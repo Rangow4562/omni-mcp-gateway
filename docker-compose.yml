@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  omni-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: omni-mcp-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - OMNI_ENV=production
+      - OMNI_HOST=0.0.0.0
+      - OMNI_PORT=8080
+      - OMNI_LOG_LEVEL=INFO
+      - OMNI_CACHE_REFRESH_INTERVAL=2.0
+      - OMNI_DEFAULT_RATE_LIMIT_RPM=1200
+      - OMNI_ENABLE_PII_REDACTION=true
+    volumes:
+      - omni-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  omni-data:
+    driver: local
+

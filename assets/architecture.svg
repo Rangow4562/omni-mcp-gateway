@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 680" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0b0f"/>
+      <stop offset="100%" stop-color="#141522"/>
+    </linearGradient>
+    <linearGradient id="primary" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#276ef1"/>
+      <stop offset="100%" stop-color="#00d2ff"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00b074"/>
+      <stop offset="100%" stop-color="#00e575"/>
+    </linearGradient>
+    <linearGradient id="purple" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#7928ca"/>
+      <stop offset="100%" stop-color="#ff0080"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="680" rx="12" fill="url(#bg)" stroke="#1f2133" stroke-width="2"/>
+
+  <!-- Top Title Header -->
+  <rect x="40" y="30" width="80" height="32" rx="6" fill="#276ef1"/>
+  <text x="80" y="52" fill="#ffffff" font-family="-apple-system, sans-serif" font-weight="900" font-size="16" text-anchor="middle" letter-spacing="1">OMNI</text>
+  <text x="135" y="53" fill="#ffffff" font-family="-apple-system, sans-serif" font-weight="800" font-size="22">MCP GATEWAY</text>
+  <text x="325" y="53" fill="#00e575" font-family="-apple-system, sans-serif" font-weight="600" font-size="14">● ENTERPRISE SYSTEM ARCHITECTURE</text>
+
+  <!-- Section 1: Ingress Clients (Left Column) -->
+  <rect x="40" y="90" width="240" height="550" rx="10" fill="#11121c" stroke="#1f2233" stroke-width="1.5"/>
+  <text x="60" y="125" fill="#a0a4c0" font-family="-apple-system, sans-serif" font-weight="700" font-size="13" letter-spacing="1">1. CLIENTS &amp; AGENTS</text>
+
+  <g transform="translate(60, 150)">
+    <rect width="200" height="85" rx="8" fill="#181a28" stroke="#2d314a" stroke-width="1"/>
+    <text x="15" y="30" fill="#00d2ff" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">AI Coding Agents</text>
+    <text x="15" y="52" fill="#7d819e" font-family="-apple-system, sans-serif" font-size="12">Shell environments</text>
+    <text x="15" y="70" fill="#00e575" font-family="monospace" font-size="11">aifx mcp call / pipe</text>
+  </g>
+
+  <g transform="translate(60, 255)">
+    <rect width="200" height="85" rx="8" fill="#181a28" stroke="#2d314a" stroke-width="1"/>
+    <text x="15" y="30" fill="#00d2ff" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Autonomous LLMs</text>
+    <text x="15" y="52" fill="#7d819e" font-family="-apple-system, sans-serif" font-size="12">Claude, GPT, Gemini</text>
+    <text x="15" y="70" fill="#276ef1" font-family="monospace" font-size="11">Omni MCP /omni/mcp</text>
+  </g>
+
+  <g transform="translate(60, 360)">
+    <rect width="200" height="85" rx="8" fill="#181a28" stroke="#2d314a" stroke-width="1"/>
+    <text x="15" y="30" fill="#00d2ff" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Internal Services</text>
+    <text x="15" y="52" fill="#7d819e" font-family="-apple-system, sans-serif" font-size="12">Muttley mesh callers</text>
+    <text x="15" y="70" fill="#a0a4c0" font-family="monospace" font-size="11">Virtual /&lt;svc&gt;/mcp</text>
+  </g>
+
+  <g transform="translate(60, 465)">
+    <rect width="200" height="85" rx="8" fill="#181a28" stroke="#2d314a" stroke-width="1"/>
+    <text x="15" y="30" fill="#00d2ff" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Engineers &amp; Owners</text>
+    <text x="15" y="52" fill="#7d819e" font-family="-apple-system, sans-serif" font-size="12">React Web Dashboard</text>
+    <text x="15" y="70" fill="#ff9900" font-family="monospace" font-size="11">Figs 3 &amp; 4 Catalog UI</text>
+  </g>
+
+  <!-- Section 2: Data Plane Runtime (Middle Column) -->
+  <rect x="310" y="90" width="460" height="550" rx="10" fill="#11121c" stroke="#276ef1" stroke-width="2"/>
+  <text x="335" y="125" fill="#276ef1" font-family="-apple-system, sans-serif" font-weight="800" font-size="14" letter-spacing="1">2. DATA PLANE (RUNTIME PROXY GATEWAY)</text>
+
+  <!-- Dynamic Router & In-Memory Cache -->
+  <g transform="translate(335, 145)">
+    <rect width="410" height="80" rx="8" fill="#181b2d" stroke="#33385a"/>
+    <text x="20" y="28" fill="#ffffff" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Dynamic Virtual Server Dispatcher &amp; Cache</text>
+    <text x="20" y="50" fill="#a0a4c0" font-family="-apple-system, sans-serif" font-size="12">Dynamic routing at /&lt;service-name&gt;/mcp without service redeployments</text>
+    <text x="20" y="68" fill="#00e575" font-family="monospace" font-size="11">In-Memory Config Cache (2.0s background refresh from SQLite WAL)</text>
+  </g>
+
+  <!-- Token Optimization: Omni MCP & Response Projection -->
+  <g transform="translate(335, 240)">
+    <rect width="410" height="120" rx="8" fill="#151d2f" stroke="#00b4d8"/>
+    <text x="20" y="28" fill="#00d2ff" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Scale &amp; Token Optimization Engine</text>
+    <text x="20" y="52" fill="#ffffff" font-family="monospace" font-size="12">• Omni MCP: discover_server, discover_tools, get_schema, invoke_tool</text>
+    <text x="20" y="74" fill="#ffffff" font-family="monospace" font-size="12">• Response Projection: GraphQL-like nested path trimming (_projection)</text>
+    <text x="20" y="96" fill="#00e575" font-family="-apple-system, sans-serif" font-size="12">Reduces LLM context consumption by up to 90% at enterprise scale</text>
+  </g>
+
+  <!-- Security & Wire Translators -->
+  <g transform="translate(335, 375)">
+    <rect width="410" height="135" rx="8" fill="#181b2d" stroke="#33385a"/>
+    <text x="20" y="28" fill="#ffffff" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Security, Rate Limiting &amp; Protocol Translation</text>
+    <text x="20" y="52" fill="#ff7875" font-family="-apple-system, sans-serif" font-size="12">• ABAC Charter Policies (human / service / agent) &amp; Token-Bucket Limiter</text>
+    <text x="20" y="74" fill="#00e575" font-family="-apple-system, sans-serif" font-size="12">• Automatic PII Redaction: Emails, phones, SSNs, credit cards, auth tokens</text>
+    <text x="20" y="96" fill="#a0a4c0" font-family="-apple-system, sans-serif" font-size="12">• Wire Adapters: HTTP REST, gRPC (Protobuf), TChannel (Thrift)</text>
+    <text x="20" y="118" fill="#276ef1" font-family="-apple-system, sans-serif" font-size="12">• Muttley Service Mesh Sidecar Client with distributed trace propagation</text>
+  </g>
+
+  <!-- Health & Telemetry Bar -->
+  <g transform="translate(335, 525)">
+    <rect width="410" height="45" rx="6" fill="#0e101a" stroke="#22263d"/>
+    <text x="20" y="28" fill="#a0a4c0" font-family="monospace" font-size="12">Probes: /healthz · /readyz · /metrics (Prometheus)</text>
+  </g>
+
+  <!-- Section 3: Control Plane & Targets (Right Column) -->
+  <rect x="795" y="90" width="365" height="550" rx="10" fill="#11121c" stroke="#1f2233" stroke-width="1.5"/>
+  <text x="820" y="125" fill="#a0a4c0" font-family="-apple-system, sans-serif" font-weight="700" font-size="13" letter-spacing="1">3. CONTROL PLANE &amp; TARGETS</text>
+
+  <!-- AutoCrawler Engine -->
+  <g transform="translate(820, 145)">
+    <rect width="315" height="110" rx="8" fill="#181a28" stroke="#2d314a"/>
+    <text x="15" y="28" fill="#ff9900" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">AutoCrawler (Cadence Engine)</text>
+    <text x="15" y="50" fill="#a0a4c0" font-family="-apple-system, sans-serif" font-size="12">Cron workflow scanning IDL repos</text>
+    <text x="15" y="72" fill="#7d819e" font-family="-apple-system, sans-serif" font-size="12">• Protobuf &amp; Thrift AST parsers</text>
+    <text x="15" y="92" fill="#7d819e" font-family="-apple-system, sans-serif" font-size="12">• LLM tool description enrichment</text>
+  </g>
+
+  <!-- Governance & Registry -->
+  <g transform="translate(820, 270)">
+    <rect width="315" height="120" rx="8" fill="#181a28" stroke="#2d314a"/>
+    <text x="15" y="28" fill="#00e575" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">MCP Registry &amp; Governance</text>
+    <text x="15" y="52" fill="#ffffff" font-family="-apple-system, sans-serif" font-size="12">• Disabled-by-Default security gate</text>
+    <text x="15" y="74" fill="#ffffff" font-family="-apple-system, sans-serif" font-size="12">• Config diff approval before deploy</text>
+    <text x="15" y="96" fill="#ffffff" font-family="-apple-system, sans-serif" font-size="12">• Durable SQLite Storage (WAL)</text>
+  </g>
+
+  <!-- Downstream Integrations -->
+  <g transform="translate(820, 405)">
+    <rect width="315" height="165" rx="8" fill="#181a28" stroke="#2d314a"/>
+    <text x="15" y="28" fill="#a0a4c0" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Downstream Systems</text>
+    <text x="15" y="56" fill="#00d2ff" font-family="-apple-system, sans-serif" font-size="12">1. IDL Microservices (HTTP/gRPC/TChannel)</text>
+    <text x="15" y="80" fill="#a0a4c0" font-family="-apple-system, sans-serif" font-size="11">   Driver Dispatch, Trip Billing, Pricing</text>
+    <text x="15" y="106" fill="#00e575" font-family="-apple-system, sans-serif" font-size="12">2. Native MCP Servers (MCPFx)</text>
+    <text x="15" y="126" fill="#a0a4c0" font-family="-apple-system, sans-serif" font-size="11">   Heartbeat listener + listTools discovery</text>
+    <text x="15" y="148" fill="#ffb703" font-family="-apple-system, sans-serif" font-size="12">3. 3P Integrations: Jira &amp; Google OAuth</text>
+  </g>
+
+  <!-- Connective Arrows -->
+  <path d="M 280 200 L 310 200" stroke="#276ef1" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M 280 300 L 310 300" stroke="#00d2ff" stroke-width="2"/>
+  <path d="M 280 400 L 310 400" stroke="#00e575" stroke-width="2"/>
+  <path d="M 770 200 L 795 200" stroke="#ff9900" stroke-width="2"/>
+  <path d="M 770 330 L 795 330" stroke="#00e575" stroke-width="2"/>
+  <path d="M 770 480 L 795 480" stroke="#276ef1" stroke-width="2"/>
+</svg>
