@@ -1,37 +1,7 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-/dist/
-!ui/dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
-.env
-.venv
-env/
-venv/
-ENV/
-
-# Testing & Coverage
-.pytest_cache/
-.coverage
-htmlcov/
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
 
 # Node / UI
 node_modules/
@@ -39,12 +9,25 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 ui/node_modules/
+/dist/
+!ui/dist/
 .DS_Store
 
-# Data & SQLite
+# Environment
+.env
+.venv
+venv/
+
+# Data & Durable WAL Storage
 data/
 *.db
 *.db-wal
 *.db-shm
+*.tmp
 .omni/
 
+# Legacy Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/

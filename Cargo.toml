@@ -1,0 +1,30 @@
+[package]
+name = "omni-mcp"
+version = "2.0.0"
+edition = "2021"
+authors = ["Omni MCP Engineering"]
+description = "High-performance Rust enterprise Model Context Protocol (MCP) Management Platform & Runtime Gateway: AutoCrawler IDL discovery, lock-free CoW virtual server routing, binary wire protocol translation (HTTP, gRPC, TChannel), circuit breaking, semantic response caching, BM25 Omni MCP incremental discovery, Response Projection, and Code Mode CLI."
+readme = "README.md"
+
+[lib]
+name = "omni_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omni-gateway"
+path = "src/main.rs"
+
+[[bin]]
+name = "omni"
+path = "src/bin/omni.rs"
+
+[[bin]]
+name = "aifx"
+path = "src/bin/aifx.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+

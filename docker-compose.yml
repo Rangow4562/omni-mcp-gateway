@@ -17,15 +17,13 @@ services:
       - OMNI_CACHE_REFRESH_INTERVAL=2.0
       - OMNI_DEFAULT_RATE_LIMIT_RPM=1200
       - OMNI_ENABLE_PII_REDACTION=true
+      - OMNI_WORKER_THREADS=16
+      - OMNI_CB_THRESHOLD=5
+      - OMNI_CB_RESET_SEC=30.0
+      - OMNI_SEMANTIC_CACHE_TTL_SEC=15.0
     volumes:
       - omni-data:/app/data
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
 
 volumes:
   omni-data:
     driver: local
-

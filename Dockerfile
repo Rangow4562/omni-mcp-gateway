@@ -1,4 +1,4 @@
-# Multi-stage production Dockerfile for Omni MCP Platform
+# Multi-stage production Dockerfile for Omni MCP Platform (Rust 2.0 Engine)
 FROM node:22-alpine AS ui-builder
 WORKDIR /app/ui
 COPY ui/package*.json ./
@@ -6,29 +6,28 @@ RUN npm ci
 COPY ui/ ./
 RUN npm run build
 
-FROM python:3.12-slim AS runner
+FROM rust:1.85-slim AS rust-builder
+WORKDIR /app
+COPY Cargo.toml ./
+COPY src/ ./src/
+RUN cargo build --release
+
+FROM debian:bookworm-slim AS runner
 WORKDIR /app
 
-ENV PYTHONUNBUFFERED=1 \
-    OMNI_HOST=0.0.0.0 \
+ENV OMNI_HOST=0.0.0.0 \
     OMNI_PORT=8080 \
     OMNI_DATA_DIR=/app/data \
     OMNI_ENV=production
 
 RUN mkdir -p /app/data
 
-# Copy backend source
-COPY pyproject.toml ./
-COPY omni_mcp/ ./omni_mcp/
+COPY --from=rust-builder /app/target/release/omni-gateway /usr/local/bin/omni-gateway
+COPY --from=rust-builder /app/target/release/omni /usr/local/bin/omni
+COPY --from=rust-builder /app/target/release/aifx /usr/local/bin/aifx
 COPY --from=ui-builder /app/ui/dist ./ui/dist
-
-RUN pip install --no-cache-dir .
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')" || exit 1
-
-ENTRYPOINT ["python", "-m", "omni_mcp.server"]
+ENTRYPOINT ["omni-gateway"]
 CMD ["8080"]
-
