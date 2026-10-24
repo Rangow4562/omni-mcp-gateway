@@ -738,6 +738,92 @@ pub fn run_server(host: &str, port: u16) -> Result<(), String> {
     Ok(())
 }
 
+pub fn run_stdio_server(specific_server: Option<&str>) -> i32 {
+    let ctx = get_gateway_context();
+    ctx.cache.start_background_refresh();
+    let omni_mcp = &ctx.omni_mcp;
+    let gateway = &ctx.gateway;
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let reader = stdin.lock();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed = match JsonValue::parse(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": PARSE_ERROR,
+                        "message": format!("Invalid JSON: {}", e)
+                    }
+                });
+                let _ = writeln!(stdout, "{}", err_resp.to_string_compact());
+                let _ = stdout.flush();
+                continue;
+            }
+        };
+
+        match RPCBatchOrSingle::from_json(&parsed) {
+            Ok(batch_or_single) => {
+                let is_notification = match &batch_or_single {
+                    RPCBatchOrSingle::Single(req) => {
+                        req.id.is_null() || req.method.starts_with("notifications/")
+                    }
+                    _ => false,
+                };
+
+                let resp_json = match specific_server {
+                    Some(srv) => match batch_or_single {
+                        RPCBatchOrSingle::Single(req) => {
+                            gateway.handle_request(srv, &req, "agent", Some("stdio-token")).to_json()
+                        }
+                        RPCBatchOrSingle::Batch(reqs) => {
+                            let results: Vec<JsonValue> = reqs
+                                .iter()
+                                .map(|r| gateway.handle_request(srv, r, "agent", Some("stdio-token")).to_json())
+                                .collect();
+                            JsonValue::Array(results)
+                        }
+                    },
+                    None => omni_mcp.handle_batch_or_single(
+                        batch_or_single,
+                        "agent",
+                        Some("stdio-token"),
+                    ),
+                };
+
+                if !is_notification {
+                    let _ = writeln!(stdout, "{}", resp_json.to_string_compact());
+                    let _ = stdout.flush();
+                }
+            }
+            Err(e) => {
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": crate::models::INVALID_REQUEST,
+                        "message": format!("Invalid JSON-RPC: {}", e)
+                    }
+                });
+                let _ = writeln!(stdout, "{}", err_resp.to_string_compact());
+                let _ = stdout.flush();
+            }
+        }
+    }
+    0
+}
+
 fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));

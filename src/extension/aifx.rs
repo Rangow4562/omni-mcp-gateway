@@ -361,6 +361,19 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             println!("{}", cli.run_benchmark(iterations));
             0
         }
+        "stdio" | "serve" => {
+            let mut server_name = None;
+            let mut i = 2;
+            while i < args.len() {
+                if (args[i] == "--server" || args[i] == "-s") && i + 1 < args.len() {
+                    server_name = Some(args[i + 1].as_str());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            crate::server::run_stdio_server(server_name)
+        }
         _ => {
             let _ = ToolStatus::Enabled;
             print_help();

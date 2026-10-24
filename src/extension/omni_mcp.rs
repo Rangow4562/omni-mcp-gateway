@@ -145,6 +145,8 @@ impl OmniMCPServer {
                     "tools": JsonValue::Array(Self::omni_tools_spec())
                 }),
             ),
+            "resources/list" => RPCResponse::ok(request.id.clone(), json!({"resources": []})),
+            "prompts/list" => RPCResponse::ok(request.id.clone(), json!({"prompts": []})),
             "tools/call" => {
                 let tool_name = request
                     .params

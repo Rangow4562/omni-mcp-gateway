@@ -57,7 +57,7 @@ impl<'a> LogEvent<'a> {
     }
 
     pub fn emit(&self) {
-        println!("{}", self.to_json().to_string_compact());
+        eprintln!("{}", self.to_json().to_string_compact());
     }
 }
 

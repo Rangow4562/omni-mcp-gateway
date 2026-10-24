@@ -10,8 +10,21 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
-    // Support `omni-gateway mcp ...` as well as `omni-gateway [port]`
+    // Support stdio MCP server mode for harness agents and MCP plugins
     if let Some(first) = args.first() {
+        if first == "--stdio" || first == "stdio" || first == "serve-stdio" {
+            let mut server_name = None;
+            let mut i = 1;
+            while i < args.len() {
+                if (args[i] == "--server" || args[i] == "-s") && i + 1 < args.len() {
+                    server_name = Some(args[i + 1].as_str());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            process::exit(omni_mcp::server::run_stdio_server(server_name));
+        }
         if first == "mcp" || first == "--help" || first == "-h" {
             process::exit(run_aifx_cli(&args));
         }
