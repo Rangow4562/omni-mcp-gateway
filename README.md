@@ -1,5 +1,7 @@
 # Omni MCP (`omni-mcp` v2.0 — Native Rust Engine)
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/rangow4562-omni-mcp-gateway-twjros)](https://m8ven.ai/mcp/rangow4562-omni-mcp-gateway-twjros?s=readme)
+
 A high-performance, zero-dependency **Rust** enterprise Model Context Protocol (MCP) management platform and runtime gateway reconstructing and advancing the architecture documented (*"Designing MCP Gateway: Uber's MCP Management Platform"*, October 1, 2026).
 
 Omni MCP unifies hundreds of microservices and thousands of tools behind a standardized, sub-millisecond, token-optimized Rust gateway with built-in governance, binary wire protocol translation, incremental discovery, circuit breaking, semantic response caching, and ABAC security.
