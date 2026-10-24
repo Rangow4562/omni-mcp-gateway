@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "omni-mcp": {
+      "command": "D:\\Personal\\Memory\\omni-mcp\\target\\release\\omni-gateway.exe",
+      "args": ["--stdio"],
+      "env": {
+        "OMNI_DATA_DIR": "D:\\Personal\\Memory\\omni-mcp\\target\\data"
+      }
+    }
+  }
+}

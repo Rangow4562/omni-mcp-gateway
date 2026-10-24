@@ -212,3 +212,98 @@ Available Endpoints:
 ```bash
 cargo test
 ```
+
+
+---
+
+## MCP Server Integration & Agent Harness Setup
+
+Omni MCP can be plugged directly into any MCP-compatible client, IDE, or multi-agent orchestration framework (Claude Desktop, Cursor, Antigravity, LangChain, AutoGen, CrewAI).
+
+### Option A: Standard Stdio Transport (Local Process)
+
+Run the native binary with `--stdio` to start the JSON-RPC 2.0 stdio engine:
+
+```json
+{
+  "mcpServers": {
+    "omni-mcp": {
+      "command": "/path/to/omni-gateway",
+      "args": ["--stdio"],
+      "env": {
+        "OMNI_DATA_DIR": "/path/to/omni-mcp/target/data"
+      }
+    }
+  }
+}
+```
+
+> **Direct Server Mode**: To isolate the agent to a specific microservice's tools without the discovery meta-tools, add `--server <name>`:
+> `"args": ["--stdio", "--server", "driverdispatchservice"]`.
+
+---
+
+### Option B: Remote / Streamable HTTP Transport
+
+Start the gateway daemon on port 8080 (`./target/release/omni-gateway 8080`), then configure clients using the HTTP endpoint:
+
+- **Centralized Omni Discovery Proxy**: `http://localhost:8080/omni/mcp`
+- **Direct Virtual Service Endpoints**: `http://localhost:8080/<service-name>/mcp`
+
+For clients requiring `mcp-remote` over stdio:
+```json
+{
+  "mcpServers": {
+    "omni-mcp-http": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://localhost:8080/omni/mcp"]
+    }
+  }
+}
+```
+
+---
+
+### Client & Agent Harness Configuration Examples
+
+#### 1. Claude Desktop (`claude_desktop_config.json`)
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "omni-mcp": {
+      "command": "D:\\Personal\\Memory\\omni-mcp\\target\\release\\omni-gateway.exe",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+#### 2. Cursor / Windsurf (`.cursor/mcp.json`)
+```json
+{
+  "mcpServers": {
+    "omni-mcp": {
+      "command": "D:\\Personal\\Memory\\omni-mcp\\target\\release\\omni-gateway.exe",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+#### 3. Antigravity IDE (`~/.gemini/config/mcp_config.json` or Plugin)
+```json
+{
+  "mcpServers": {
+    "omni-mcp": {
+      "command": "D:\\Personal\\Memory\\omni-mcp\\target\\release\\omni-gateway.exe",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+#### 4. Python Agent Harness (`mcp` SDK)
+See [`examples/mcp-configs/python_harness_agent.py`](examples/mcp-configs/python_harness_agent.py) for a complete working agent implementation connecting to Omni MCP via `mcp.client.stdio.stdio_client`.
