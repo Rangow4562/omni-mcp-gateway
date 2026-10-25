@@ -25,6 +25,7 @@ data/
 *.db-shm
 *.tmp
 .omni/
+bin/*.exe
 
 # Legacy Python artifacts
 __pycache__/

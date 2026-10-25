@@ -1,0 +1,40 @@
+{
+  "name": "omni-mcp",
+  "version": "2.0.0",
+  "description": "High-performance enterprise Model Context Protocol (MCP) gateway & management platform: dynamic virtual server routing, incremental discovery, wire translation, and response projection.",
+  "main": "bin/omni-mcp.js",
+  "bin": {
+    "omni-mcp": "./bin/omni-mcp.js",
+    "omni-gateway": "./bin/omni-mcp.js"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "gateway",
+    "ai",
+    "llm",
+    "agent",
+    "claude",
+    "cursor",
+    "antigravity",
+    "discovery"
+  ],
+  "author": "Omni MCP Engineering",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rangow4562/omni-mcp-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Rangow4562/omni-mcp-gateway/issues"
+  },
+  "homepage": "https://github.com/Rangow4562/omni-mcp-gateway#readme"
+}
