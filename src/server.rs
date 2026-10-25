@@ -13,15 +13,17 @@ use crate::data_plane::{
 use crate::extension::OmniMCPServer;
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
-use crate::models::{RPCBatchOrSingle, ToolStatus, PARSE_ERROR, RATE_LIMITED};
-use crate::storage::WalRegistryStore;
+use crate::models::{
+    RPCBatchOrSingle, ToolStatus, TraceSpan, PARSE_ERROR, RATE_LIMITED,
+};
+use crate::storage::{MerkleAuditStore, WalRegistryStore};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -63,6 +65,8 @@ pub struct ProductionGatewayContext {
     pub gateway: MCPProxyGateway,
     pub omni_mcp: OmniMCPServer,
     pub metrics: Arc<GatewayMetrics>,
+    pub audit_store: Arc<MerkleAuditStore>,
+    pub traces: Arc<RwLock<Vec<TraceSpan>>>,
 }
 
 impl ProductionGatewayContext {
@@ -86,7 +90,16 @@ impl ProductionGatewayContext {
             config.circuit_breaker_reset_sec,
         );
         let sem_cache = SemanticResponseCache::new(config.semantic_cache_ttl_sec);
-        let gateway = MCPProxyGateway::with_resilience(cache.clone(), translator, cb, sem_cache);
+
+        let mut audit_path_buf = PathBuf::from(&config.data_dir);
+        audit_path_buf.push("omni_audit.log");
+        let audit_store = Arc::new(MerkleAuditStore::new(Some(
+            audit_path_buf.to_string_lossy().into_owned(),
+        )));
+        let traces = Arc::new(RwLock::new(Vec::new()));
+
+        let gateway = MCPProxyGateway::with_resilience(cache.clone(), translator, cb, sem_cache)
+            .with_observability(audit_store.clone(), traces.clone());
         let omni_mcp = OmniMCPServer::new(cache.clone(), gateway.clone());
 
         let ctx = Self {
@@ -102,6 +115,8 @@ impl ProductionGatewayContext {
             gateway,
             omni_mcp,
             metrics: Arc::new(GatewayMetrics::new()),
+            audit_store,
+            traces,
         };
 
         if ctx.registry.list_servers(None).is_empty() {
@@ -149,6 +164,43 @@ impl ProductionGatewayContext {
             .create_third_party_server("jira", "eng-productivity");
         self.registry.register_server(jira_srv);
 
+        // 4. OpenAPI 3.1 Payments & Billing Service (REST with Canary & Fallback)
+        let payments_openapi = r#"
+        {
+          "openapi": "3.1.0",
+          "info": {
+            "title": "Payments & Billing API",
+            "version": "3.0.0",
+            "description": "Enterprise payment processing, charge authorisations, and instant refunds."
+          },
+          "paths": {
+            "/payments/charge": {
+              "post": {
+                "summary": "Process customer payment charge",
+                "tags": ["payments", "billing", "checkout"],
+                "parameters": [
+                  {"name": "customer_id", "in": "query", "required": true, "schema": {"type": "string"}},
+                  {"name": "amount_cents", "in": "query", "required": true, "schema": {"type": "integer"}},
+                  {"name": "currency", "in": "query", "required": false, "schema": {"type": "string"}}
+                ]
+              }
+            },
+            "/payments/refund": {
+              "post": {
+                "summary": "Execute transaction refund",
+                "tags": ["payments", "refund", "billing"],
+                "parameters": [
+                  {"name": "charge_id", "in": "query", "required": true, "schema": {"type": "string"}},
+                  {"name": "reason", "in": "query", "required": false, "schema": {"type": "string"}}
+                ]
+              }
+            }
+          }
+        }
+        "#;
+        self.crawler
+            .register_idl_source("payments-service", payments_openapi);
+
         // Run discovery cycle
         self.crawler.run_discovery_workflow();
 
@@ -160,6 +212,21 @@ impl ProductionGatewayContext {
             "GetDriverLocation",
             ToolStatus::Enabled,
         );
+
+        // Enable PaymentsService tools
+        self.registry
+            .toggle_server_status("paymentsservice", ToolStatus::Enabled);
+        self.registry.toggle_tool_status(
+            "paymentsservice",
+            "payments_charge",
+            ToolStatus::Enabled,
+        );
+        self.registry.toggle_tool_status(
+            "paymentsservice",
+            "payments_refund",
+            ToolStatus::Enabled,
+        );
+
         self.cache.refresh_now();
     }
 
@@ -391,6 +458,67 @@ impl ProductionGatewayContext {
                     }),
                 )
             }
+            "/sse" | "/omni/sse" => {
+                let sse_body = "event: endpoint\ndata: /omni/mcp\n\nevent: status\ndata: {\"status\":\"connected\",\"version\":\"3.0.0\",\"runtime\":\"rust\"}\n\n";
+                (
+                    200,
+                    "text/event-stream; charset=utf-8".to_string(),
+                    vec![
+                        ("Cache-Control".to_string(), "no-cache".to_string()),
+                        ("Connection".to_string(), "keep-alive".to_string()),
+                        ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+                    ],
+                    sse_body.as_bytes().to_vec(),
+                )
+            }
+            "/api/traces" => {
+                let spans_guard = self.traces.read().unwrap();
+                let spans: Vec<JsonValue> = spans_guard.iter().map(|s| s.to_json()).collect();
+                self.json_response(
+                    200,
+                    json!({
+                        "spans": JsonValue::Array(spans),
+                        "total": spans_guard.len() as i64
+                    }),
+                )
+            }
+            "/api/audit" => {
+                let records = self.audit_store.list_records(Some(100));
+                let recs_json: Vec<JsonValue> = records.iter().map(|r| r.to_json()).collect();
+                let (verified, _) = self.audit_store.verify_chain();
+                self.json_response(
+                    200,
+                    json!({
+                        "head_hash": self.audit_store.get_head_hash(),
+                        "total_records": recs_json.len() as i64,
+                        "chain_verified": verified,
+                        "records": JsonValue::Array(recs_json)
+                    }),
+                )
+            }
+            "/api/audit/verify" => {
+                let (verified, count_or_idx) = self.audit_store.verify_chain();
+                if verified {
+                    self.json_response(
+                        200,
+                        json!({
+                            "verified": true,
+                            "records_checked": count_or_idx as i64,
+                            "algorithm": "SHA-256 (FIPS 180-4)",
+                            "head_hash": self.audit_store.get_head_hash()
+                        }),
+                    )
+                } else {
+                    self.json_response(
+                        409,
+                        json!({
+                            "verified": false,
+                            "corrupted_at_index": count_or_idx as i64,
+                            "reason": "Hash mismatch in cryptographic Merkle chain"
+                        }),
+                    )
+                }
+            }
             _ => self.serve_static_or_index(path),
         }
     }
@@ -459,6 +587,8 @@ impl ProductionGatewayContext {
             JsonValue::parse(&body_str)
         };
 
+        let traceparent = headers.get("traceparent").map(|s| s.as_str());
+
         // 1. Dynamic Virtual Server MCP Route: `/<service-name>/mcp`
         if path.ends_with("/mcp") && path != "/omni/mcp" {
             let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -479,11 +609,12 @@ impl ProductionGatewayContext {
                 };
                 match RPCBatchOrSingle::from_json(&json_val) {
                     Ok(batch_or_single) => {
-                        let resp_json = self.gateway.handle_batch_or_single(
+                        let resp_json = self.gateway.handle_batch_or_single_with_trace(
                             service_name,
                             batch_or_single,
                             actor,
                             Some(token),
+                            traceparent,
                         );
                         return self.json_response(200, resp_json);
                     }
@@ -624,6 +755,14 @@ impl ProductionGatewayContext {
                 self.cache.refresh_now();
                 self.gateway.semantic_cache.invalidate_service(s_name);
                 self.json_response(200, json!({"success": ok}))
+            }
+            "/api/execute" => {
+                let srv = body.get("server_name").and_then(|x| x.as_str()).unwrap_or("");
+                let tool = body.get("tool_name").and_then(|x| x.as_str()).unwrap_or("");
+                let args = body.get("arguments").cloned().unwrap_or_else(JsonValue::object);
+                let req = crate::models::RPCRequest::new(1, "tools/call", json!({"name": tool, "arguments": args}));
+                let resp = self.gateway.handle_request_with_trace(srv, &req, actor, Some(token), traceparent);
+                self.json_response(200, resp.to_json())
             }
             _ => self.json_response(404, json!({"error": "Endpoint not found"})),
         }

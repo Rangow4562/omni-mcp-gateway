@@ -23,6 +23,9 @@ pub struct MethodDefinition {
     pub fields: Vec<FieldDefinition>,
     pub doc_comment: String,
     pub protocol: ProtocolType,
+    pub tags: Vec<String>,
+    pub custom_schema: Option<JsonValue>,
+    pub is_mutation: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +149,7 @@ impl IDLParser {
                                         .get(&req_type)
                                         .cloned()
                                         .unwrap_or_default();
+                                    let is_mutation = is_mutation_name(&method_name);
                                     methods.push(MethodDefinition {
                                         name: method_name,
                                         request_type: req_type,
@@ -153,6 +157,9 @@ impl IDLParser {
                                         fields: method_fields,
                                         doc_comment: std::mem::take(&mut pending_comment),
                                         protocol: ProtocolType::Grpc,
+                                        tags: Vec::new(),
+                                        custom_schema: None,
+                                        is_mutation,
                                     });
                                 }
                             }
@@ -253,6 +260,7 @@ impl IDLParser {
                                 }
                             }
 
+                            let is_mutation = is_mutation_name(&m_name);
                             methods.push(MethodDefinition {
                                 name: m_name.clone(),
                                 request_type: format!("{}Request", m_name),
@@ -260,6 +268,9 @@ impl IDLParser {
                                 fields,
                                 doc_comment: std::mem::take(&mut pending_comment),
                                 protocol: ProtocolType::TChannel,
+                                tags: Vec::new(),
+                                custom_schema: None,
+                                is_mutation,
                             });
                         }
                     }
@@ -278,8 +289,187 @@ impl IDLParser {
         services
     }
 
+    /// Parses an OpenAPI 3.0, 3.1, or Swagger 2.0 definition into ServiceDefinitions.
+    pub fn parse_openapi(content: &str) -> Vec<ServiceDefinition> {
+        let root = match JsonValue::parse(content) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+
+        let title = root
+            .get("info")
+            .and_then(|i| i.get("title"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("OpenAPIService");
+        let svc_name: String = title
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let svc_name = if svc_name.is_empty() {
+            "OpenAPIService".to_string()
+        } else {
+            svc_name
+        };
+
+        let svc_doc = root
+            .get("info")
+            .and_then(|i| i.get("description"))
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let mut methods = Vec::new();
+
+        if let Some(paths) = root.get("paths").and_then(|p| p.as_object()) {
+            for (path_str, path_item) in paths {
+                if let Some(ops) = path_item.as_object() {
+                    for (http_method, op_val) in ops {
+                        let http_method_upper = http_method.to_uppercase();
+                        if !matches!(
+                            http_method_upper.as_str(),
+                            "GET" | "POST" | "PUT" | "DELETE" | "PATCH"
+                        ) {
+                            continue;
+                        }
+
+                        let op_id = op_val
+                            .get("operationId")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                let clean_path: String = path_str
+                                    .chars()
+                                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                                    .collect();
+                                format!(
+                                    "{}_{}",
+                                    http_method.to_lowercase(),
+                                    clean_path.trim_matches('_')
+                                )
+                            });
+
+                        let summary = op_val
+                            .get("summary")
+                            .or_else(|| op_val.get("description"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        let mut tags = Vec::new();
+                        if let Some(tag_arr) = op_val.get("tags").and_then(|t| t.as_array()) {
+                            for tag in tag_arr {
+                                if let Some(ts) = tag.as_str() {
+                                    tags.push(ts.to_string());
+                                }
+                            }
+                        }
+
+                        let mut fields = Vec::new();
+                        let mut properties = JsonValue::object();
+                        let mut required_keys = Vec::new();
+
+                        if let Some(params) = op_val.get("parameters").and_then(|p| p.as_array()) {
+                            for param in params {
+                                if let Some(p_name) = param.get("name").and_then(|n| n.as_str()) {
+                                    let p_desc = param
+                                        .get("description")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or("");
+                                    let p_type = param
+                                        .get("schema")
+                                        .and_then(|s| s.get("type"))
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("string");
+                                    let p_req = param
+                                        .get("required")
+                                        .and_then(|r| r.as_bool())
+                                        .unwrap_or(false);
+
+                                    properties.insert(
+                                        p_name.to_string(),
+                                        json!({
+                                            "type": p_type,
+                                            "description": p_desc
+                                        }),
+                                    );
+                                    if p_req {
+                                        required_keys.push(JsonValue::from(p_name));
+                                    }
+                                    fields.push(FieldDefinition {
+                                        name: p_name.to_string(),
+                                        field_type: p_type.to_string(),
+                                        is_repeated: false,
+                                        is_required: p_req,
+                                        is_map: false,
+                                        doc_comment: p_desc.to_string(),
+                                    });
+                                }
+                            }
+                        }
+
+                        if let Some(rb_schema) = op_val
+                            .get("requestBody")
+                            .and_then(|rb| rb.get("content"))
+                            .and_then(|c| c.get("application/json"))
+                            .and_then(|aj| aj.get("schema"))
+                        {
+                            if let Some(rb_props) =
+                                rb_schema.get("properties").and_then(|p| p.as_object())
+                            {
+                                for (k, v) in rb_props {
+                                    properties.insert(k.clone(), v.clone());
+                                }
+                            }
+                            if let Some(rb_req) =
+                                rb_schema.get("required").and_then(|r| r.as_array())
+                            {
+                                for r in rb_req {
+                                    required_keys.push(r.clone());
+                                }
+                            }
+                        }
+
+                        let custom_schema = json!({
+                            "type": "object",
+                            "properties": properties,
+                            "required": JsonValue::Array(required_keys)
+                        });
+
+                        let is_mutation = matches!(
+                            http_method_upper.as_str(),
+                            "POST" | "PUT" | "DELETE" | "PATCH"
+                        );
+
+                        methods.push(MethodDefinition {
+                            name: op_id,
+                            request_type: format!("{}/{}", http_method_upper, path_str),
+                            response_type: "200".to_string(),
+                            fields,
+                            doc_comment: summary,
+                            protocol: ProtocolType::Http,
+                            tags,
+                            custom_schema: Some(custom_schema),
+                            is_mutation,
+                        });
+                    }
+                }
+            }
+        }
+
+        vec![ServiceDefinition {
+            service_name: svc_name,
+            package: "openapi.rest".to_string(),
+            methods,
+            doc_comment: svc_doc,
+            protocol: ProtocolType::Http,
+        }]
+    }
+
     /// Translates method parameter fields into an MCP JSON Schema.
     pub fn translate_to_json_schema(method: &MethodDefinition) -> JsonValue {
+        if let Some(cs) = &method.custom_schema {
+            return cs.clone();
+        }
         let mut properties = JsonValue::object();
         let mut required: Vec<JsonValue> = Vec::new();
 
@@ -402,4 +592,18 @@ fn extract_named_blocks(content: &str, keyword: &str) -> Vec<(String, String, St
     }
 
     results
+}
+
+fn is_mutation_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with("set")
+        || lower.starts_with("create")
+        || lower.starts_with("update")
+        || lower.starts_with("delete")
+        || lower.starts_with("post")
+        || lower.starts_with("cancel")
+        || lower.starts_with("dispatch")
+        || lower.starts_with("deliver")
+        || lower.starts_with("charge")
+        || lower.starts_with("refund")
 }

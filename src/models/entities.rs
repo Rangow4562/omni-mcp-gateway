@@ -3,6 +3,97 @@
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generates a valid 32-hex character W3C trace ID.
+pub fn generate_trace_id() -> String {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let count = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    let part1 = (nanos ^ (count.wrapping_mul(0x9e3779b97f4a7c15))) as u64;
+    let part2 = ((nanos >> 64) ^ (count.wrapping_mul(0xbf58476d1ce4e5b9))) as u64 ^ 0xa5a5a5a5a5a5a5a5;
+    format!("{:016x}{:016x}", part1.max(1), part2.max(1))
+}
+
+/// Generates a valid 16-hex character W3C span ID.
+pub fn generate_span_id() -> String {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let count = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let val = nanos ^ count.wrapping_mul(0x517cc1b727220a95);
+    format!("{:016x}", val.max(1))
+}
+
+/// Parses an incoming W3C `traceparent` header (format: `00-{trace_id}-{span_id}-{flags}`).
+pub fn parse_traceparent(header: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = header.trim().split('-').collect();
+    if parts.len() == 4 && parts[0] == "00" && parts[1].len() == 32 && parts[2].len() == 16 {
+        Some((parts[1].to_string(), parts[2].to_string()))
+    } else {
+        None
+    }
+}
+
+/// Formats a W3C `traceparent` header for downstream propagation.
+pub fn format_traceparent(trace_id: &str, span_id: &str) -> String {
+    format!("00-{}-{}-01", trace_id, span_id)
+}
+
+/// OpenTelemetry-compatible distributed trace span.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceSpan {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub service_name: String,
+    pub tool_name: String,
+    pub start_time_us: u64,
+    pub duration_us: u64,
+    pub status: String,
+    pub attributes: BTreeMap<String, JsonValue>,
+}
+
+impl TraceSpan {
+    pub fn to_json(&self) -> JsonValue {
+        let attrs: Vec<JsonValue> = self
+            .attributes
+            .iter()
+            .map(|(k, v)| {
+                json!({
+                    "key": k.clone(),
+                    "value": v.clone()
+                })
+            })
+            .collect();
+
+        json!({
+            "traceId": self.trace_id.clone(),
+            "spanId": self.span_id.clone(),
+            "parentSpanId": self.parent_span_id.clone().unwrap_or_default(),
+            "name": self.name.clone(),
+            "serviceName": self.service_name.clone(),
+            "toolName": self.tool_name.clone(),
+            "kind": 2, // SPAN_KIND_SERVER
+            "startTimeUnixNano": (self.start_time_us as u128 * 1_000) as i64,
+            "endTimeUnixNano": ((self.start_time_us + self.duration_us) as u128 * 1_000) as i64,
+            "durationUs": self.duration_us as i64,
+            "status": {
+                "code": if self.status == "OK" { 1 } else { 2 },
+                "message": self.status.clone()
+            },
+            "attributes": JsonValue::Array(attrs)
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolType {
@@ -203,6 +294,11 @@ pub struct ToolRecord {
     pub charter_policy: Option<CharterPolicy>,
     pub metadata: JsonValue,
     pub idempotent_cacheable: bool,
+    pub canary_version: Option<u32>,
+    pub canary_weight_pct: u8,
+    pub fallback_tool: Option<String>,
+    pub tags: Vec<String>,
+    pub is_mutation: bool,
 }
 
 impl ToolRecord {
@@ -224,6 +320,11 @@ impl ToolRecord {
             charter_policy: None,
             metadata: JsonValue::object(),
             idempotent_cacheable: true,
+            canary_version: None,
+            canary_weight_pct: 0,
+            fallback_tool: None,
+            tags: Vec::new(),
+            is_mutation: false,
         }
     }
 
@@ -275,6 +376,11 @@ impl ToolRecord {
             "charter_policy": policy_val,
             "metadata": self.metadata.clone(),
             "idempotent_cacheable": self.idempotent_cacheable,
+            "canary_version": self.canary_version.map(|v| v as i64).map(JsonValue::from).unwrap_or(JsonValue::Null),
+            "canary_weight_pct": self.canary_weight_pct as i64,
+            "fallback_tool": self.fallback_tool.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "tags": JsonValue::Array(self.tags.iter().map(|t| JsonValue::from(t.as_str())).collect()),
+            "is_mutation": self.is_mutation,
         })
     }
 
@@ -326,6 +432,19 @@ impl ToolRecord {
             .get("idempotent_cacheable")
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
+        let canary_version = v.get("canary_version").and_then(|x| x.as_u64()).map(|u| u as u32);
+        let canary_weight_pct = v.get("canary_weight_pct").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
+        let fallback_tool = v.get("fallback_tool").and_then(|x| x.as_str()).map(String::from);
+        let tags = v
+            .get("tags")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let is_mutation = v.get("is_mutation").and_then(|x| x.as_bool()).unwrap_or(false);
 
         Some(Self {
             name,
@@ -340,6 +459,11 @@ impl ToolRecord {
             charter_policy,
             metadata,
             idempotent_cacheable,
+            canary_version,
+            canary_weight_pct,
+            fallback_tool,
+            tags,
+            is_mutation,
         })
     }
 }

@@ -1,7 +1,7 @@
 {
   "name": "@rangow2260/omni-mcp",
-  "version": "2.0.1",
-  "description": "High-performance enterprise Model Context Protocol (MCP) gateway & management platform: dynamic virtual server routing, incremental discovery, wire translation, and response projection.",
+  "version": "3.0.0",
+  "description": "High-performance enterprise Model Context Protocol (MCP) gateway & management platform v3.0: dynamic virtual server routing, universal IDL discovery (Protobuf, Thrift, OpenAPI 3.1), OTel W3C distributed tracing, SHA-256 Merkle audit trail, canary weighted routing, autonomous planning, and streamable HTTP/SSE.",
   "main": "bin/omni-mcp.js",
   "bin": {
     "omni-mcp": "bin/omni-mcp.js",

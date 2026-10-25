@@ -72,6 +72,8 @@ impl AutoCrawler {
                     || (content.contains("service ") && content.contains("rpc "))
                 {
                     IDLParser::parse_protobuf(&content)
+                } else if content.contains("\"openapi\"") || content.contains("\"swagger\"") {
+                    IDLParser::parse_openapi(&content)
                 } else if content.contains("namespace ") || content.contains("service ") {
                     IDLParser::parse_thrift(&content)
                 } else {
@@ -116,6 +118,8 @@ impl AutoCrawler {
                         tool_record.downstream_endpoint =
                             format!("muttley://{}/{}", virtual_server_name, method.name);
                         tool_record.downstream_method = method.name.clone();
+                        tool_record.tags = method.tags.clone();
+                        tool_record.is_mutation = method.is_mutation;
 
                         server_record.add_tool(tool_record);
                         discovered_tools += 1;

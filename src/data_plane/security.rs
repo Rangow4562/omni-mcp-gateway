@@ -6,13 +6,14 @@ use crate::models::{CharterPolicy, ServerRecord, ToolRecord};
 pub struct PIIRedactor;
 
 impl PIIRedactor {
-    /// Out-of-the-box zero-allocation-friendly scanner for PII and sensitive data patterns.
+    /// Out-of-the-box zero-allocation-friendly scanner for PII, secrets, and sensitive data patterns.
     pub fn redact_text(input: &str) -> String {
         let s1 = redact_emails(input);
         let s2 = redact_bearer_tokens(&s1);
-        let s3 = redact_credit_cards(&s2);
-        let s4 = redact_ssns(&s3);
-        redact_phones(&s4)
+        let s3 = redact_secrets(&s2);
+        let s4 = redact_credit_cards(&s3);
+        let s5 = redact_ssns(&s4);
+        redact_phones(&s5)
     }
 
     pub fn redact_payload(data: &JsonValue) -> JsonValue {
@@ -106,6 +107,52 @@ fn redact_bearer_tokens(s: &str) -> String {
                 cursor = tok_end;
                 i = tok_end;
                 continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[cursor..]);
+    out
+}
+
+fn redact_secrets(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        // AWS Key: AKIA... (20 chars total)
+        if i + 20 <= bytes.len() && &s[i..i + 4] == "AKIA" {
+            let is_aws = s[i + 4..i + 20]
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+            if is_aws {
+                out.push_str(&s[cursor..i]);
+                out.push_str("[REDACTED_AWS_KEY]");
+                cursor = i + 20;
+                i = cursor;
+                continue;
+            }
+        }
+
+        // OpenAI / Anthropic / GitHub / NPM API Keys (sk-..., ghp_..., gho_..., npm_...)
+        for prefix in &["sk-", "ghp_", "gho_", "npm_"] {
+            let p_len = prefix.len();
+            if i + p_len < bytes.len() && &s[i..i + p_len] == *prefix {
+                let mut end = i + p_len;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'-'))
+                {
+                    end += 1;
+                }
+                if end - (i + p_len) >= 16 {
+                    out.push_str(&s[cursor..i]);
+                    out.push_str("[REDACTED_API_KEY]");
+                    cursor = end;
+                    i = end;
+                    break;
+                }
             }
         }
         i += 1;

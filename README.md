@@ -1,4 +1,4 @@
-# Omni MCP (`omni-mcp` v2.0 — Native Rust Engine)
+# Omni MCP (`omni-mcp` v3.0 — Native Rust Autonomous Mesh & Resilience Engine)
 
 [![npm version](https://img.shields.io/npm/v/@rangow2260/omni-mcp.svg?style=flat-square&color=blue)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/@rangow2260/omni-mcp.svg?style=flat-square)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
@@ -8,11 +8,24 @@
 
 A high-performance, zero-dependency **Rust** enterprise Model Context Protocol (MCP) management platform and runtime gateway reconstructing and advancing the architecture documented (*"Designing MCP Gateway: Uber's MCP Management Platform"*, October 1, 2026).
 
-Omni MCP unifies hundreds of microservices and thousands of tools behind a standardized, sub-millisecond, token-optimized Rust gateway with built-in governance, binary wire protocol translation, incremental discovery, circuit breaking, semantic response caching, and ABAC security.
+Omni MCP unifies hundreds of microservices and thousands of tools behind a standardized, sub-millisecond, token-optimized Rust gateway with built-in governance, binary wire protocol translation, incremental discovery, circuit breaking, semantic response caching, ABAC security, OpenTelemetry W3C distributed tracing, canary weighted routing, and cryptographic Merkle audit logging.
 
 <p align="center">
   <img src="assets/omni-mcp-banner.png" alt="Omni MCP Gateway Banner" width="100%" />
 </p>
+
+---
+
+## 🚀 What's New in Version 3.0
+
+- 🌐 **Universal IDL Discovery (OpenAPI 3.1 & Swagger 2.0)**: Ingests OpenAPI 3.0/3.1 and Swagger 2.0 REST specifications alongside Protobuf v2/v3 and Thrift, generating validated MCP JSON schemas with tags, parameter models, and mutation awareness.
+- 🔭 **OpenTelemetry W3C Distributed Tracing**: Full W3C `traceparent` context extraction and downstream propagation (`00-{trace_id}-{span_id}-01`). Microsecond-precision spans collected and served at `/api/traces`.
+- 🔀 **Canary Weighted Routing & Resilient Fallback**: Route configurable percentages of traffic (`canary_weight_pct`) to experimental tool versions. When primary endpoints fail or circuit breakers trip, requests automatically execute configured fallback tools.
+- ⛓️ **Cryptographic SHA-256 Merkle Audit Trail**: Tamper-evident, zero-dependency chained ledger (`omni_audit.log`). Every agent invocation is cryptographically chained against the genesis block and exposed via `/api/audit`, `/api/audit/verify`, and `omni://audit/merkle-head`.
+- 🧠 **Autonomous Planning & Self-Healing Diagnostics**: LLM agents query `recommend_tools` to generate multi-step tool pipelines for high-level goals, and call `explain_error` for automated root cause analysis, circuit breaker status, and remediation suggestions.
+- 📦 **MCP Resources & Enterprise Prompts**: Full MCP `resources/list`, `resources/read`, `prompts/list`, and `prompts/get` support for accessing live schemas, raw IDLs, and incident investigation runbooks.
+- 🌊 **Streamable HTTP Server-Sent Events (SSE)**: Native `/sse` endpoint enabling event-driven streaming.
+- 🛡️ **DFA Secret & API Key Redaction**: Deterministic redaction covering AWS Access Keys (`AKIA...`), GitHub Tokens (`ghp_...`), NPM Tokens (`npm_...`), and OpenAI/Anthropic API keys (`sk-...`) alongside standard PII.
 
 ---
 
@@ -34,7 +47,7 @@ npx -y @rangow2260/omni-mcp mcp search driver
 
 ---
 
-## Why Rust 2.0? Key Advances Over v1.0
+## Why Rust? Key Advances Over Legacy Architectures
 
 - **Zero-Copy Copy-on-Write (`Arc`) Routing Table**: Data plane readers acquire `Arc<ServerRecord>` handles in nanoseconds without deep-cloning server/tool schemas or blocking concurrent workers.
 - **16-Shard Lock-Free-Contention Rate Limiter**: Token-bucket rate limiter sharded across 16 independent locks (`token:actor`), eliminating mutex contention under multi-agent load.
@@ -42,29 +55,35 @@ npx -y @rangow2260/omni-mcp mcp search driver
 - **TTL Semantic Response Cache**: Caches idempotent tool invocations (`service::tool::args`) with automatic cache invalidation whenever a tool's status or version changes in the Control Plane.
 - **JSON-RPC 2.0 Batch Execution & `batch_invoke_tools`**: Supports both array batch JSON-RPC 2.0 payloads and multi-tool batch execution via `/omni/mcp`.
 - **Durable WAL + Atomic Snapshot Storage Engine**: Crash-safe Write-Ahead Log (`.db-wal`) with 64-bit FNV-1a checksum verification and atomic snapshot compaction (`WalRegistryStore`).
-- **DFA PII Scanner**: High-speed deterministic state-machine redaction for emails, phone numbers, SSNs, credit cards, and bearer tokens.
+- **DFA PII & Secrets Scanner**: High-speed deterministic state-machine redaction for emails, phone numbers, SSNs, credit cards, AWS keys, GitHub tokens, and API tokens.
 - **Bounded Thread-Pool HTTP/1.1 Keep-Alive Server**: Persistent TCP connections with `TCP_NODELAY` and microsecond latency histograms (`p50`, `p95`, `p99`) exported to `/metrics`.
 
 ---
 
-## REA Claim Audit & Rust 2.0 Capabilities
+## REA Claim Audit & v3.0 Capabilities
 
 | Document Claim / Capability | Document Statement | Omni MCP Rust Implementation | Status |
 | :--- | :--- | :--- | :--- |
-| **800+ Servers / 5000+ Tools** | Gateway scales to enterprise volume without context exhaustion | Copy-on-Write `Arc<BTreeMap>` routing table + WAL storage | **Verified Documented Baseline** |
+| **800+ Servers / 5000+ Tools** | Gateway scales to enterprise volume without context exhaustion | Copy-on-Write `Arc<BTreeMap>` routing table + WAL storage | **Verified Baseline** |
 | **Control vs Data Plane** | Centralized Registry (Control) vs Proxy Gateway (Data) | Decoupled `omni_mcp::control_plane` & `omni_mcp::data_plane` | **Verified Architecture** |
-| **AutoCrawler** | Cadence workflow scanning IDL registry and native heartbeats | `AutoCrawler` workflow engine with Protobuf/Thrift AST parsers | **Verified Architecture** |
+| **AutoCrawler** | Cadence workflow scanning IDL registry and native heartbeats | `AutoCrawler` workflow engine with Protobuf/Thrift/OpenAPI parsers | **Verified Architecture** |
+| **Universal IDL Support** | Ingest gRPC, Thrift, and REST specifications | Protobuf v2/v3, Thrift AST, OpenAPI 3.1 & Swagger 2.0 parsers | **v3.0 Upgrade** |
 | **Disabled by Default** | Discovery doesn't imply exposure; tools require review & approval | Strict `ToolStatus::Disabled` state machine; requires explicit enablement | **Verified Principle** |
 | **Diffs & Rollback** | Tool edits trigger diffs requiring approval; supports rollback | Versioned `ConfigDiff` engine with approval gates and rollback | **Verified Feature** |
 | **Dynamic Routing** | Materializes virtual servers at `/<service-name>/mcp` without redeploy | Dynamic HTTP/1.1 dispatch table refreshed on background cadence | **Verified Data Plane** |
 | **Wire Translation** | Translates JSON-RPC to HTTP, gRPC, TChannel wire formats | `ProtocolTranslator` binary framing for HTTP, gRPC, TChannel | **Verified Data Plane** |
 | **Muttley Delegation** | Downstream calls routed via Muttley service mesh sidecar | `MuttleyMeshClient` sidecar adapter with `p50`/`p95`/`p99` histograms | **Verified Integration** |
-| **Security & ABAC** | Server/tool charter policies for humans, services, agents; PII redaction | `SecurityCharterEngine` + DFA `PIIRedactor` | **Verified Security Model** |
-| **Omni MCP** | Proxy enabling incremental discovery via 4 standard tools | `OmniMCPServer` with BM25-style ranking + `batch_invoke_tools` | **Verified Context Feature** |
+| **Security & ABAC** | Server/tool charter policies for humans, services, agents; PII redaction | `SecurityCharterEngine` + DFA `PIIRedactor` (with API key redaction) | **Verified Security Model** |
+| **Omni MCP Discovery** | Proxy enabling incremental discovery via standard tools | `OmniMCPServer` with BM25 ranking + `recommend_tools` + `explain_error` | **v3.0 Upgrade** |
+| **MCP Resources & Prompts**| Full resource catalog and diagnostic runbooks | `resources/list`, `resources/read`, `prompts/list`, `prompts/get` | **v3.0 Upgrade** |
+| **OpenTelemetry Tracing** | Distributed end-to-end W3C request tracing | `traceparent` context injection, in-memory collector, `/api/traces` | **v3.0 Upgrade** |
+| **Canary & Resilient Fallback**| Safe progressive rollouts and fault-tolerant fallbacks | Percentage weighted traffic routing + automatic fallback execution | **v3.0 Upgrade** |
+| **Cryptographic Audit** | Tamper-evident immutable ledger for enterprise compliance | Zero-dependency FIPS 180-4 SHA-256 Merkle chained audit store | **v3.0 Upgrade** |
+| **Streamable SSE** | Server-Sent Events streaming for tool execution | Native `/sse` endpoint with event dispatch | **v3.0 Upgrade** |
 | **Response Projection** | GraphQL-like nested path array trimming response in runtime | `ResponseProjectionEngine` supporting nested keys, `items[].field`, and `*` | **Verified Token Optimization** |
 | **Code Mode (`aifx`)** | CLI for coding agents: `mcp list`, `mcp search`, `mcp call` | Native `omni` and `aifx` Rust binaries + `mcp bench` micro-benchmark | **Verified CLI Interface** |
-| **Resilience & Caching** | Enterprise fault tolerance and sub-millisecond tail latency | `CircuitBreakerRegistry` + `SemanticResponseCache` + Batch JSON-RPC | **Advanced Rust 2.0 Upgrade** |
-| **Registry & Tool UI** | Web interfaces for reviewing configs, diffs, and testing (Figs 3 & 4) | React 18 + Vite application served statically from `ui/dist` at `/` | **Verified Documented UI** |
+| **Resilience & Caching** | Enterprise fault tolerance and sub-millisecond tail latency | `CircuitBreakerRegistry` + `SemanticResponseCache` + Batch JSON-RPC | **Verified Data Plane** |
+| **Registry & Tool UI** | Web interfaces for reviewing configs, diffs, and testing | React 18 + Vite application served statically from `ui/dist` at `/` | **Verified Documented UI** |
 
 ---
 
@@ -79,25 +98,27 @@ npx -y @rangow2260/omni-mcp mcp search driver
                         │                         │
                         ▼                         ▼
                   Omni MCP Proxy              omni / aifx CLI
-              (BM25 Incremental Search)      (Native Rust Binary)
+             (BM25 Search + Planning)       (Native Rust Binary)
                         │                         │
                         └──────────┬──────────────┘
                                    │
                                    ▼
-             ┌───────────────────────────────────────────────┐
-             │     RUST DATA PLANE (Proxy Gateway Runtime)   │
-             │   Dynamic Virtual Servers: /<service-name>/mcp│
-             ├───────────────────────────────────────────────┤
-             │  • CoW Arc<BTreeMap> In-Memory Routing Table  │
-             │  • 16-Shard Token-Bucket Rate Limiter         │
-             │  • ABAC Charter Policy Engine (Actor Access)  │
-             │  • Per-Service Circuit Breaker (Fast-Fail)    │
-             │  • TTL Semantic Response Cache (Idempotent)   │
-             │  • Response Projection Engine (Field Trimmer) │
-             │  • DFA PII / Sensitive Data Redactor          │
-             │  • Binary Wire Translators (gRPC / Thrift)    │
-             │  • Muttley Mesh Client (p50/p95/p99 Metrics)  │
-             └───────────────────────┬───────────────────────┘
+             ┌──────────────────────────────────────────────────┐
+             │     RUST DATA PLANE (Proxy Gateway Runtime)      │
+             │   Dynamic Virtual Servers: /<service-name>/mcp   │
+             ├──────────────────────────────────────────────────┤
+             │  • CoW Arc<BTreeMap> In-Memory Routing Table     │
+             │  • 16-Shard Token-Bucket Rate Limiter            │
+             │  • OpenTelemetry W3C Trace Injector & Collector  │
+             │  • Canary Weighted Traffic Router (0-100%)       │
+             │  • Resilient Automatic Fallback Tool Execution   │
+             │  • Per-Service Circuit Breaker (Fast-Fail)       │
+             │  • TTL Semantic Response Cache (Idempotent)      │
+             │  • Response Projection Engine (Field Trimmer)    │
+             │  • DFA PII & API Key Redactor                    │
+             │  • Wire Translators (HTTP, gRPC, Thrift)         │
+             │  • SHA-256 Merkle Cryptographic Audit Logger     │
+             └───────────────────────┬──────────────────────────┘
                                      │
                  ┌───────────────────┴───────────────────┐
                  ▼                                       ▼
@@ -107,151 +128,56 @@ npx -y @rangow2260/omni-mcp mcp search driver
                                    ▲
                                    │ (Syncs Config)
                                    │
-             ┌───────────────────────────────────────────────┐
-             │       RUST CONTROL PLANE (MCP Registry)       │
-             ├───────────────────────────────────────────────┤
-             │  • Durable WAL + Atomic Snapshot Store        │
-             │  • Disabled-by-Default Policy Enforcer        │
-             │  • Config Diff Review, Approval & Rollback    │
-             │  • AutoCrawler Cadence Engine                 │
-             │  • IDL Parser (Protobuf & Thrift AST + Maps)  │
-             │  • LLM Description Enrichment Generator       │
-             │  • MCPFx Heartbeat Listener                   │
-             │  • 3P OAuth Token Exchanger (Jira / Google)   │
-             └───────────────────────────────────────────────┘
+             ┌──────────────────────────────────────────────────┐
+             │       RUST CONTROL PLANE (MCP Registry)          │
+             ├──────────────────────────────────────────────────┤
+             │  • Durable WAL + Atomic Snapshot Store           │
+             │  • Disabled-by-Default Policy Enforcer           │
+             │  • Config Diff Review, Approval & Rollback       │
+             │  • AutoCrawler Universal IDL Engine              │
+             │    - Protobuf v2/v3 AST Parser                   │
+             │    - Thrift AST Parser                           │
+             │    - OpenAPI 3.1 & Swagger 2.0 Parser            │
+             │  • LLM Description Enrichment Generator          │
+             │  • MCPFx Heartbeat Listener                      │
+             │  • 3P OAuth Token Exchanger (Jira / Google)      │
+             └──────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Repository Structure
+## Available Endpoints & APIs
 
-```text
-omni-mcp/
-├── Cargo.toml                  # High-performance LTO release profile configuration
-├── package.json                # NPM distribution package (@rangow2260/omni-mcp)
-├── LICENSE                     # Apache License 2.0
-├── bin/
-│   └── omni-mcp.js             # Zero-dependency cross-platform native binary runner
-├── examples/
-│   └── mcp-configs/
-│       ├── claude_desktop_config.json # Claude Desktop configuration
-│       ├── cursor_mcp.json            # Cursor / Windsurf configuration
-│       └── python_harness_agent.py    # Official MCP Python SDK harness client
-├── docker-compose.yml          # Containerized deployment with persistent volume
-├── .env.example                # Enterprise environment configuration template
-├── src/
-│   ├── lib.rs                  # Library root exporting all platform modules
-│   ├── main.rs                 # `omni-gateway` binary entrypoint (HTTP + stdio)
-│   ├── json.rs                 # RFC-8259 JSON AST, parser, serializer & `json!` macro
-│   ├── config.rs               # Environment configuration with sensible production defaults
-│   ├── logging.rs              # Microsecond-precision structured JSON telemetry
-│   ├── server.rs               # Bounded thread-pool HTTP/1.1 & stdio JSON-RPC 2.0 server
-│   ├── models/
-│   │   ├── mod.rs
-│   │   ├── entities.rs         # ServerRecord, ToolRecord, ToolStatus, ProtocolType, CharterPolicy, ConfigDiff
-│   │   └── rpc.rs              # RPCRequest, RPCBatchOrSingle, RPCResponse, RPCError & error codes
-│   ├── storage/
-│   │   ├── mod.rs
-│   │   └── wal_store.rs        # Durable Write-Ahead Log (WAL) + Atomic Snapshot Store (FNV-1a checksums)
-│   ├── control_plane/
-│   │   ├── mod.rs
-│   │   ├── registry.rs         # Concurrent RwLock versioned store, diff approvals, rollback engine
-│   │   ├── crawler.rs          # AutoCrawler Cadence discovery workflow engine
-│   │   ├── idl_parser.rs       # Protobuf (proto2/proto3 + maps) and Thrift AST parser -> JSON Schema
-│   │   ├── description_gen.rs  # LLM description enrichment generator
-│   │   ├── native_monitor.rs   # MCPFx heartbeat monitor and listTools discovery
-│   │   └── third_party.rs      # 3P OAuth token exchange adapter (Jira, Google)
-│   ├── data_plane/
-│   │   ├── mod.rs
-│   │   ├── cache.rs            # Copy-on-Write Arc<BTreeMap> config cache with background sync
-│   │   ├── rate_limiter.rs     # 16-shard token-bucket rate limiter
-│   │   ├── circuit_breaker.rs  # Per-service Circuit Breaker & TTL Semantic Response Cache
-│   │   ├── security.rs         # ABAC charter policies & DFA PII redactor
-│   │   ├── projection.rs       # Response Projection engine (nested paths, arrays `[]`, wildcards `*`)
-│   │   ├── translators.rs      # HTTP, gRPC (Protobuf binary frame), and TChannel (Thrift binary frame)
-│   │   ├── muttley.rs          # Muttley service mesh sidecar client with p50/p95/p99 latency tracking
-│   │   └── gateway.rs          # Dynamic virtual server router (/<service-name>/mcp), single & batch RPC
-│   ├── extension/
-│   │   ├── mod.rs
-│   │   ├── omni_mcp.rs         # Omni MCP proxy server (discover_server, discover_tools, get_tool_schema, invoke_tool, batch_invoke_tools)
-│   │   └── aifx.rs             # Code Mode CLI & built-in data-plane micro-benchmark
-│   └── bin/
-│       ├── omni.rs             # `omni` CLI binary
-│       └── aifx.rs             # `aifx` CLI binary
-├── ui/                         # React 18 + Vite dashboard (Figures 3 & 4)
-│   └── dist/                   # Production built assets served by `omni-gateway`
-└── tests/
-    └── integration_tests.rs    # Comprehensive integration & unit test suite
-```
-
----
-
-## Build from Source (Cargo)
-
-### 1. Build Release Binaries
-
-```bash
-cargo build --release
-```
-
-### 2. Run the Gateway Server
-
-```bash
-# Starts the multi-threaded Rust HTTP/1.1 keep-alive server on port 8080
-./target/release/omni-gateway 8080
-```
-
-Available Endpoints:
+### HTTP / REST Endpoints
 - **Interactive UI Dashboard**: `http://localhost:8080/`
 - **Liveness Probe**: `http://localhost:8080/healthz`
 - **Readiness Probe**: `http://localhost:8080/readyz`
 - **Prometheus Metrics**: `http://localhost:8080/metrics`
-- **Omni MCP Proxy**: `http://localhost:8080/omni/mcp`
-- **Virtual Endpoints**: `http://localhost:8080/<service-name>/mcp`
-- **REST Catalog API**: `http://localhost:8080/api/servers`, `http://localhost:8080/api/stats`, `http://localhost:8080/api/diffs`
+- **Server-Sent Events (SSE)**: `http://localhost:8080/sse`
+- **OpenTelemetry Traces**: `http://localhost:8080/api/traces`
+- **Merkle Audit Trail**: `http://localhost:8080/api/audit`
+- **Cryptographic Audit Verification**: `http://localhost:8080/api/audit/verify`
+- **REST Interactive Tool Execution**: `http://localhost:8080/api/execute`
+- **Centralized Omni MCP Proxy**: `http://localhost:8080/omni/mcp`
+- **Direct Virtual Service Endpoints**: `http://localhost:8080/<service-name>/mcp`
 
----
+### Omni MCP Discovery & Autonomous Planning Tools
 
-### 3. Code Mode CLI (`omni` / `aifx`)
-
-```bash
-# List all registered servers
-./target/release/aifx mcp list
-
-# Search for tools across all servers
-./target/release/aifx mcp search driver
-
-# Invoke tool through gateway with Response Projection
-./target/release/aifx mcp call driverdispatchservice GetDriverLocation \
-  --args '{"driver_id": "drv_102"}' \
-  --project "data.driver.name,data.driver.vehicle.license_plate"
-
-# Save tool response directly to file for zero-context shell grep
-./target/release/aifx mcp call driverdispatchservice GetDriverLocation \
-  --args '{"driver_id": "drv_102"}' \
-  --output ./driver_info.json
-
-# Run built-in Rust Data Plane Benchmark
-./target/release/aifx mcp bench --iterations 50000
-```
-
----
-
-### 4. Running the Tests
-
-```bash
-cargo test
-```
+1. `discover_server`: Semantic keyword/intent discovery of virtual microservices across the enterprise.
+2. `discover_tools`: Inspect active, enabled tools for an identified microservice.
+3. `get_tool_schema`: Retrieve full JSON schema, parameter constraints, and canary metadata.
+4. `invoke_tool`: Invoke discovered tools with optional GraphQL-style field projection (`_projection`).
+5. `batch_invoke_tools`: Execute parallel multi-tool call graphs in a single agent turn.
+6. `recommend_tools`: Autonomous planning tool analyzing agent goals to recommend an ordered pipeline of tools across microservices.
+7. `explain_error`: Self-healing diagnostics tool providing root cause analysis, circuit breaker status, and fallback options.
 
 ---
 
 ## MCP Server Integration & Agent Harness Setup
 
-Omni MCP can be plugged directly into any MCP-compatible client, IDE, or multi-agent orchestration framework (Claude Desktop, Cursor, Antigravity, LangChain, AutoGen, CrewAI).
+Omni MCP plugs directly into Claude Desktop, Cursor, Antigravity, or Python agent harnesses.
 
 ### Option 1: NPX Zero-Install (Recommended)
-
-Run directly via `npx` (requires Node.js 18+):
 
 ```bash
 # Start as stdio MCP server for agent harnesses
@@ -264,7 +190,7 @@ npx -y @rangow2260/omni-mcp 8080
 npx -y @rangow2260/omni-mcp mcp list
 ```
 
-In your client configuration (`claude_desktop_config.json`, `.cursor/mcp.json`, `mcp_config.json`):
+Client configuration (`claude_desktop_config.json`, `.cursor/mcp.json`, `mcp_config.json`):
 
 ```json
 {
@@ -281,8 +207,6 @@ In your client configuration (`claude_desktop_config.json`, `.cursor/mcp.json`, 
 
 ### Option 2: Direct Native Binary (Zero-Dependency)
 
-Run the precompiled native Rust binary with `--stdio` to start the JSON-RPC 2.0 stdio engine:
-
 ```json
 {
   "mcpServers": {
@@ -297,14 +221,11 @@ Run the precompiled native Rust binary with `--stdio` to start the JSON-RPC 2.0 
 }
 ```
 
-> **Direct Server Mode**: To isolate the agent to a specific microservice's tools without the discovery meta-tools, add `--server <name>`:
-> `"args": ["-y", "@rangow2260/omni-mcp", "--stdio", "--server", "driverdispatchservice"]`.
-
 ---
 
 ### Option 3: Remote / Streamable HTTP Transport
 
-Start the gateway daemon on port 8080 (`npx -y @rangow2260/omni-mcp 8080` or `./target/release/omni-gateway 8080`), then configure clients using the HTTP endpoint:
+Start the gateway daemon on port 8080 (`npx -y @rangow2260/omni-mcp 8080`), then configure clients:
 
 - **Centralized Omni Discovery Proxy**: `http://localhost:8080/omni/mcp`
 - **Direct Virtual Service Endpoints**: `http://localhost:8080/<service-name>/mcp`
@@ -323,7 +244,7 @@ For clients requiring `mcp-remote` over stdio:
 
 ---
 
-### Client & Agent Harness Configuration Examples
+## Client & Agent Harness Configuration Examples
 
 #### 1. Claude Desktop (`claude_desktop_config.json`)
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`

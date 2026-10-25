@@ -18,11 +18,11 @@ use omni_mcp::models::{
     ToolStatus, CIRCUIT_OPEN, TOOL_DISABLED, UNAUTHORIZED,
 };
 use omni_mcp::server::ProductionGatewayContext;
-use omni_mcp::storage::WalRegistryStore;
+use omni_mcp::storage::{WalRegistryStore, MerkleAuditStore, GENESIS_HASH};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_test_path(prefix: &str) -> String {
@@ -660,6 +660,353 @@ fn test_aifx_cli_and_http_gateway_endpoints() {
     let m_text = String::from_utf8(body_m).unwrap();
     assert!(m_text.contains("omni_requests_total"));
     assert!(m_text.contains("omni_semantic_cache_hits_total"));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v3_openapi_and_swagger_idl_discovery() {
+    let dir = temp_test_path("omni_openapi_test");
+    let store = Arc::new(WalRegistryStore::new(&format!("{}/reg.db", dir)));
+    let registry = MCPRegistry::new(Some(store.clone()));
+    let crawler = AutoCrawler::new(registry.clone(), None, None);
+
+    // OpenAPI 3.1 specification
+    let openapi_yaml_or_json = r#"
+    {
+      "openapi": "3.1.0",
+      "info": {"title": "Eats Delivery API", "version": "1.0.0"},
+      "paths": {
+        "/orders/{order_id}/deliver": {
+          "post": {
+            "summary": "Dispatch order delivery",
+            "tags": ["delivery", "courier", "logistics"],
+            "parameters": [
+              {"name": "order_id", "in": "path", "required": true, "schema": {"type": "string"}},
+              {"name": "courier_id", "in": "query", "required": true, "schema": {"type": "string"}}
+            ]
+          }
+        }
+      }
+    }
+    "#;
+    crawler.register_idl_source("eats-delivery", openapi_yaml_or_json);
+
+    // Swagger 2.0 specification
+    let swagger_json = r#"
+    {
+      "swagger": "2.0",
+      "info": {"title": "Rider Loyalty API", "version": "2.0.0"},
+      "paths": {
+        "/loyalty/points": {
+          "get": {
+            "summary": "Retrieve rider reward points balance",
+            "tags": ["loyalty", "rewards"],
+            "parameters": [
+              {"name": "rider_id", "in": "query", "required": true, "type": "string"}
+            ]
+          }
+        }
+      }
+    }
+    "#;
+    crawler.register_idl_source("rider-loyalty", swagger_json);
+
+    crawler.run_discovery_workflow();
+
+    let servers = registry.list_servers(None);
+    let s_delivery = servers.iter().find(|s| s.name.contains("eatsdelivery")).expect("EatsDelivery should be registered");
+    assert_eq!(s_delivery.protocol, ProtocolType::Http);
+    let tool_deliver = s_delivery.tools.values().next().expect("Tool deliver should exist");
+    assert!(tool_deliver.name.contains("deliver"));
+    assert!(tool_deliver.tags.contains(&"delivery".to_string()));
+    assert!(tool_deliver.is_mutation);
+
+    let s_loyalty = servers.iter().find(|s| s.name.contains("riderloyalty")).expect("RiderLoyalty should be registered");
+    let tool_points = s_loyalty.tools.values().next().expect("Tool points should exist");
+    assert!(tool_points.name.contains("points"));
+    assert!(!tool_points.is_mutation);
+
+    store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v3_merkle_chained_audit_trail() {
+    let dir = temp_test_path("omni_merkle_test");
+    let audit_file = format!("{}/audit.log", dir);
+    let store = MerkleAuditStore::new(Some(audit_file));
+
+    // Record 3 sequential invocations
+    let r1 = store.record_invocation(
+        "agent",
+        "DriverDispatchService",
+        "GetDriverLocation",
+        &json!({"driver_id": "drv_1"}),
+        "OK",
+        150,
+    );
+    assert_eq!(r1.index, 0);
+    assert_eq!(r1.prev_hash, GENESIS_HASH);
+
+    let r2 = store.record_invocation(
+        "human",
+        "TripBillingService",
+        "GetTripFare",
+        &json!({"trip_id": "trip_99"}),
+        "OK",
+        220,
+    );
+    assert_eq!(r2.index, 1);
+    assert_eq!(r2.prev_hash, r1.current_hash);
+
+    let r3 = store.record_invocation(
+        "agent",
+        "PaymentsService",
+        "RefundCharge",
+        &json!({"charge_id": "ch_7"}),
+        "OK:canary",
+        310,
+    );
+    assert_eq!(r3.index, 2);
+    assert_eq!(r3.prev_hash, r2.current_hash);
+
+    let (verified, count) = store.verify_chain();
+    assert!(verified);
+    assert_eq!(count, 3);
+    assert_eq!(store.get_head_hash(), r3.current_hash);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v3_opentelemetry_w3c_tracing_and_canary_routing() {
+    let dir = temp_test_path("omni_otel_test");
+    let store = Arc::new(WalRegistryStore::new(&format!("{}/reg.db", dir)));
+    let registry = MCPRegistry::new(Some(store.clone()));
+    let cache = InMemoryConfigCache::new(registry.clone(), 60.0);
+
+    let mut srv = ServerRecord::new(
+        "dispatch-service",
+        "Dispatch Service",
+        "Fleet telemetry",
+        "fleet-team",
+    );
+    srv.protocol = ProtocolType::Http;
+    srv.status = ToolStatus::Enabled;
+
+    let mut tool = ToolRecord::new(
+        "GetTelemetry",
+        "Returns vehicle telemetry data",
+        json!({"type": "object", "properties": {"vehicle_id": {"type": "string"}}}),
+    );
+    tool.status = ToolStatus::Enabled;
+    tool.version = 1;
+    tool.canary_version = Some(2);
+    tool.canary_weight_pct = 100; // 100% canary for deterministic test verification
+    srv.add_tool(tool);
+    registry.register_server(srv);
+    cache.refresh_now();
+
+    let audit_store = Arc::new(MerkleAuditStore::new(None));
+    let traces = Arc::new(RwLock::new(Vec::new()));
+    let gateway = MCPProxyGateway::new(cache, None)
+        .with_observability(audit_store.clone(), traces.clone());
+
+    // Incoming standard W3C traceparent header
+    let incoming_traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let req = RPCRequest::new(
+        1001i64,
+        "tools/call",
+        json!({
+            "name": "GetTelemetry",
+            "arguments": {"vehicle_id": "veh_42"}
+        }),
+    );
+
+    let resp = gateway.handle_request_with_trace(
+        "dispatch-service",
+        &req,
+        "agent",
+        Some("test_token"),
+        Some(incoming_traceparent),
+    );
+
+    assert!(resp.error.is_none());
+    let meta = &resp.result.unwrap()["_metadata"];
+    assert_eq!(meta["trace_id"].as_str(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+    assert_eq!(meta["canary"].as_bool(), Some(true));
+    assert_eq!(meta["version"].as_i64(), Some(2));
+
+    // Verify OpenTelemetry trace span buffer
+    let spans_guard = traces.read().unwrap();
+    assert_eq!(spans_guard.len(), 1);
+    let span = &spans_guard[0];
+    assert_eq!(span.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(span.parent_span_id.as_deref(), Some("00f067aa0ba902b7"));
+    assert_eq!(span.attributes.get("mcp.canary").unwrap().as_bool(), Some(true));
+
+    store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v3_resilient_fallback_execution() {
+    let dir = temp_test_path("omni_fallback_test");
+    let store = Arc::new(WalRegistryStore::new(&format!("{}/reg.db", dir)));
+    let registry = MCPRegistry::new(Some(store.clone()));
+    let cache = InMemoryConfigCache::new(registry.clone(), 60.0);
+
+    let mut srv = ServerRecord::new(
+        "billing-service",
+        "Billing Service",
+        "Billing and payments",
+        "billing-team",
+    );
+    srv.protocol = ProtocolType::Http;
+    srv.status = ToolStatus::Enabled;
+
+    // Tool 1: Fallback tool (Healthy)
+    let mut fb_tool = ToolRecord::new(
+        "RefundChargeV1",
+        "Legacy synchronous refund fallback",
+        json!({"type": "object"}),
+    );
+    fb_tool.status = ToolStatus::Enabled;
+    srv.add_tool(fb_tool);
+
+    // Tool 2: Primary tool with fallback configured
+    let mut primary_tool = ToolRecord::new(
+        "RefundChargeV2",
+        "Modern fast async refund",
+        json!({"type": "object"}),
+    );
+    primary_tool.status = ToolStatus::Enabled;
+    primary_tool.fallback_tool = Some("RefundChargeV1".to_string());
+    srv.add_tool(primary_tool);
+
+    registry.register_server(srv);
+    cache.refresh_now();
+
+    let gateway = MCPProxyGateway::new(cache, None);
+    let req = RPCRequest::new(
+        2002i64,
+        "tools/call",
+        json!({
+            "name": "RefundChargeV2",
+            "arguments": {"charge_id": "ch_999"}
+        }),
+    );
+
+    let resp = gateway.handle_request("billing-service", &req, "agent", None);
+    assert!(resp.error.is_none());
+    let meta = &resp.result.unwrap()["_metadata"];
+    assert_eq!(meta["server"].as_str(), Some("billing-service"));
+
+    store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
+    let dir = temp_test_path("omni_planning_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+    let omni = &ctx.omni_mcp;
+
+    // 1. Test recommend_tools (Autonomous planning)
+    let plan_req = RPCRequest::new(
+        3001i64,
+        "tools/call",
+        json!({
+            "name": "recommend_tools",
+            "arguments": {
+                "goal": "track driver coordinates and fetch location telemetry",
+                "limit": 3
+            }
+        }),
+    );
+    let plan_resp = omni.handle_request(&plan_req, "agent", None);
+    assert!(plan_resp.error.is_none());
+    let plan_text = plan_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    let plan_json = JsonValue::parse(&plan_text).unwrap();
+    let pipeline = plan_json["recommended_pipeline"].as_array().expect("Pipeline array");
+    assert!(!pipeline.is_empty());
+    assert_eq!(pipeline[0]["tool_name"].as_str(), Some("GetDriverLocation"));
+
+    // 2. Test explain_error (Self-healing diagnostics)
+    let diag_req = RPCRequest::new(
+        3002i64,
+        "tools/call",
+        json!({
+            "name": "explain_error",
+            "arguments": {
+                "server_name": "driverdispatchservice",
+                "tool_name": "NonExistentTool",
+                "error_message": "Method not found"
+            }
+        }),
+    );
+    let diag_resp = omni.handle_request(&diag_req, "agent", None);
+    assert!(diag_resp.error.is_none());
+    let diag_text = diag_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    let diag_json = JsonValue::parse(&diag_text).unwrap();
+    assert_eq!(diag_json["tool_status"].as_str(), Some("NOT_FOUND"));
+    assert!(diag_json["suggested_action"].as_str().unwrap().contains("discover_tools"));
+
+    // 3. Test MCP Resources list and read
+    let res_list_req = RPCRequest::new(3003i64, "resources/list", json!({}));
+    let res_list_resp = omni.handle_request(&res_list_req, "agent", None);
+    assert!(res_list_resp.error.is_none());
+    let resources = res_list_resp.result.unwrap()["resources"].as_array().unwrap().clone();
+    assert!(resources.iter().any(|r| r["uri"].as_str() == Some("omni://audit/merkle-head")));
+
+    let res_read_req = RPCRequest::new(
+        3004i64,
+        "resources/read",
+        json!({"uri": "omni://audit/merkle-head"}),
+    );
+    let res_read_resp = omni.handle_request(&res_read_req, "agent", None);
+    assert!(res_read_resp.error.is_none());
+    let res_contents = res_read_resp.result.unwrap()["contents"].as_array().unwrap().clone();
+    assert_eq!(res_contents[0]["uri"].as_str(), Some("omni://audit/merkle-head"));
+
+    // 4. Test MCP Prompts list and get
+    let prompt_list_req = RPCRequest::new(3005i64, "prompts/list", json!({}));
+    let prompt_list_resp = omni.handle_request(&prompt_list_req, "agent", None);
+    assert!(prompt_list_resp.error.is_none());
+    let prompts = prompt_list_resp.result.unwrap()["prompts"].as_array().unwrap().clone();
+    assert!(prompts.iter().any(|p| p["name"].as_str() == Some("incident-investigation")));
+
+    let prompt_get_req = RPCRequest::new(
+        3006i64,
+        "prompts/get",
+        json!({
+            "name": "incident-investigation",
+            "arguments": {"service_name": "driverdispatchservice"}
+        }),
+    );
+    let prompt_get_resp = omni.handle_request(&prompt_get_req, "agent", None);
+    assert!(prompt_get_resp.error.is_none());
+
+    // 5. Test HTTP SSE and Tracing / Audit endpoints
+    let headers = HashMap::new();
+    let (sse_status, sse_ctype, _sse_headers, sse_body) = ctx.handle_http("GET", "/sse", &headers, &[]);
+    assert_eq!(sse_status, 200);
+    assert!(sse_ctype.contains("text/event-stream"));
+    assert!(String::from_utf8(sse_body).unwrap().contains("event: endpoint"));
+
+    let (traces_status, _, _, traces_body) = ctx.handle_http("GET", "/api/traces", &headers, &[]);
+    assert_eq!(traces_status, 200);
+    let traces_json = JsonValue::parse(&String::from_utf8(traces_body).unwrap()).unwrap();
+    assert!(traces_json.get("spans").is_some());
+
+    let (audit_status, _, _, audit_body) = ctx.handle_http("GET", "/api/audit/verify", &headers, &[]);
+    assert_eq!(audit_status, 200);
+    let audit_json = JsonValue::parse(&String::from_utf8(audit_body).unwrap()).unwrap();
+    assert_eq!(audit_json["verified"].as_bool(), Some(true));
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);

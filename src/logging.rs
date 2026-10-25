@@ -18,6 +18,13 @@ pub fn now_epoch_millis() -> u64 {
         .unwrap_or(0)
 }
 
+pub fn now_epoch_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 pub struct LogEvent<'a> {
     pub level: &'a str,
     pub message: &'a str,

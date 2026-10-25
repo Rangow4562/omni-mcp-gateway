@@ -2,8 +2,9 @@ pub mod entities;
 pub mod rpc;
 
 pub use entities::{
-    ActorType, CharterPolicy, ConfigDiff, HistoryEntry, ProtocolType, ServerRecord, ToolRecord,
-    ToolStatus,
+    format_traceparent, generate_span_id, generate_trace_id, parse_traceparent, ActorType,
+    CharterPolicy, ConfigDiff, HistoryEntry, ProtocolType, ServerRecord, ToolRecord, ToolStatus,
+    TraceSpan,
 };
 pub use rpc::{
     RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse, CIRCUIT_OPEN, DOWNSTREAM_ERROR,
