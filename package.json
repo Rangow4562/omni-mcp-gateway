@@ -4,8 +4,8 @@
   "description": "High-performance enterprise Model Context Protocol (MCP) gateway & management platform: dynamic virtual server routing, incremental discovery, wire translation, and response projection.",
   "main": "bin/omni-mcp.js",
   "bin": {
-    "omni-mcp": "./bin/omni-mcp.js",
-    "omni-gateway": "./bin/omni-mcp.js"
+    "omni-mcp": "bin/omni-mcp.js",
+    "omni-gateway": "bin/omni-mcp.js"
   },
   "files": [
     "bin",
@@ -31,7 +31,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Rangow4562/omni-mcp-gateway.git"
+    "url": "git+https://github.com/Rangow4562/omni-mcp-gateway.git"
   },
   "bugs": {
     "url": "https://github.com/Rangow4562/omni-mcp-gateway/issues"
