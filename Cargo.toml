@@ -1,6 +1,6 @@
 [package]
 name = "omni-mcp"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2021"
 authors = ["Omni MCP Engineering"]
 description = "High-performance Rust enterprise Model Context Protocol (MCP) Management Platform & Runtime Gateway: AutoCrawler IDL discovery, lock-free CoW virtual server routing, binary wire protocol translation (HTTP, gRPC, TChannel), circuit breaking, semantic response caching, BM25 Omni MCP incremental discovery, Response Projection, and Code Mode CLI."
