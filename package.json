@@ -1,5 +1,5 @@
 {
-  "name": "omni-mcp",
+  "name": "@rangow2260/omni-mcp",
   "version": "2.0.0",
   "description": "High-performance enterprise Model Context Protocol (MCP) gateway & management platform: dynamic virtual server routing, incremental discovery, wire translation, and response projection.",
   "main": "bin/omni-mcp.js",

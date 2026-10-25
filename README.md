@@ -220,9 +220,39 @@ cargo test
 
 Omni MCP can be plugged directly into any MCP-compatible client, IDE, or multi-agent orchestration framework (Claude Desktop, Cursor, Antigravity, LangChain, AutoGen, CrewAI).
 
-### Option A: Standard Stdio Transport (Local Process)
+### Option A: NPX Zero-Install (Recommended)
 
-Run the native binary with `--stdio` to start the JSON-RPC 2.0 stdio engine:
+Run directly via `npx` (requires Node.js 18+):
+
+```bash
+# Start as stdio MCP server for agent harnesses
+npx -y @rangow2260/omni-mcp --stdio
+
+# Run the HTTP Gateway server on port 8080
+npx -y @rangow2260/omni-mcp 8080
+
+# Run Code Mode CLI
+npx -y @rangow2260/omni-mcp mcp list
+```
+
+In any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, `mcp_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "omni-mcp": {
+      "command": "npx",
+      "args": ["-y", "@rangow2260/omni-mcp", "--stdio"]
+    }
+  }
+}
+```
+
+---
+
+### Option B: Direct Native Binary (Zero-Dependency)
+
+Run the precompiled native Rust binary with `--stdio` to start the JSON-RPC 2.0 stdio engine:
 
 ```json
 {
@@ -239,7 +269,7 @@ Run the native binary with `--stdio` to start the JSON-RPC 2.0 stdio engine:
 ```
 
 > **Direct Server Mode**: To isolate the agent to a specific microservice's tools without the discovery meta-tools, add `--server <name>`:
-> `"args": ["--stdio", "--server", "driverdispatchservice"]`.
+> `"args": ["-y", "@rangow2260/omni-mcp", "--stdio", "--server", "driverdispatchservice"]`.
 
 ---
 
