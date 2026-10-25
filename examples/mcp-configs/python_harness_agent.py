@@ -1,6 +1,6 @@
 """
 Example MCP Client & Harness Agent using the official `mcp` Python SDK
-to connect to the Omni MCP Rust Gateway over stdio.
+to connect to the Omni MCP Gateway over stdio.
 """
 
 import asyncio
@@ -8,12 +8,18 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 async def run_harness_agent():
-    # 1. Configure stdio server parameters pointing to Omni Gateway binary
+    # Option 1: Use portable npx distribution (zero installation required)
     server_params = StdioServerParameters(
-        command=r"D:\Personal\Memory\omni-mcp\target\release\omni-gateway.exe",
-        args=["--stdio"],
-        env={"OMNI_DATA_DIR": r"D:\Personal\Memory\omni-mcp\target\data"}
+        command="npx",
+        args=["-y", "@rangow2260/omni-mcp", "--stdio"]
     )
+
+    # Option 2: Use direct compiled binary
+    # server_params = StdioServerParameters(
+    #     command=r"D:\Personal\Memory\omni-mcp\target\release\omni-gateway.exe",
+    #     args=["--stdio"],
+    #     env={"OMNI_DATA_DIR": r"D:\Personal\Memory\omni-mcp\target\data"}
+    # )
 
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
@@ -53,4 +59,3 @@ async def run_harness_agent():
 
 if __name__ == "__main__":
     asyncio.run(run_harness_agent())
-

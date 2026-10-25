@@ -1,5 +1,9 @@
 # Omni MCP (`omni-mcp` v2.0 — Native Rust Engine)
 
+[![npm version](https://img.shields.io/npm/v/@rangow2260/omni-mcp.svg?style=flat-square&color=blue)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
+[![npm downloads](https://img.shields.io/npm/dm/@rangow2260/omni-mcp.svg?style=flat-square)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](https://opensource.org/licenses/Apache-2.0)
+[![CI/CD](https://github.com/Rangow4562/omni-mcp-gateway/actions/workflows/rust.yml/badge.svg)](https://github.com/Rangow4562/omni-mcp-gateway/actions)
 [![M8ven Score](https://m8ven.ai/badge/mcp/rangow4562-omni-mcp-gateway-twjros?v=fd153b9f4d4191d6d0d111c8fbe1aa22)](https://m8ven.ai/mcp/rangow4562-omni-mcp-gateway-twjros?s=readme)
 
 A high-performance, zero-dependency **Rust** enterprise Model Context Protocol (MCP) management platform and runtime gateway reconstructing and advancing the architecture documented (*"Designing MCP Gateway: Uber's MCP Management Platform"*, October 1, 2026).
@@ -9,6 +13,24 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
 <p align="center">
   <img src="assets/omni-mcp-banner.png" alt="Omni MCP Gateway Banner" width="100%" />
 </p>
+
+---
+
+## ⚡ Instant Quick Start via NPX (Zero-Install)
+
+No Rust compiler, toolchain, or local build required:
+
+```bash
+# Start as stdio MCP server for agent harnesses (Claude, Cursor, Antigravity)
+npx -y @rangow2260/omni-mcp --stdio
+
+# Launch the multi-threaded HTTP/1.1 Gateway server on port 8080
+npx -y @rangow2260/omni-mcp 8080
+
+# Run the Code Mode CLI
+npx -y @rangow2260/omni-mcp mcp list
+npx -y @rangow2260/omni-mcp mcp search driver
+```
 
 ---
 
@@ -56,8 +78,8 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
                     AI Agents / LLMs / Shell Coding Agents
                         │                         │
                         ▼                         ▼
-                 Omni MCP Proxy              omni / aifx CLI
-             (BM25 Incremental Search)      (Native Rust Binary)
+                  Omni MCP Proxy              omni / aifx CLI
+              (BM25 Incremental Search)      (Native Rust Binary)
                         │                         │
                         └──────────┬──────────────┘
                                    │
@@ -101,21 +123,29 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
 
 ---
 
-## Codebase Structure
+## Repository Structure
 
-```
+```text
 omni-mcp/
-├── Cargo.toml                  # Rust crate & binary definitions (omni-gateway, omni, aifx)
-├── Dockerfile                  # Multi-stage Node + Rust release container build
+├── Cargo.toml                  # High-performance LTO release profile configuration
+├── package.json                # NPM distribution package (@rangow2260/omni-mcp)
+├── LICENSE                     # Apache License 2.0
+├── bin/
+│   └── omni-mcp.js             # Zero-dependency cross-platform native binary runner
+├── examples/
+│   └── mcp-configs/
+│       ├── claude_desktop_config.json # Claude Desktop configuration
+│       ├── cursor_mcp.json            # Cursor / Windsurf configuration
+│       └── python_harness_agent.py    # Official MCP Python SDK harness client
 ├── docker-compose.yml          # Containerized deployment with persistent volume
 ├── .env.example                # Enterprise environment configuration template
 ├── src/
 │   ├── lib.rs                  # Library root exporting all platform modules
-│   ├── main.rs                 # `omni-gateway` binary entrypoint
+│   ├── main.rs                 # `omni-gateway` binary entrypoint (HTTP + stdio)
 │   ├── json.rs                 # RFC-8259 JSON AST, parser, serializer & `json!` macro
 │   ├── config.rs               # Environment configuration with sensible production defaults
 │   ├── logging.rs              # Microsecond-precision structured JSON telemetry
-│   ├── server.rs               # Bounded thread-pool HTTP/1.1 keep-alive & JSON-RPC 2.0 server
+│   ├── server.rs               # Bounded thread-pool HTTP/1.1 & stdio JSON-RPC 2.0 server
 │   ├── models/
 │   │   ├── mod.rs
 │   │   ├── entities.rs         # ServerRecord, ToolRecord, ToolStatus, ProtocolType, CharterPolicy, ConfigDiff
@@ -156,7 +186,7 @@ omni-mcp/
 
 ---
 
-## Quick Start & Usage
+## Build from Source (Cargo)
 
 ### 1. Build Release Binaries
 
@@ -213,14 +243,13 @@ Available Endpoints:
 cargo test
 ```
 
-
 ---
 
 ## MCP Server Integration & Agent Harness Setup
 
 Omni MCP can be plugged directly into any MCP-compatible client, IDE, or multi-agent orchestration framework (Claude Desktop, Cursor, Antigravity, LangChain, AutoGen, CrewAI).
 
-### Option A: NPX Zero-Install (Recommended)
+### Option 1: NPX Zero-Install (Recommended)
 
 Run directly via `npx` (requires Node.js 18+):
 
@@ -235,7 +264,7 @@ npx -y @rangow2260/omni-mcp 8080
 npx -y @rangow2260/omni-mcp mcp list
 ```
 
-In any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, `mcp_config.json`):
+In your client configuration (`claude_desktop_config.json`, `.cursor/mcp.json`, `mcp_config.json`):
 
 ```json
 {
@@ -250,7 +279,7 @@ In any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, `mcp
 
 ---
 
-### Option B: Direct Native Binary (Zero-Dependency)
+### Option 2: Direct Native Binary (Zero-Dependency)
 
 Run the precompiled native Rust binary with `--stdio` to start the JSON-RPC 2.0 stdio engine:
 
@@ -273,9 +302,9 @@ Run the precompiled native Rust binary with `--stdio` to start the JSON-RPC 2.0 
 
 ---
 
-### Option B: Remote / Streamable HTTP Transport
+### Option 3: Remote / Streamable HTTP Transport
 
-Start the gateway daemon on port 8080 (`./target/release/omni-gateway 8080`), then configure clients using the HTTP endpoint:
+Start the gateway daemon on port 8080 (`npx -y @rangow2260/omni-mcp 8080` or `./target/release/omni-gateway 8080`), then configure clients using the HTTP endpoint:
 
 - **Centralized Omni Discovery Proxy**: `http://localhost:8080/omni/mcp`
 - **Direct Virtual Service Endpoints**: `http://localhost:8080/<service-name>/mcp`
@@ -304,8 +333,8 @@ For clients requiring `mcp-remote` over stdio:
 {
   "mcpServers": {
     "omni-mcp": {
-      "command": "D:\\Personal\\Memory\\omni-mcp\\target\\release\\omni-gateway.exe",
-      "args": ["--stdio"]
+      "command": "npx",
+      "args": ["-y", "@rangow2260/omni-mcp", "--stdio"]
     }
   }
 }
@@ -316,8 +345,8 @@ For clients requiring `mcp-remote` over stdio:
 {
   "mcpServers": {
     "omni-mcp": {
-      "command": "D:\\Personal\\Memory\\omni-mcp\\target\\release\\omni-gateway.exe",
-      "args": ["--stdio"]
+      "command": "npx",
+      "args": ["-y", "@rangow2260/omni-mcp", "--stdio"]
     }
   }
 }
@@ -328,8 +357,8 @@ For clients requiring `mcp-remote` over stdio:
 {
   "mcpServers": {
     "omni-mcp": {
-      "command": "D:\\Personal\\Memory\\omni-mcp\\target\\release\\omni-gateway.exe",
-      "args": ["--stdio"]
+      "command": "npx",
+      "args": ["-y", "@rangow2260/omni-mcp", "--stdio"]
     }
   }
 }
@@ -337,3 +366,11 @@ For clients requiring `mcp-remote` over stdio:
 
 #### 4. Python Agent Harness (`mcp` SDK)
 See [`examples/mcp-configs/python_harness_agent.py`](examples/mcp-configs/python_harness_agent.py) for a complete working agent implementation connecting to Omni MCP via `mcp.client.stdio.stdio_client`.
+
+---
+
+## License
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at:
+
+[http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)
