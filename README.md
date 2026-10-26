@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/omni-mcp-v4-banner.png" alt="Omni MCP 4.0 Banner" width="100%" />
+</p>
+
 # Omni MCP (`omni-mcp` v4.0 — Native Rust Code Mode & Autonomous Mesh Gateway)
 
 [![npm version](https://img.shields.io/npm/v/@rangow2260/omni-mcp.svg?style=flat-square&color=blue)](https://www.npmjs.com/package/@rangow2260/omni-mcp)

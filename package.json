@@ -18,6 +18,7 @@
   "keywords": [
     "mcp",
     "model-context-protocol",
+    "code-mode",
     "gateway",
     "ai",
     "llm",
@@ -25,7 +26,12 @@
     "claude",
     "cursor",
     "antigravity",
-    "discovery"
+    "discovery",
+    "grpc",
+    "microservices",
+    "protobuf",
+    "service-mesh",
+    "typescript-definitions"
   ],
   "author": "Omni MCP Engineering",
   "license": "Apache-2.0",
