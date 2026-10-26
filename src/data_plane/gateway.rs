@@ -5,6 +5,10 @@
 
 use crate::data_plane::cache::InMemoryConfigCache;
 use crate::data_plane::circuit_breaker::{CircuitBreakerRegistry, SemanticResponseCache};
+use crate::data_plane::codemode::{
+    CodeModeError, CodeModeExecutor, CodeModeTypeGenerator, CodeOutput, HostCallbacks,
+    PendingApproval, SandboxLimits, TypeGenerationResult,
+};
 use crate::data_plane::projection::ResponseProjectionEngine;
 use crate::data_plane::security::{PIIRedactor, SecurityCharterEngine};
 use crate::data_plane::translators::ProtocolTranslator;
@@ -569,5 +573,232 @@ impl MCPProxyGateway {
                 g.push(span);
             }
         }
+    }
+
+    /// Generates Cloudflare Code Mode TypeScript declarations (`declare namespace codemode { ... }`)
+    /// from the active OmniMCP catalog.
+    pub fn generate_codemode_types(
+        &self,
+        server_filter: Option<&str>,
+        search_query: Option<&str>,
+    ) -> TypeGenerationResult {
+        let servers = self.cache.list_servers();
+        CodeModeTypeGenerator::generate_declarations(&servers, server_filter, search_query)
+    }
+
+    /// Executes a Cloudflare Code Mode JS/TS (`async () => { ... }`) or Rust/Rhai script inside
+    /// the sub-millisecond in-process sandbox, routing all `codemode.<server>.<tool>()` calls
+    /// through the governed OmniMCP Data Plane.
+    pub fn execute_codemode(
+        &self,
+        code: &str,
+        limits: Option<SandboxLimits>,
+        require_mutation_approval: bool,
+        caller_actor: &str,
+        user_token: Option<&str>,
+        traceparent: Option<&str>,
+    ) -> CodeOutput {
+        let start_micros = now_epoch_micros();
+        let (trace_id, parent_span_id) = if let Some(tp) = traceparent {
+            parse_traceparent(tp)
+                .map(|(tid, sid)| (tid, Some(sid)))
+                .unwrap_or_else(|| (generate_trace_id(), None))
+        } else {
+            (generate_trace_id(), None)
+        };
+        let span_id = generate_span_id();
+        let codemode_traceparent = format_traceparent(&trace_id, &span_id);
+
+        let servers_snapshot = self.cache.list_servers();
+
+        let mut invoke_cb =
+            |raw_srv: &str, raw_tool: &str, args_vec: Vec<JsonValue>| -> Result<JsonValue, CodeModeError> {
+                // Resolve server by exact name or sanitized TypeScript identifier
+                let server_opt = self.cache.get_server(raw_srv).or_else(|| {
+                    servers_snapshot
+                        .iter()
+                        .find(|s| {
+                            s.name.eq_ignore_ascii_case(raw_srv)
+                                || CodeModeTypeGenerator::sanitize_ident(&s.name)
+                                    .eq_ignore_ascii_case(raw_srv)
+                        })
+                        .cloned()
+                });
+
+                let server = match server_opt {
+                    Some(s) => s,
+                    None => {
+                        return Err(CodeModeError::RuntimeError(format!(
+                            "Virtual MCP server '{}' not found in catalog",
+                            raw_srv
+                        )))
+                    }
+                };
+
+                let tool = server
+                    .tools
+                    .get(raw_tool)
+                    .or_else(|| {
+                        server.tools.values().find(|t| {
+                            t.name.eq_ignore_ascii_case(raw_tool)
+                                || CodeModeTypeGenerator::sanitize_ident(&t.name)
+                                    .eq_ignore_ascii_case(raw_tool)
+                        })
+                    })
+                    .ok_or_else(|| {
+                        CodeModeError::RuntimeError(format!(
+                            "Tool '{}' not found on server '{}'",
+                            raw_tool, server.name
+                        ))
+                    })?;
+
+                // Convert positional arguments into named JSON object if needed
+                let arg_obj = if args_vec.is_empty() {
+                    JsonValue::object()
+                } else if args_vec.len() == 1 && args_vec[0].is_object() {
+                    args_vec[0].clone()
+                } else {
+                    let mut obj = JsonValue::object();
+                    if let Some(props) =
+                        tool.input_schema.get("properties").and_then(|p| p.as_object())
+                    {
+                        for (idx, (prop_key, _)) in props.iter().enumerate() {
+                            if let Some(val) = args_vec.get(idx) {
+                                obj.insert(prop_key.clone(), val.clone());
+                            }
+                        }
+                    }
+                    for (idx, val) in args_vec.iter().enumerate() {
+                        let k = format!("arg{}", idx);
+                        if !obj.contains_key(&k) {
+                            obj.insert(k, val.clone());
+                        }
+                    }
+                    obj
+                };
+
+                // Human-in-the-loop Mutation Approval Gate
+                if require_mutation_approval && tool.is_mutation {
+                    return Err(CodeModeError::ApprovalRequired(PendingApproval {
+                        server_name: server.name.clone(),
+                        tool_name: tool.name.clone(),
+                        arguments: arg_obj,
+                        reason: format!(
+                            "Tool '{}.{}' is a state-mutating operation (is_mutation=true) and requires approval before execution.",
+                            server.name, tool.name
+                        ),
+                    }));
+                }
+
+                let rpc_req = RPCRequest::new(
+                    1,
+                    "tools/call",
+                    json!({
+                        "name": tool.name.clone(),
+                        "arguments": arg_obj
+                    }),
+                );
+
+                let rpc_resp = self.handle_request_with_trace(
+                    &server.name,
+                    &rpc_req,
+                    caller_actor,
+                    user_token,
+                    Some(&codemode_traceparent),
+                );
+
+                if let Some(err) = rpc_resp.error {
+                    return Err(CodeModeError::RuntimeError(err.message));
+                }
+
+                if let Some(res) = rpc_resp.result {
+                    if let Some(text) = res
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
+                        if let Ok(parsed) = JsonValue::parse(text) {
+                            return Ok(parsed);
+                        }
+                    }
+                    return Ok(res);
+                }
+
+                Ok(JsonValue::Null)
+            };
+
+        let search_cb = |query: &str| -> JsonValue {
+            let q = query.trim().to_lowercase();
+            let mut matches = Vec::new();
+            for s in &servers_snapshot {
+                if s.status != ToolStatus::Enabled {
+                    continue;
+                }
+                for t in s.tools.values() {
+                    if t.status != ToolStatus::Enabled {
+                        continue;
+                    }
+                    let haystack = format!(
+                        "{} {} {} {}",
+                        s.name,
+                        t.name,
+                        t.description,
+                        t.tags.join(" ")
+                    )
+                    .to_lowercase();
+                    if q.is_empty() || q.split_whitespace().any(|tok| haystack.contains(tok)) {
+                        matches.push(json!({
+                            "server": CodeModeTypeGenerator::sanitize_ident(&s.name),
+                            "tool": CodeModeTypeGenerator::sanitize_ident(&t.name),
+                            "description": t.description.clone(),
+                            "is_mutation": t.is_mutation
+                        }));
+                    }
+                }
+            }
+            JsonValue::Array(matches)
+        };
+
+        let describe_cb = |srv: &str, tool_opt: Option<&str>| -> String {
+            CodeModeTypeGenerator::generate_declarations(&servers_snapshot, Some(srv), tool_opt)
+                .typescript_declarations
+        };
+
+        let mut host = HostCallbacks {
+            invoke_tool: &mut invoke_cb,
+            search_catalog: &search_cb,
+            describe_types: &describe_cb,
+        };
+
+        let executor = CodeModeExecutor::new(limits.unwrap_or_default());
+        let mut output = executor.execute(code, &mut host, &codemode_traceparent);
+
+        // Apply PII & Secret Redaction on the final sandbox result
+        output.result = PIIRedactor::redact_payload(&output.result);
+
+        let total_us = output.boot_parse_us + output.eval_us;
+        self.record_telemetry_and_audit(
+            &trace_id,
+            &span_id,
+            parent_span_id.as_deref(),
+            "omni-codemode",
+            "codemode",
+            caller_actor,
+            &json!({
+                "ops_consumed": output.ops_consumed as i64,
+                "tool_calls": output.tool_calls as i64,
+                "require_mutation_approval": require_mutation_approval
+            }),
+            &format!("{}:codemode", output.status),
+            start_micros,
+            total_us,
+            false,
+            false,
+            false,
+        );
+
+        output
     }
 }

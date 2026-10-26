@@ -241,6 +241,77 @@ impl AifxCLI {
         })
         .to_string_pretty()
     }
+
+    pub fn run_codemode(
+        &self,
+        code: &str,
+        require_approval: bool,
+        actor: &str,
+        token: Option<&str>,
+    ) -> String {
+        self.cache.refresh_now();
+        let out = self.gateway.execute_codemode(
+            code,
+            None,
+            require_approval,
+            actor,
+            token,
+            None,
+        );
+        out.to_json().to_string_pretty()
+    }
+
+    pub fn get_types(&self, server_filter: Option<&str>, query: Option<&str>) -> String {
+        self.cache.refresh_now();
+        let gen = self.gateway.generate_codemode_types(server_filter, query);
+        gen.to_json().to_string_pretty()
+    }
+
+    pub fn run_codemode_benchmark(&self, iterations: usize) -> String {
+        self.cache.refresh_now();
+        let n = iterations.max(100);
+        let script = r#"
+        async () => {
+            const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
+            const cancelled = rides.filter(r => r.status === "cancelled" && r.amount > 20.0);
+            let total = 0.0;
+            for (const r of cancelled) {
+                total += r.amount;
+            }
+            return { refunded_count: cancelled.length, total_amount: total };
+        }
+        "#;
+
+        let t0 = Instant::now();
+        let mut last_out = None;
+        for _ in 0..n {
+            last_out = Some(self.gateway.execute_codemode(
+                script,
+                None,
+                false,
+                "agent",
+                Some("uber_token_bench"),
+                None,
+            ));
+        }
+        let elapsed = t0.elapsed();
+        let total_ms = elapsed.as_secs_f64() * 1000.0;
+        let avg_us = (elapsed.as_nanos() as f64 / n as f64) / 1000.0;
+        let rps = (n as f64) / elapsed.as_secs_f64().max(1e-9);
+        let sample = last_out.unwrap();
+
+        json!({
+            "benchmark": "omni-mcp-cloudflare-codemode-sandbox",
+            "iterations": n as i64,
+            "total_ms": (total_ms * 100.0).round() / 100.0,
+            "avg_sandbox_latency_us": (avg_us * 100.0).round() / 100.0,
+            "sub_millisecond_verified": avg_us < 1000.0,
+            "throughput_scripts_per_sec": rps.round() as i64,
+            "sample_result": sample.result,
+            "ops_per_script": sample.ops_consumed as i64
+        })
+        .to_string_pretty()
+    }
 }
 
 pub fn run_aifx_cli(args: &[String]) -> i32 {
@@ -361,6 +432,85 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             println!("{}", cli.run_benchmark(iterations));
             0
         }
+        "codemode" | "exec" => {
+            let mut code = String::new();
+            let mut require_approval = false;
+            let mut actor = "agent";
+            let mut token = "uber_token_default";
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--code" | "--script" | "-c" if i + 1 < args.len() => {
+                        code = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--file" | "-f" if i + 1 < args.len() => {
+                        code = fs::read_to_string(&args[i + 1]).unwrap_or_default();
+                        i += 2;
+                    }
+                    "--require-approval" => {
+                        require_approval = true;
+                        i += 1;
+                    }
+                    "--actor" if i + 1 < args.len() => {
+                        actor = &args[i + 1];
+                        i += 2;
+                    }
+                    "--token" if i + 1 < args.len() => {
+                        token = &args[i + 1];
+                        i += 2;
+                    }
+                    other if !other.starts_with('-') && code.is_empty() => {
+                        code = other.to_string();
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if code.trim().is_empty() {
+                eprintln!("Usage: aifx mcp codemode --code '<script>' [--require-approval]");
+                return 1;
+            }
+            println!(
+                "{}",
+                cli.run_codemode(&code, require_approval, actor, Some(token))
+            );
+            0
+        }
+        "types" => {
+            let mut srv: Option<&str> = None;
+            let mut query: Option<&str> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--server" | "-s" if i + 1 < args.len() => {
+                        srv = Some(&args[i + 1]);
+                        i += 2;
+                    }
+                    "--query" | "-q" if i + 1 < args.len() => {
+                        query = Some(&args[i + 1]);
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            println!("{}", cli.get_types(srv, query));
+            0
+        }
+        "bench-codemode" | "bench-sandbox" => {
+            let mut iterations = 10_000usize;
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--iterations" && i + 1 < args.len() {
+                    iterations = args[i + 1].parse().unwrap_or(10_000);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            println!("{}", cli.run_codemode_benchmark(iterations));
+            0
+        }
         "stdio" | "serve" => {
             let mut server_name = None;
             let mut i = 2;
@@ -384,11 +534,14 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
 
 fn print_help() {
     println!(
-        "omni / aifx - High-Performance Rust CLI for Agentic Operations & Code Mode MCP Execution\n\n\
+        "omni / aifx - High-Performance Rust CLI for Agentic Operations & Cloudflare Code Mode MCP\n\n\
          USAGE:\n\
          \x20 aifx mcp list [--format table|json]\n\
          \x20 aifx mcp search [query] [--format table|json]\n\
          \x20 aifx mcp call <server> <tool> [--args '<json>'] [--project '<fields>'] [--output <path>] [--actor <actor>]\n\
-         \x20 aifx mcp bench [--iterations <N>]"
+         \x20 aifx mcp codemode --code '<script>' [--require-approval]\n\
+         \x20 aifx mcp types [--server <name>] [--query <q>]\n\
+         \x20 aifx mcp bench [--iterations <N>]\n\
+         \x20 aifx mcp bench-codemode [--iterations <N>]"
     );
 }

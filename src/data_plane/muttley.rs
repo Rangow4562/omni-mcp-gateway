@@ -107,6 +107,29 @@ impl MuttleyMeshClient {
         method_name: &str,
         protocol: ProtocolType,
     ) -> JsonValue {
+        // Provide realistic multi-record arrays for Code Mode multi-step workflows
+        if (service_name == "uber_rides" || service_name == "uberridesservice")
+            && (method_name == "list_recent" || method_name == "ListRecentRides")
+        {
+            return json!([
+                {"id": "ride_101", "user_id": "usr_456", "status": "completed", "amount": 18.5, "city": "San Francisco"},
+                {"id": "ride_102", "user_id": "usr_456", "status": "cancelled", "amount": 35.0, "city": "San Francisco"},
+                {"id": "ride_103", "user_id": "usr_456", "status": "cancelled", "amount": 12.0, "city": "San Francisco"},
+                {"id": "ride_104", "user_id": "usr_456", "status": "cancelled", "amount": 37.5, "city": "New York"}
+            ]);
+        }
+
+        if (service_name == "accounting" || service_name == "accountingservice")
+            && method_name == "refund"
+        {
+            return json!({
+                "status": "REFUNDED",
+                "service": service_name,
+                "method": method_name,
+                "refund_id": "rfnd_99201"
+            });
+        }
+
         let mut h: u64 = 14695981039346656037;
         for b in service_name.bytes().chain(method_name.bytes()) {
             h ^= b as u64;

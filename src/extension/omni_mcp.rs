@@ -11,6 +11,7 @@
 //! Full MCP Resources (`resources/list`, `resources/read`) and MCP Prompts (`prompts/list`, `prompts/get`).
 
 use crate::data_plane::cache::InMemoryConfigCache;
+use crate::data_plane::codemode::{CodeModeTypeGenerator, SandboxLimits};
 use crate::data_plane::gateway::MCPProxyGateway;
 use crate::json::JsonValue;
 use crate::models::{
@@ -159,6 +160,45 @@ impl OmniMCPServer {
                     "required": ["server_name", "tool_name", "error_message"]
                 }
             }),
+            json!({
+                "name": "codemode",
+                "description": "Cloudflare Code Mode + OmniMCP execution sandbox. Write a single JavaScript/TypeScript `async () => { ... }` or Rust/Rhai script to coordinate multi-step tool calls (`await codemode.<server>.<tool>(input)`), loops, filtering, and aggregations in < 1ms without bloating the LLM context window.\n\nAvailable TypeScript Declarations:\n{{types}}",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "JavaScript/TypeScript `async () => { ... }` or Rust/Rhai script using `codemode.<server>.<tool>(args)` or `codemode.search(query)`"
+                        },
+                        "require_mutation_approval": {
+                            "type": "boolean",
+                            "description": "When true, pauses execution and returns status='APPROVAL_REQUIRED' if the script attempts to invoke any state-mutating tool (is_mutation=true)"
+                        },
+                        "max_operations": {
+                            "type": "integer",
+                            "description": "Instruction fuel limit (default: 50000)"
+                        }
+                    },
+                    "required": ["code"]
+                }
+            }),
+            json!({
+                "name": "get_codemode_types",
+                "description": "Cloudflare Code Mode Search & Execute helper: generates compact TypeScript `.d.ts` declarations (`declare namespace codemode { ... }`) for registered OmniMCP servers/tools, compressing verbose JSON Schemas by >90%.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "server_name": {
+                            "type": "string",
+                            "description": "Optional server name filter"
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Optional search keyword to filter tool declarations"
+                        }
+                    }
+                }
+            }),
         ]
     }
 
@@ -201,8 +241,8 @@ impl OmniMCPServer {
                     },
                     "serverInfo": {
                         "name": "uber-omni-mcp-gateway",
-                        "version": "3.0.0",
-                        "description": "Uber Omni MCP Central Discovery & Resilience Gateway (Rust Engine v3.0)",
+                        "version": "4.0.0",
+                        "description": "Uber Omni MCP Central Discovery, Code Mode & Resilience Gateway (Rust Engine v4.0)",
                         "runtime": "rust"
                     }
                 }),
@@ -210,12 +250,27 @@ impl OmniMCPServer {
             "notifications/initialized" | "ping" => {
                 RPCResponse::ok(request.id.clone(), JsonValue::object())
             }
-            "tools/list" => RPCResponse::ok(
-                request.id.clone(),
-                json!({
-                    "tools": JsonValue::Array(Self::omni_tools_spec())
-                }),
-            ),
+            "tools/list" => {
+                let ts_gen = self.gateway.generate_codemode_types(None, None);
+                let mut tools = Self::omni_tools_spec();
+                for t in &mut tools {
+                    if t.get("name").and_then(|n| n.as_str()) == Some("codemode") {
+                        if let Some(desc) = t.get("description").and_then(|d| d.as_str()) {
+                            let injected = CodeModeTypeGenerator::inject_types_template(
+                                desc,
+                                &ts_gen.typescript_declarations,
+                            );
+                            t.insert("description", JsonValue::from(injected));
+                        }
+                    }
+                }
+                RPCResponse::ok(
+                    request.id.clone(),
+                    json!({
+                        "tools": JsonValue::Array(tools)
+                    }),
+                )
+            }
             "resources/list" => self.handle_resources_list(request),
             "resources/read" => self.handle_resources_read(request),
             "prompts/list" => self.handle_prompts_list(request),
@@ -244,6 +299,8 @@ impl OmniMCPServer {
                     }
                     "recommend_tools" => self.call_recommend_tools(request, &arguments),
                     "explain_error" => self.call_explain_error(request, &arguments),
+                    "codemode" => self.call_codemode(request, &arguments, caller_actor, user_token),
+                    "get_codemode_types" => self.call_get_codemode_types(request, &arguments),
                     other => RPCResponse::err(
                         request.id.clone(),
                         RPCError::new(
@@ -267,12 +324,18 @@ impl OmniMCPServer {
         let servers = self.cache.list_servers();
         let mut resources = Vec::new();
 
-        // 1. Audit trail resource
+        // 1. Audit trail & Code Mode TypeScript declaration resources
         resources.push(json!({
             "uri": "omni://audit/merkle-head",
             "name": "Cryptographic Merkle Audit Head",
             "mimeType": "application/json",
             "description": "Current SHA-256 Merkle audit chain root hash and compliance verification status."
+        }));
+        resources.push(json!({
+            "uri": "omni://codemode/types.d.ts",
+            "name": "Cloudflare Code Mode TypeScript Declarations",
+            "mimeType": "application/typescript",
+            "description": "Auto-generated `declare namespace codemode` TypeScript definitions for all enabled OmniMCP tools."
         }));
 
         // 2. Per-server IDL and schema resources
@@ -309,6 +372,22 @@ impl OmniMCPServer {
                 )
             }
         };
+
+        if uri == "omni://codemode/types.d.ts" {
+            let ts = self.gateway.generate_codemode_types(None, None);
+            return RPCResponse::ok(
+                request.id.clone(),
+                json!({
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "application/typescript",
+                            "text": ts.typescript_declarations
+                        }
+                    ]
+                }),
+            );
+        }
 
         if uri == "omni://audit/merkle-head" {
             let (head_hash, count, verified) = if let Some(store) = &self.gateway.audit_store {
@@ -994,6 +1073,80 @@ impl OmniMCPServer {
             "root_cause_analysis": root_cause,
             "suggested_action": suggested_action
         });
+
+        RPCResponse::ok(
+            request.id.clone(),
+            json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": payload.to_string_pretty()
+                    }
+                ]
+            }),
+        )
+    }
+
+    fn call_codemode(
+        &self,
+        request: &RPCRequest,
+        args: &JsonValue,
+        caller_actor: &str,
+        user_token: Option<&str>,
+    ) -> RPCResponse {
+        let code = match args.get("code").and_then(|x| x.as_str()) {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::new(INVALID_PARAMS, "Missing 'code' string in codemode"),
+                )
+            }
+        };
+
+        let require_mutation_approval = args
+            .get("require_mutation_approval")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+
+        let mut limits = SandboxLimits::default();
+        if let Some(max_ops) = args.get("max_operations").and_then(|x| x.as_u64()) {
+            limits.max_operations = max_ops.clamp(100, 500_000);
+        }
+
+        let output = self.gateway.execute_codemode(
+            code,
+            Some(limits),
+            require_mutation_approval,
+            caller_actor,
+            user_token,
+            None,
+        );
+
+        let is_err = output.status == "ERROR";
+        let payload = output.to_json();
+
+        RPCResponse::ok(
+            request.id.clone(),
+            json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": payload.to_string_pretty()
+                    }
+                ],
+                "isError": is_err
+            }),
+        )
+    }
+
+    fn call_get_codemode_types(&self, request: &RPCRequest, args: &JsonValue) -> RPCResponse {
+        let server_filter = args.get("server_name").and_then(|x| x.as_str());
+        let search_query = args.get("query").and_then(|x| x.as_str());
+        let gen = self
+            .gateway
+            .generate_codemode_types(server_filter, search_query);
+        let payload = gen.to_json();
 
         RPCResponse::ok(
             request.id.clone(),

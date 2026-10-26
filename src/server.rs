@@ -8,13 +8,14 @@ use crate::control_plane::{
 };
 use crate::data_plane::{
     CircuitBreakerRegistry, InMemoryConfigCache, MCPProxyGateway, ProtocolTranslator, RateLimiter,
-    SemanticResponseCache,
+    SandboxLimits, SemanticResponseCache,
 };
 use crate::extension::OmniMCPServer;
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
-    RPCBatchOrSingle, ToolStatus, TraceSpan, PARSE_ERROR, RATE_LIMITED,
+    ProtocolType, RPCBatchOrSingle, ServerRecord, ToolRecord, ToolStatus, TraceSpan, PARSE_ERROR,
+    RATE_LIMITED,
 };
 use crate::storage::{MerkleAuditStore, WalRegistryStore};
 use std::collections::HashMap;
@@ -119,7 +120,9 @@ impl ProductionGatewayContext {
             traces,
         };
 
-        if ctx.registry.list_servers(None).is_empty() {
+        if ctx.registry.list_servers(None).is_empty()
+            || ctx.registry.get_server("uber_rides").is_none()
+        {
             ctx.seed_sample_catalog();
         }
         ctx
@@ -226,6 +229,61 @@ impl ProductionGatewayContext {
             "payments_refund",
             ToolStatus::Enabled,
         );
+
+        // 5. Seed Code Mode multi-step services (`uber_rides` & `accounting`)
+        let mut rides_srv = ServerRecord::new(
+            "uber_rides",
+            "Uber Rides Service",
+            "Rider trip history, status tracking, and ride lookup.",
+            "rider-experience",
+        );
+        rides_srv.protocol = ProtocolType::Grpc;
+        rides_srv.status = ToolStatus::Enabled;
+        let mut list_recent = ToolRecord::new(
+            "list_recent",
+            "List recent rides for a rider account",
+            json!({
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "Rider user identifier"}
+                },
+                "required": ["user_id"]
+            }),
+        );
+        list_recent.protocol = ProtocolType::Grpc;
+        list_recent.downstream_endpoint = "muttley://uber_rides/list_recent".to_string();
+        list_recent.status = ToolStatus::Enabled;
+        list_recent.tags = vec!["rides".to_string(), "trip".to_string(), "history".to_string()];
+        rides_srv.tools.insert("list_recent".to_string(), list_recent);
+        self.registry.register_server(rides_srv);
+
+        let mut acct_srv = ServerRecord::new(
+            "accounting",
+            "Accounting & Refunds Service",
+            "Automated rider billing adjustments and refund execution.",
+            "fintech-accounting",
+        );
+        acct_srv.protocol = ProtocolType::Http;
+        acct_srv.status = ToolStatus::Enabled;
+        let mut refund_tool = ToolRecord::new(
+            "refund",
+            "Issue a refund for a cancelled or disputed ride",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ride_id": {"type": "string", "description": "Ride identifier to refund"},
+                    "reason": {"type": "string", "description": "Audit reason for refund"}
+                },
+                "required": ["ride_id", "reason"]
+            }),
+        );
+        refund_tool.protocol = ProtocolType::Http;
+        refund_tool.downstream_endpoint = "muttley://accounting/refund".to_string();
+        refund_tool.status = ToolStatus::Enabled;
+        refund_tool.is_mutation = true;
+        refund_tool.tags = vec!["refund".to_string(), "accounting".to_string(), "billing".to_string()];
+        acct_srv.tools.insert("refund".to_string(), refund_tool);
+        self.registry.register_server(acct_srv);
 
         self.cache.refresh_now();
     }
@@ -519,6 +577,10 @@ impl ProductionGatewayContext {
                     )
                 }
             }
+            "/api/codemode/types" => {
+                let gen = self.gateway.generate_codemode_types(None, None);
+                self.json_response(200, gen.to_json())
+            }
             _ => self.serve_static_or_index(path),
         }
     }
@@ -763,6 +825,26 @@ impl ProductionGatewayContext {
                 let req = crate::models::RPCRequest::new(1, "tools/call", json!({"name": tool, "arguments": args}));
                 let resp = self.gateway.handle_request_with_trace(srv, &req, actor, Some(token), traceparent);
                 self.json_response(200, resp.to_json())
+            }
+            "/api/codemode/eval" => {
+                let code = body.get("code").and_then(|x| x.as_str()).unwrap_or("");
+                let require_approval = body
+                    .get("require_mutation_approval")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                let mut limits = SandboxLimits::default();
+                if let Some(max_ops) = body.get("max_operations").and_then(|x| x.as_u64()) {
+                    limits.max_operations = max_ops.clamp(100, 500_000);
+                }
+                let out = self.gateway.execute_codemode(
+                    code,
+                    Some(limits),
+                    require_approval,
+                    actor,
+                    Some(token),
+                    traceparent,
+                );
+                self.json_response(200, out.to_json())
             }
             _ => self.json_response(404, json!({"error": "Endpoint not found"})),
         }
