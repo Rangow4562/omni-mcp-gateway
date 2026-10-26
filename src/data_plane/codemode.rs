@@ -1,7 +1,7 @@
-//! Cloudflare Code Mode + OmniMCP Execution Engine (`codemode`).
+//! Omni Code Mode Execution Engine (`codemode`).
 //!
-//! Implements the two core primitives from Cloudflare's Code Mode architecture
-//! (`https://developers.cloudflare.com/agents/tools/codemode/`) natively in zero-dependency Rust:
+//! Implements two high-performance primitives for code-driven tool orchestration
+//! natively in zero-dependency Rust:
 //! 1. `CodeModeTypeGenerator`: Compiles registered OmniMCP tool JSON Schemas into compact TypeScript
 //!    declarations (`declare namespace codemode { ... }`) and supports `{{types}}` prompt injection.
 //! 2. `CodeModeExecutor`: Sub-millisecond in-process AST sandbox executing JavaScript/TypeScript
@@ -64,7 +64,7 @@ impl PendingApproval {
     }
 }
 
-/// Output structure modeled after Cloudflare's `@cloudflare/codemode` `CodeOutput` interface,
+/// Output structure for Code Mode script execution,
 /// enriched with OmniMCP sub-millisecond telemetry and governance metrics.
 #[derive(Clone, Debug)]
 pub struct CodeOutput {
@@ -172,7 +172,7 @@ impl TypeGenerationResult {
 }
 
 /// Automatically converts OmniMCP catalog tool definitions (JSON Schema) into compact
-/// TypeScript declarations (`declare namespace codemode { ... }`), matching `@cloudflare/codemode`.
+/// TypeScript declarations (`declare namespace codemode { ... }`).
 pub struct CodeModeTypeGenerator;
 
 impl CodeModeTypeGenerator {
@@ -256,7 +256,7 @@ impl CodeModeTypeGenerator {
             }
         }
 
-        // Built-in Cloudflare Code Mode Search & Execute helpers
+        // Built-in Code Mode Search & Execute helpers
         lines.push(
             "  /** Search OmniMCP catalog for tools by keyword/intent */".to_string(),
         );
@@ -357,7 +357,7 @@ impl CodeModeTypeGenerator {
 }
 
 // ============================================================================
-// Polyglot AST Sandbox (Cloudflare Code Mode JS/TS + Rust/Rhai)
+// Polyglot AST Sandbox (Code Mode JS/TS + Rust/Rhai)
 // ============================================================================
 
 #[derive(Clone, Debug)]
@@ -960,7 +960,7 @@ impl Parser {
     fn parse_program(&mut self) -> Result<Vec<Stmt>, CodeModeError> {
         self.consume_optional_semicolons();
 
-        // Unwrap top-level Cloudflare Code Mode wrapper if present:
+        // Unwrap top-level Code Mode wrapper if present:
         // e.g. `async () => { ... }`, `() => { ... }`, `async function run() { ... }`
         if self.peek() == &Token::Async {
             self.advance();
@@ -2188,7 +2188,7 @@ impl<'a> VmState<'a> {
             }
         }
 
-        // 5. Cloudflare Code Mode `codemode.<server>.<tool>(args...)`
+        // 5. Code Mode `codemode.<server>.<tool>(args...)`
         if let Expr::Field(inner_obj, server_name) = receiver {
             if let Expr::Var(ns) = inner_obj.as_ref() {
                 if ns == "codemode" {

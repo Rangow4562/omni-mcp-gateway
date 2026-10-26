@@ -1,4 +1,4 @@
-# Omni MCP (`omni-mcp` v4.0 — Cloudflare Code Mode & Native Rust Autonomous Mesh Gateway)
+# Omni MCP (`omni-mcp` v4.0 — Native Rust Code Mode & Autonomous Mesh Gateway)
 
 [![npm version](https://img.shields.io/npm/v/@rangow2260/omni-mcp.svg?style=flat-square&color=blue)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/@rangow2260/omni-mcp.svg?style=flat-square)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
@@ -6,10 +6,10 @@
 [![CI/CD](https://github.com/Rangow4562/omni-mcp-gateway/actions/workflows/rust.yml/badge.svg)](https://github.com/Rangow4562/omni-mcp-gateway/actions)
 [![M8ven Score](https://m8ven.ai/badge/mcp/rangow4562-omni-mcp-gateway-twjros?v=fd153b9f4d4191d6d0d111c8fbe1aa22)](https://m8ven.ai/mcp/rangow4562-omni-mcp-gateway-twjros?s=readme)
 
-A high-performance, zero-dependency **Rust** enterprise Model Context Protocol (MCP) management platform and runtime gateway combining **[Cloudflare Code Mode](https://developers.cloudflare.com/agents/tools/codemode/)** with enterprise service mesh governance.
+A high-performance, zero-dependency **Rust** enterprise Model Context Protocol (MCP) management platform and runtime gateway featuring native in-process **Omni Code Mode** with enterprise service mesh governance.
 
 Omni MCP unifies hundreds of microservices and thousands of tools behind a standardized, sub-millisecond, token-optimized Rust gateway with:
-- **Cloudflare Code Mode Execution (`codemode`)**: Polyglot in-process sandbox executing `async () => { ... }` JavaScript/TypeScript and Rust/Rhai scripts in **~0.10 ms (100 µs)**.
+- **Native Code Mode Execution (`codemode`)**: Polyglot in-process sandbox executing `async () => { ... }` JavaScript/TypeScript and Rust/Rhai scripts in **~0.10 ms (100 µs)**.
 - **Dynamic TypeScript Declarations (`declare namespace codemode`)**: Automatically converts OpenAPI 3.1, Protobuf, and Thrift JSON Schemas into compact `.d.ts` declarations, compressing tool prompt token footprints by **>65–95%**.
 - **Search & Execute Pattern**: Built-in `codemode.search(query)` and `codemode.describe(server, tool?)` allowing agents to discover and inspect typed definitions on demand without context bloat.
 - **Zero-Outbound Isolation & Approval Gates**: `globalOutbound: null` isolation blocks raw `fetch()` or filesystem calls, while human-in-the-loop approval gates intercept state-mutating operations (`is_mutation: true`).
@@ -19,7 +19,7 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
 
 ## 🚀 What's New in Version 4.0
 
-- ⚡ **Cloudflare Code Mode Integration**: Implements the Cloudflare Code Mode architecture natively in pure Rust. LLMs write code instead of juggling hundreds of flat tool schemas or suffering through slow multi-turn tool chaining.
+- ⚡ **Omni Code Mode Engine**: Native in-process execution engine in pure Rust. LLMs write procedural scripts instead of juggling hundreds of flat tool schemas or suffering through slow multi-turn tool chaining.
 - 📜 **Automatic TypeScript Type Generation (`{{types}}`)**: Dynamically compiles registered tool JSON Schemas into compact `declare namespace codemode { ... }` TypeScript definitions. Supports `{{types}}` prompt template injection and `omni://codemode/types.d.ts` resource access.
 - 🔬 **Sub-Millisecond Polyglot Sandbox**: AST interpreter booting in **< 50 µs** and evaluating multi-step tool pipelines, loops, and closures (`.filter()`, `.map()`, `.reduce()`, `.dedup_by_key()`) with zero external C/C++ dependencies.
 - 🖨️ **Captured Console Output**: Intercepts `console.log`, `console.warn`, `console.error`, and `print`, returning structured `CodeOutput { result, logs, pending_approvals, _metrics }` for seamless LLM self-correction.

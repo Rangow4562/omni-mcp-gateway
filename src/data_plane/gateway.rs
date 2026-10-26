@@ -575,7 +575,7 @@ impl MCPProxyGateway {
         }
     }
 
-    /// Generates Cloudflare Code Mode TypeScript declarations (`declare namespace codemode { ... }`)
+    /// Generates Omni Code Mode TypeScript declarations (`declare namespace codemode { ... }`)
     /// from the active OmniMCP catalog.
     pub fn generate_codemode_types(
         &self,
@@ -586,7 +586,7 @@ impl MCPProxyGateway {
         CodeModeTypeGenerator::generate_declarations(&servers, server_filter, search_query)
     }
 
-    /// Executes a Cloudflare Code Mode JS/TS (`async () => { ... }`) or Rust/Rhai script inside
+    /// Executes an Omni Code Mode JS/TS (`async () => { ... }`) or Rust/Rhai script inside
     /// the sub-millisecond in-process sandbox, routing all `codemode.<server>.<tool>()` calls
     /// through the governed OmniMCP Data Plane.
     pub fn execute_codemode(

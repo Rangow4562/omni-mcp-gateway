@@ -301,7 +301,7 @@ impl AifxCLI {
         let sample = last_out.unwrap();
 
         json!({
-            "benchmark": "omni-mcp-cloudflare-codemode-sandbox",
+            "benchmark": "omni-mcp-codemode-sandbox",
             "iterations": n as i64,
             "total_ms": (total_ms * 100.0).round() / 100.0,
             "avg_sandbox_latency_us": (avg_us * 100.0).round() / 100.0,
@@ -534,7 +534,7 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
 
 fn print_help() {
     println!(
-        "omni / aifx - High-Performance Rust CLI for Agentic Operations & Cloudflare Code Mode MCP\n\n\
+        "omni / aifx - High-Performance Rust CLI for Agentic Operations & Omni Code Mode MCP\n\n\
          USAGE:\n\
          \x20 aifx mcp list [--format table|json]\n\
          \x20 aifx mcp search [query] [--format table|json]\n\

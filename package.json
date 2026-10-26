@@ -1,7 +1,7 @@
 {
   "name": "@rangow2260/omni-mcp",
   "version": "4.0.0",
-  "description": "High-performance enterprise Model Context Protocol (MCP) & Cloudflare Code Mode gateway v4.0: dynamic TypeScript (.d.ts) schema compression, sub-millisecond in-process Code Mode sandbox, universal IDL discovery (Protobuf, Thrift, OpenAPI 3.1), OTel W3C distributed tracing, and SHA-256 Merkle audit trail.",
+  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v4.0: dynamic TypeScript (.d.ts) schema compression, sub-millisecond in-process Code Mode sandbox, universal IDL discovery (Protobuf, Thrift, OpenAPI 3.1), OTel W3C distributed tracing, and SHA-256 Merkle audit trail.",
   "main": "bin/omni-mcp.js",
   "bin": {
     "omni-mcp": "bin/omni-mcp.js",

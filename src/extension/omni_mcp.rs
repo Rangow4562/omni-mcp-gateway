@@ -162,7 +162,7 @@ impl OmniMCPServer {
             }),
             json!({
                 "name": "codemode",
-                "description": "Cloudflare Code Mode + OmniMCP execution sandbox. Write a single JavaScript/TypeScript `async () => { ... }` or Rust/Rhai script to coordinate multi-step tool calls (`await codemode.<server>.<tool>(input)`), loops, filtering, and aggregations in < 1ms without bloating the LLM context window.\n\nAvailable TypeScript Declarations:\n{{types}}",
+                "description": "Omni Code Mode execution sandbox. Write a single JavaScript/TypeScript `async () => { ... }` or Rust/Rhai script to coordinate multi-step tool calls (`await codemode.<server>.<tool>(input)`), loops, filtering, and aggregations in < 1ms without bloating the LLM context window.\n\nAvailable TypeScript Declarations:\n{{types}}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -184,7 +184,7 @@ impl OmniMCPServer {
             }),
             json!({
                 "name": "get_codemode_types",
-                "description": "Cloudflare Code Mode Search & Execute helper: generates compact TypeScript `.d.ts` declarations (`declare namespace codemode { ... }`) for registered OmniMCP servers/tools, compressing verbose JSON Schemas by >90%.",
+                "description": "Code Mode Search & Execute helper: generates compact TypeScript `.d.ts` declarations (`declare namespace codemode { ... }`) for registered OmniMCP servers/tools, compressing verbose JSON Schemas by >90%.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -333,7 +333,7 @@ impl OmniMCPServer {
         }));
         resources.push(json!({
             "uri": "omni://codemode/types.d.ts",
-            "name": "Cloudflare Code Mode TypeScript Declarations",
+            "name": "Omni Code Mode TypeScript Declarations",
             "mimeType": "application/typescript",
             "description": "Auto-generated `declare namespace codemode` TypeScript definitions for all enabled OmniMCP tools."
         }));

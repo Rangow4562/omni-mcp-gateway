@@ -1059,7 +1059,7 @@ fn test_v4_codemode_js_ts_and_rhai_multi_tool_chaining_with_console_logs() {
     cfg.data_dir = dir.clone();
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
-    // 1. Cloudflare Code Mode JS/TS async script with console.log and multi-tool chaining
+    // 1. Omni Code Mode JS/TS async script with console.log and multi-tool chaining
     let js_script = r#"
     async () => {
         const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
