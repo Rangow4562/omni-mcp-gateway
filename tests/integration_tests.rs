@@ -6,9 +6,10 @@ use omni_mcp::control_plane::{
     AutoCrawler, IDLParser, MCPFxHeartbeatMonitor, MCPRegistry, ThirdPartyAuthExchange,
 };
 use omni_mcp::data_plane::{
-    CircuitBreakerRegistry, CircuitState, CodeModeTypeGenerator, InMemoryConfigCache,
-    MCPProxyGateway, MuttleyMeshClient, PIIRedactor, ProtocolTranslator, RateLimiter,
-    ResponseProjectionEngine, SandboxLimits, SecurityCharterEngine, SemanticResponseCache,
+    CircuitBreakerRegistry, CircuitState, CodeModeTypeGenerator, FaultInjectionConfig,
+    InMemoryConfigCache, MCPProxyGateway, MuttleyMeshClient, PIIRedactor, ProtocolTranslator,
+    RateLimiter, ResponseProjectionEngine, SandboxLimits, SecurityCharterEngine,
+    SemanticResponseCache,
 };
 use omni_mcp::extension::{AifxCLI, OmniMCPServer};
 use omni_mcp::json;
@@ -1222,6 +1223,328 @@ fn test_v4_codemode_zero_outbound_isolation_and_fuel_guardrails() {
     let (verified, count) = ctx.audit_store.verify_chain();
     assert!(verified);
     assert!(count >= 2);
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_5_resumable_ast_continuation_suspend_and_resume() {
+    let dir = temp_test_path("omni_v45_continuation_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // Script has 3 top-level statements:
+    // Stmt 0: read `uber_rides.list_recent`
+    // Stmt 1: mutating `accounting.refund` (triggers APPROVAL_REQUIRED when require_mutation_approval = true)
+    // Stmt 2: return final object combining `rides.length` from Stmt 0 and `receipt` from Stmt 1
+    let script = r#"
+    async () => {
+        const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
+        const receipt = await codemode.accounting.refund({ ride_id: rides[1].id, reason: "Late arrival" });
+        return {
+            resumed_from_snapshot: true,
+            total_rides_in_scope: rides.length,
+            refunded_ride_id: rides[1].id,
+            refund_id: receipt.refund_id,
+            refund_status: receipt.status
+        };
+    }
+    "#;
+
+    let suspended_out = ctx.gateway.execute_codemode(
+        script,
+        None,
+        true, // require_mutation_approval = true
+        "agent",
+        Some("uber_token_1"),
+        None,
+    );
+    assert_eq!(suspended_out.status, "APPROVAL_REQUIRED");
+    let exec_id = suspended_out
+        .execution_id
+        .clone()
+        .expect("Must have Crockford Base32 ULID execution_id");
+    assert_eq!(exec_id.len(), 26);
+
+    let frame = suspended_out
+        .suspended_frame
+        .as_ref()
+        .expect("Must produce SuspendedExecutionFrame");
+    assert_eq!(frame.instruction_ptr, 1);
+    assert_eq!(frame.target_var.as_deref(), Some("receipt"));
+    assert_eq!(frame.pending_server, "accounting");
+    assert_eq!(frame.pending_tool, "refund");
+
+    // Verify frame is persisted in WalRegistryStore
+    let listed = ctx.gateway.list_suspended_codemode_frames();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].execution_id, exec_id);
+
+    // Resume after human approval without re-running step 0 (`uber_rides.list_recent`)
+    let resumed_out = ctx.gateway.resume_codemode(
+        &exec_id,
+        "security_lead",
+        None,
+        Some("uber_token_1"),
+        None,
+    );
+    assert_eq!(resumed_out.status, "OK", "Resume error: {:?}", resumed_out.error);
+    assert_eq!(resumed_out.tool_calls, 1, "Only the approved mutation should run on resume");
+    assert_eq!(resumed_out.result["resumed_from_snapshot"].as_bool(), Some(true));
+    assert_eq!(resumed_out.result["total_rides_in_scope"].as_i64(), Some(4));
+    assert_eq!(resumed_out.result["refunded_ride_id"].as_str(), Some("ride_102"));
+    assert_eq!(resumed_out.result["refund_id"].as_str(), Some("rfnd_99201"));
+    assert_eq!(resumed_out.result["refund_status"].as_str(), Some("REFUNDED"));
+
+    // Frame must be deleted after consumption
+    assert!(ctx.gateway.list_suspended_codemode_frames().is_empty());
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_5_vectorized_columnar_record_batch_pushdown() {
+    let dir = temp_test_path("omni_v45_vectorized_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // Register a synthetic analytics dataset tool returning 2,000 rows
+    let mut analytics_srv = ServerRecord::new(
+        "omnigraph_analytics",
+        "OmniGraph Vector & Columnar Analytics",
+        "Returns large tabular datasets for vectorized predicate pushdown",
+        "data-platform",
+    );
+    analytics_srv.protocol = ProtocolType::Grpc;
+    analytics_srv.status = ToolStatus::Enabled;
+    let mut scan_tool = ToolRecord::new(
+        "scan_candidates",
+        "Scan candidate records with score and status columns",
+        json!({"type": "object"}),
+    );
+    scan_tool.status = ToolStatus::Enabled;
+    analytics_srv.add_tool(scan_tool);
+    ctx.registry.register_server(analytics_srv);
+    ctx.cache.refresh_now();
+
+    // Test vectorized `.filter()` + `.map()` pushdown on a tabular dataset
+    let script = r#"
+    async () => {
+        const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
+        const high_value_cancelled = rides
+            .filter(row => row.amount >= 25.0 && row.status == "cancelled")
+            .map(row => ({ id: row.id, cents: row.amount * 100 }));
+        return {
+            matched: high_value_cancelled.length,
+            first_id: high_value_cancelled[0].id,
+            first_cents: high_value_cancelled[0].cents
+        };
+    }
+    "#;
+
+    let out = ctx.gateway.execute_codemode(script, None, false, "agent", None, None);
+    assert_eq!(out.status, "OK", "Vectorized error: {:?}", out.error);
+    assert_eq!(
+        out.vectorized_pushdowns, 2,
+        "Both .filter() and .map() must compile to vectorized PhysicalExpr pushdowns"
+    );
+    assert_eq!(
+        out.rows_scanned_vectorized, 6,
+        "4 rows scanned in vectorized filter + 2 rows in vectorized map"
+    );
+    assert_eq!(out.result["matched"].as_i64(), Some(2));
+    assert_eq!(out.result["first_id"].as_str(), Some("ride_102"));
+    assert_eq!(out.result["first_cents"].as_f64(), Some(3500.0));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_5_ssa_ast_auto_parallelization() {
+    let dir = temp_test_path("omni_v45_ssa_parallel_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // Enable tripbillingservice so we have 3 distinct microservices to call
+    ctx.registry
+        .toggle_server_status("tripbillingservice", ToolStatus::Enabled);
+    ctx.registry.toggle_tool_status(
+        "tripbillingservice",
+        "getTripFare",
+        ToolStatus::Enabled,
+    );
+    ctx.cache.refresh_now();
+
+    // LLM writes 3 sequential independent awaits followed by a dependent return statement.
+    // The SSA `AstAutoParallelizer` lifts the 3 consecutive independent calls into 1 `Stmt::ParallelWave`.
+    let script = r#"
+    async () => {
+        const driver = await codemode.driverdispatchservice.GetDriverLocation({ driver_id: "drv_88" });
+        const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
+        const fare = await codemode.tripbillingservice.getTripFare({ trip_id: "trp_99" });
+        return {
+            driver_ok: driver.status == "SUCCESS",
+            ride_count: rides.length,
+            fare_status: fare.status
+        };
+    }
+    "#;
+
+    let out = ctx.gateway.execute_codemode(script, None, false, "agent", None, None);
+    assert_eq!(out.status, "OK", "Parallel wave error: {:?}", out.error);
+    assert_eq!(
+        out.auto_parallel_waves, 1,
+        "Expected 1 auto-parallelized wave"
+    );
+    assert_eq!(
+        out.parallelized_tool_calls, 3,
+        "Expected all 3 independent tool calls to execute in the parallel wave"
+    );
+    assert_eq!(out.tool_calls, 3);
+    assert_eq!(out.result["ride_count"].as_i64(), Some(4));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_5_declarative_saga_compensation_lifo_rollback() {
+    let dir = temp_test_path("omni_v45_saga_rollback_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // Script performs 2 mutations (`payments_charge`) that succeed, then calls a non-existent tool
+    // that triggers a mid-flight failure. The gateway must unwind both completed charges in LIFO order
+    // using `payments_refund`.
+    let script = r#"
+    async () => {
+        const c1 = await codemode.paymentsservice.payments_charge({ customer_id: "cust_A", amount_cents: 1500, currency: "USD" });
+        const c2 = await codemode.paymentsservice.payments_charge({ customer_id: "cust_B", amount_cents: 3200, currency: "USD" });
+        const boom = await codemode.paymentsservice.non_existent_settlement({ batch_id: "b_1" });
+        return { c1, c2, boom };
+    }
+    "#;
+
+    let out = ctx.gateway.execute_codemode(script, None, false, "agent", None, None);
+    assert_eq!(
+        out.status, "SAGA_ROLLED_BACK",
+        "Expected SAGA_ROLLED_BACK when script fails after mutations"
+    );
+    assert_eq!(
+        out.saga_compensations.len(),
+        2,
+        "Both completed mutations must be compensated in LIFO order"
+    );
+    assert_eq!(out.saga_compensations[0].forward_tool, "payments_charge");
+    assert_eq!(out.saga_compensations[0].compensating_tool, "payments_refund");
+    assert_eq!(out.saga_compensations[0].status, "COMPENSATED");
+    assert_eq!(out.saga_compensations[1].forward_tool, "payments_charge");
+    assert_eq!(out.saga_compensations[1].compensating_tool, "payments_refund");
+    assert_eq!(out.saga_compensations[1].status, "COMPENSATED");
+
+    // Verify Merkle Audit Store logged "COMPENSATED:saga_rollback"
+    let audit_records = ctx.audit_store.list_records(Some(20));
+    let saga_logs: Vec<_> = audit_records
+        .iter()
+        .filter(|r| r.status == "COMPENSATED:saga_rollback")
+        .collect();
+    assert_eq!(saga_logs.len(), 2);
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_5_speculative_zero_turn_schema_pre_injection() {
+    let dir = temp_test_path("omni_v45_speculative_schema_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let spec = ctx.gateway.generate_speculative_codemode_types(
+        "process customer payment charge and issue refund for cancelled ride",
+        4,
+        0.82,
+    );
+
+    assert!(
+        spec.matched_tools.len() >= 2,
+        "Expected at least 2 high-confidence tools pre-injected on Turn 0, got {}",
+        spec.matched_tools.len()
+    );
+    assert!(spec.confidence_score >= 0.82);
+    assert!(spec.typescript_declarations.contains("payments_charge"));
+    assert!(spec.typescript_declarations.contains("refund"));
+    assert!(
+        spec.routing_latency_us < 10_000,
+        "Speculative BM25 routing must be ultra-fast (< 10ms), took {} us",
+        spec.routing_latency_us
+    );
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_5_deterministic_simulation_testing_dst() {
+    let dir = temp_test_path("omni_v45_dst_simulation_test");
+    let mut cfg = OmniConfig::default();
+    cfg.data_dir = dir.clone();
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // Script performs a mutation (`payments_charge`) followed by a second tool call (`list_recent`).
+    // Under simulated network drops / circuit breakers on the second tool call, DST must trigger
+    // deterministic LIFO Saga rollbacks and produce an identical SHA-256 fingerprint across replays.
+    let script = r#"
+    async () => {
+        const charge = await codemode.paymentsservice.payments_charge({ customer_id: "cust_dst", amount_cents: 5000, currency: "USD" });
+        const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
+        return { charge_status: charge.status, ride_count: rides.length };
+    }
+    "#;
+
+    let fault_cfg = FaultInjectionConfig {
+        base_seed: 1337,
+        num_runs: 20,
+        network_drop_prob: 0.25,
+        circuit_open_prob: 0.15,
+        latency_spike_prob: 0.10,
+        malformed_payload_prob: 0.05,
+    };
+
+    let report_1 = ctx.gateway.simulate_codemode(
+        script,
+        None,
+        fault_cfg.clone(),
+        "agent",
+        None,
+    );
+    let report_2 = ctx.gateway.simulate_codemode(
+        script,
+        None,
+        fault_cfg,
+        "agent",
+        None,
+    );
+
+    assert_eq!(report_1.total_runs, 20);
+    assert_eq!(
+        report_1.deterministic_fingerprint,
+        report_2.deterministic_fingerprint,
+        "Same seed must produce bit-for-bit identical DST simulation trajectories"
+    );
+    assert!(
+        report_1.compensated_rollback_runs > 0,
+        "Expected chaos faults on step 2 to trigger Saga rollbacks of step 1"
+    );
+    assert!(report_1.succeeded_runs > 0);
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);

@@ -47,6 +47,44 @@ pub fn format_traceparent(trace_id: &str, span_id: &str) -> String {
     format!("00-{}-{}-01", trace_id, span_id)
 }
 
+/// Generates a 26-character Crockford Base32 ULID (48-bit ms timestamp + 80-bit monotonic entropy).
+pub fn generate_ulid() -> String {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    use std::time::SystemTime;
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let seq = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+
+    let entropy_hi = nanos.wrapping_mul(0x9e3779b97f4a7c15) ^ seq.wrapping_mul(0xbf58476d1ce4e5b9);
+    let entropy_lo = seq.wrapping_mul(0x94d049bb133111eb) ^ now_ms.rotate_left(17);
+
+    let mut out = [b'0'; 26];
+    // 10 chars of 48-bit timestamp
+    let mut ts = now_ms & 0xFFFF_FFFF_FFFF;
+    for i in (0..10).rev() {
+        out[i] = CROCKFORD[(ts & 0x1F) as usize];
+        ts >>= 5;
+    }
+    // 16 chars of 80-bit randomness
+    let mut r1 = entropy_hi;
+    let mut r2 = entropy_lo;
+    for i in 10..18 {
+        out[i] = CROCKFORD[(r1 & 0x1F) as usize];
+        r1 >>= 5;
+    }
+    for i in 18..26 {
+        out[i] = CROCKFORD[(r2 & 0x1F) as usize];
+        r2 >>= 5;
+    }
+    String::from_utf8(out.to_vec()).unwrap_or_else(|_| "01J00000000000000000000000".to_string())
+}
+
 /// OpenTelemetry-compatible distributed trace span.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TraceSpan {
@@ -280,6 +318,212 @@ impl CharterPolicy {
     }
 }
 
+/// Declarative Saga compensation specification for state-mutating tools.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MutationCompensationSpec {
+    pub forward_tool: String,
+    pub compensating_server: Option<String>,
+    pub compensating_tool: String,
+    /// Maps compensating tool argument key -> source path ("input.<field>", "output.<field>", or literal)
+    pub arg_mapping: BTreeMap<String, String>,
+}
+
+impl MutationCompensationSpec {
+    pub fn to_json(&self) -> JsonValue {
+        let mut map_obj = JsonValue::object();
+        for (k, v) in &self.arg_mapping {
+            map_obj.insert(k.clone(), JsonValue::from(v.as_str()));
+        }
+        json!({
+            "forward_tool": self.forward_tool.clone(),
+            "compensating_server": self.compensating_server.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "compensating_tool": self.compensating_tool.clone(),
+            "arg_mapping": map_obj,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let forward_tool = v.get("forward_tool").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let compensating_server = v
+            .get("compensating_server")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        let compensating_tool = v.get("compensating_tool")?.as_str()?.to_string();
+        let mut arg_mapping = BTreeMap::new();
+        if let Some(entries) = v.get("arg_mapping").and_then(|m| m.as_object()) {
+            for (k, val) in entries {
+                if let Some(s) = val.as_str() {
+                    arg_mapping.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+        Some(Self {
+            forward_tool,
+            compensating_server,
+            compensating_tool,
+            arg_mapping,
+        })
+    }
+}
+
+/// Record of a completed mutation during a Code Mode script execution, used for LIFO Saga rollback.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompletedMutationRecord {
+    pub server_name: String,
+    pub tool_name: String,
+    pub input_args: JsonValue,
+    pub output_val: JsonValue,
+    pub compensation_spec: Option<MutationCompensationSpec>,
+}
+
+impl CompletedMutationRecord {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "server_name": self.server_name.clone(),
+            "tool_name": self.tool_name.clone(),
+            "input_args": self.input_args.clone(),
+            "output_val": self.output_val.clone(),
+            "compensation_spec": self.compensation_spec.as_ref().map(|c| c.to_json()).unwrap_or(JsonValue::Null),
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let server_name = v.get("server_name")?.as_str()?.to_string();
+        let tool_name = v.get("tool_name")?.as_str()?.to_string();
+        let input_args = v.get("input_args").cloned().unwrap_or_else(JsonValue::object);
+        let output_val = v.get("output_val").cloned().unwrap_or(JsonValue::Null);
+        let compensation_spec = v.get("compensation_spec").and_then(|cs| {
+            if cs.is_null() {
+                None
+            } else {
+                MutationCompensationSpec::from_json(cs)
+            }
+        });
+        Some(Self {
+            server_name,
+            tool_name,
+            input_args,
+            output_val,
+            compensation_spec,
+        })
+    }
+}
+
+/// Record of a Saga compensation action executed when a multi-mutation script rolls back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SagaCompensationRecord {
+    pub forward_server: String,
+    pub forward_tool: String,
+    pub compensating_server: String,
+    pub compensating_tool: String,
+    pub compensating_args: JsonValue,
+    pub status: String,
+    pub compensation_output: JsonValue,
+}
+
+impl SagaCompensationRecord {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "forward_server": self.forward_server.clone(),
+            "forward_tool": self.forward_tool.clone(),
+            "compensating_server": self.compensating_server.clone(),
+            "compensating_tool": self.compensating_tool.clone(),
+            "compensating_args": self.compensating_args.clone(),
+            "status": self.status.clone(),
+            "compensation_output": self.compensation_output.clone(),
+        })
+    }
+}
+
+/// Serializable execution continuation frame persisted in `WalRegistryStore` when a script
+/// hits an approval gate (`APPROVAL_REQUIRED`). Enables stateless horizontal suspend/resume.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SuspendedExecutionFrame {
+    pub execution_id: String,
+    pub script_hash: String,
+    pub script_source: String,
+    pub instruction_ptr: usize,
+    pub target_var: Option<String>,
+    pub serialized_scope: JsonValue,
+    pub pending_server: String,
+    pub pending_tool: String,
+    pub pending_arguments: JsonValue,
+    pub pending_reason: String,
+    pub policy_context_hash: String,
+    pub caller_actor: String,
+    pub logs: Vec<String>,
+    pub completed_mutations: Vec<CompletedMutationRecord>,
+    pub created_at: f64,
+}
+
+impl SuspendedExecutionFrame {
+    pub fn to_json(&self) -> JsonValue {
+        let logs_arr: Vec<JsonValue> = self.logs.iter().map(|s| JsonValue::from(s.as_str())).collect();
+        let muts_arr: Vec<JsonValue> = self.completed_mutations.iter().map(|m| m.to_json()).collect();
+        json!({
+            "execution_id": self.execution_id.clone(),
+            "script_hash": self.script_hash.clone(),
+            "script_source": self.script_source.clone(),
+            "instruction_ptr": self.instruction_ptr as i64,
+            "target_var": self.target_var.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "serialized_scope": self.serialized_scope.clone(),
+            "pending_server": self.pending_server.clone(),
+            "pending_tool": self.pending_tool.clone(),
+            "pending_arguments": self.pending_arguments.clone(),
+            "pending_reason": self.pending_reason.clone(),
+            "policy_context_hash": self.policy_context_hash.clone(),
+            "caller_actor": self.caller_actor.clone(),
+            "logs": JsonValue::Array(logs_arr),
+            "completed_mutations": JsonValue::Array(muts_arr),
+            "created_at": self.created_at,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let execution_id = v.get("execution_id")?.as_str()?.to_string();
+        let script_hash = v.get("script_hash")?.as_str()?.to_string();
+        let script_source = v.get("script_source")?.as_str()?.to_string();
+        let instruction_ptr = v.get("instruction_ptr")?.as_u64()? as usize;
+        let target_var = v.get("target_var").and_then(|x| x.as_str()).map(String::from);
+        let serialized_scope = v.get("serialized_scope").cloned().unwrap_or_else(JsonValue::object);
+        let pending_server = v.get("pending_server")?.as_str()?.to_string();
+        let pending_tool = v.get("pending_tool")?.as_str()?.to_string();
+        let pending_arguments = v.get("pending_arguments").cloned().unwrap_or_else(JsonValue::object);
+        let pending_reason = v.get("pending_reason").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let policy_context_hash = v.get("policy_context_hash").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let caller_actor = v.get("caller_actor").and_then(|x| x.as_str()).unwrap_or("agent").to_string();
+        let logs = v
+            .get("logs")
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let completed_mutations = v
+            .get("completed_mutations")
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(CompletedMutationRecord::from_json).collect())
+            .unwrap_or_default();
+        let created_at = v.get("created_at").and_then(|x| x.as_f64()).unwrap_or_else(now_epoch_secs);
+
+        Some(Self {
+            execution_id,
+            script_hash,
+            script_source,
+            instruction_ptr,
+            target_var,
+            serialized_scope,
+            pending_server,
+            pending_tool,
+            pending_arguments,
+            pending_reason,
+            policy_context_hash,
+            caller_actor,
+            logs,
+            completed_mutations,
+            created_at,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolRecord {
     pub name: String,
@@ -299,6 +543,7 @@ pub struct ToolRecord {
     pub fallback_tool: Option<String>,
     pub tags: Vec<String>,
     pub is_mutation: bool,
+    pub compensation_spec: Option<MutationCompensationSpec>,
 }
 
 impl ToolRecord {
@@ -325,6 +570,7 @@ impl ToolRecord {
             fallback_tool: None,
             tags: Vec::new(),
             is_mutation: false,
+            compensation_spec: None,
         }
     }
 
@@ -363,6 +609,10 @@ impl ToolRecord {
             Some(p) => p.to_json(),
             None => JsonValue::Null,
         };
+        let comp_val = match &self.compensation_spec {
+            Some(c) => c.to_json(),
+            None => JsonValue::Null,
+        };
         json!({
             "name": self.name.clone(),
             "description": self.description.clone(),
@@ -381,6 +631,7 @@ impl ToolRecord {
             "fallback_tool": self.fallback_tool.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
             "tags": JsonValue::Array(self.tags.iter().map(|t| JsonValue::from(t.as_str())).collect()),
             "is_mutation": self.is_mutation,
+            "compensation_spec": comp_val,
         })
     }
 
@@ -445,6 +696,13 @@ impl ToolRecord {
             })
             .unwrap_or_default();
         let is_mutation = v.get("is_mutation").and_then(|x| x.as_bool()).unwrap_or(false);
+        let compensation_spec = v.get("compensation_spec").and_then(|cs| {
+            if cs.is_null() {
+                None
+            } else {
+                MutationCompensationSpec::from_json(cs)
+            }
+        });
 
         Some(Self {
             name,
@@ -464,6 +722,7 @@ impl ToolRecord {
             fallback_tool,
             tags,
             is_mutation,
+            compensation_spec,
         })
     }
 }

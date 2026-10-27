@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod circuit_breaker;
 pub mod codemode;
+pub mod dst;
 pub mod gateway;
 pub mod muttley;
 pub mod projection;
@@ -12,7 +13,11 @@ pub use cache::InMemoryConfigCache;
 pub use circuit_breaker::{CircuitBreakerRegistry, CircuitState, SemanticResponseCache};
 pub use codemode::{
     CodeModeError, CodeModeExecutor, CodeModeTypeGenerator, CodeOutput, HostCallbacks,
-    PendingApproval, SandboxLimits, TypeGenerationResult,
+    PendingApproval, SandboxLimits, SpeculativeInjectionResult, TypeGenerationResult,
+};
+pub use dst::{
+    DeterministicSimulator, FaultInjectionConfig, SeedRunOutcome, SimulationReport,
+    Xoshiro256StarStar,
 };
 pub use gateway::MCPProxyGateway;
 pub use muttley::MuttleyMeshClient;

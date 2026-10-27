@@ -7,6 +7,7 @@
 
 use crate::control_plane::registry::MCPRegistry;
 use crate::data_plane::cache::InMemoryConfigCache;
+use crate::data_plane::dst::FaultInjectionConfig;
 use crate::data_plane::gateway::MCPProxyGateway;
 use crate::json::JsonValue;
 use crate::models::{RPCRequest, ToolStatus};
@@ -261,10 +262,52 @@ impl AifxCLI {
         out.to_json().to_string_pretty()
     }
 
-    pub fn get_types(&self, server_filter: Option<&str>, query: Option<&str>) -> String {
+    pub fn get_types(
+        &self,
+        server_filter: Option<&str>,
+        query: Option<&str>,
+        intent: Option<&str>,
+    ) -> String {
         self.cache.refresh_now();
+        if let Some(intent_str) = intent {
+            let spec = self
+                .gateway
+                .generate_speculative_codemode_types(intent_str, 4, 0.82);
+            return spec.to_json().to_string_pretty();
+        }
         let gen = self.gateway.generate_codemode_types(server_filter, query);
         gen.to_json().to_string_pretty()
+    }
+
+    pub fn resume_codemode(
+        &self,
+        execution_id: &str,
+        approver: &str,
+        token: Option<&str>,
+    ) -> String {
+        self.cache.refresh_now();
+        let out = self
+            .gateway
+            .resume_codemode(execution_id, approver, None, token, None);
+        out.to_json().to_string_pretty()
+    }
+
+    pub fn simulate_codemode(
+        &self,
+        code: &str,
+        seed: u64,
+        runs: usize,
+        actor: &str,
+        token: Option<&str>,
+    ) -> String {
+        self.cache.refresh_now();
+        let mut cfg = FaultInjectionConfig::default();
+        cfg.base_seed = seed;
+        cfg.num_runs = runs.clamp(1, 1000);
+        let report = self
+            .gateway
+            .simulate_codemode(code, None, cfg, actor, token);
+        report.to_json().to_string_pretty()
     }
 
     pub fn run_codemode_benchmark(&self, iterations: usize) -> String {
@@ -480,6 +523,7 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
         "types" => {
             let mut srv: Option<&str> = None;
             let mut query: Option<&str> = None;
+            let mut intent: Option<&str> = None;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -491,10 +535,93 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
                         query = Some(&args[i + 1]);
                         i += 2;
                     }
+                    "--intent" | "-i" if i + 1 < args.len() => {
+                        intent = Some(&args[i + 1]);
+                        i += 2;
+                    }
                     _ => i += 1,
                 }
             }
-            println!("{}", cli.get_types(srv, query));
+            println!("{}", cli.get_types(srv, query, intent));
+            0
+        }
+        "resume" => {
+            let mut exec_id = "";
+            let mut approver = "operator";
+            let mut token = "uber_token_default";
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--id" | "--execution-id" if i + 1 < args.len() => {
+                        exec_id = &args[i + 1];
+                        i += 2;
+                    }
+                    "--approver" if i + 1 < args.len() => {
+                        approver = &args[i + 1];
+                        i += 2;
+                    }
+                    "--token" if i + 1 < args.len() => {
+                        token = &args[i + 1];
+                        i += 2;
+                    }
+                    other if !other.starts_with('-') && exec_id.is_empty() => {
+                        exec_id = other;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if exec_id.is_empty() {
+                eprintln!("Usage: aifx mcp resume <execution_id> [--approver <name>]");
+                return 1;
+            }
+            println!("{}", cli.resume_codemode(exec_id, approver, Some(token)));
+            0
+        }
+        "simulate" | "dst" => {
+            let mut code = String::new();
+            let mut seed = 42u64;
+            let mut runs = 25usize;
+            let mut actor = "agent";
+            let mut token = "uber_token_default";
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--code" | "--script" | "-c" if i + 1 < args.len() => {
+                        code = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--seed" if i + 1 < args.len() => {
+                        seed = args[i + 1].parse().unwrap_or(42);
+                        i += 2;
+                    }
+                    "--runs" if i + 1 < args.len() => {
+                        runs = args[i + 1].parse().unwrap_or(25);
+                        i += 2;
+                    }
+                    "--actor" if i + 1 < args.len() => {
+                        actor = &args[i + 1];
+                        i += 2;
+                    }
+                    "--token" if i + 1 < args.len() => {
+                        token = &args[i + 1];
+                        i += 2;
+                    }
+                    other if !other.starts_with('-') && code.is_empty() => {
+                        code = other.to_string();
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if code.trim().is_empty() {
+                eprintln!("Usage: aifx mcp simulate --code '<script>' [--seed <u64>] [--runs <N>]");
+                return 1;
+            }
+            println!(
+                "{}",
+                cli.simulate_codemode(&code, seed, runs, actor, Some(token))
+            );
             0
         }
         "bench-codemode" | "bench-sandbox" => {
@@ -534,13 +661,15 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
 
 fn print_help() {
     println!(
-        "omni / aifx - High-Performance Rust CLI for Agentic Operations & Omni Code Mode MCP\n\n\
+        "omni / aifx - High-Performance Rust CLI for Agentic Operations & Omni Code Mode MCP (v4.5)\n\n\
          USAGE:\n\
          \x20 aifx mcp list [--format table|json]\n\
          \x20 aifx mcp search [query] [--format table|json]\n\
          \x20 aifx mcp call <server> <tool> [--args '<json>'] [--project '<fields>'] [--output <path>] [--actor <actor>]\n\
          \x20 aifx mcp codemode --code '<script>' [--require-approval]\n\
-         \x20 aifx mcp types [--server <name>] [--query <q>]\n\
+         \x20 aifx mcp resume <execution_id> [--approver <name>]\n\
+         \x20 aifx mcp simulate --code '<script>' [--seed <u64>] [--runs <N>]\n\
+         \x20 aifx mcp types [--server <name>] [--query <q>] [--intent '<prompt>']\n\
          \x20 aifx mcp bench [--iterations <N>]\n\
          \x20 aifx mcp bench-codemode [--iterations <N>]"
     );

@@ -2,7 +2,7 @@
 //! Provides ACID-like crash-safe persistence with FNV-1a checksum integrity and automatic WAL compaction.
 
 use crate::json::JsonValue;
-use crate::models::{ConfigDiff, ServerRecord};
+use crate::models::{ConfigDiff, ServerRecord, SuspendedExecutionFrame};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -14,6 +14,7 @@ pub type SQLiteRegistryStore = WalRegistryStore;
 struct StoreState {
     servers: BTreeMap<String, ServerRecord>,
     diffs: BTreeMap<String, ConfigDiff>,
+    suspended_frames: BTreeMap<String, SuspendedExecutionFrame>,
     wal_entries_since_compact: usize,
 }
 
@@ -33,6 +34,7 @@ impl WalRegistryStore {
             state: RwLock::new(StoreState {
                 servers: BTreeMap::new(),
                 diffs: BTreeMap::new(),
+                suspended_frames: BTreeMap::new(),
                 wal_entries_since_compact: 0,
             }),
         };
@@ -76,6 +78,13 @@ impl WalRegistryStore {
                             }
                         }
                     }
+                    if let Some(frames) = val.get("suspended_frames").and_then(|f| f.as_array()) {
+                        for f_val in frames {
+                            if let Some(frame) = SuspendedExecutionFrame::from_json(f_val) {
+                                guard.suspended_frames.insert(frame.execution_id.clone(), frame);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -106,6 +115,16 @@ impl WalRegistryStore {
                                             if let Some(diff) = ConfigDiff::from_json(d_val) {
                                                 guard.diffs.insert(diff.diff_id.clone(), diff);
                                             }
+                                        }
+                                    } else if op == "SAVE_SUSPENDED_FRAME" {
+                                        if let Some(f_val) = entry.get("data") {
+                                            if let Some(frame) = SuspendedExecutionFrame::from_json(f_val) {
+                                                guard.suspended_frames.insert(frame.execution_id.clone(), frame);
+                                            }
+                                        }
+                                    } else if op == "DELETE_SUSPENDED_FRAME" {
+                                        if let Some(id) = entry.get("data").and_then(|d| d.as_str()) {
+                                            guard.suspended_frames.remove(id);
                                         }
                                     }
                                 }
@@ -157,10 +176,16 @@ impl WalRegistryStore {
         }
         let servers_arr: Vec<JsonValue> = state.servers.values().map(|s| s.to_json()).collect();
         let diffs_arr: Vec<JsonValue> = state.diffs.values().map(|d| d.to_json()).collect();
+        let frames_arr: Vec<JsonValue> = state
+            .suspended_frames
+            .values()
+            .map(|f| f.to_json())
+            .collect();
         let snapshot = json!({
-            "engine": "omni-rust-wal-v2",
+            "engine": "omni-rust-wal-v4.5",
             "servers": JsonValue::Array(servers_arr),
             "diffs": JsonValue::Array(diffs_arr),
+            "suspended_frames": JsonValue::Array(frames_arr),
         });
         let tmp_path = format!("{}.tmp", self.db_path);
         if fs::write(&tmp_path, snapshot.to_string_compact()).is_ok() {
@@ -200,6 +225,37 @@ impl WalRegistryStore {
             .filter(|d| !only_pending || !d.approved)
             .cloned()
             .collect()
+    }
+
+    pub fn save_suspended_frame(&self, frame: &SuspendedExecutionFrame) {
+        let mut guard = self.state.write().unwrap();
+        guard
+            .suspended_frames
+            .insert(frame.execution_id.clone(), frame.clone());
+        self.append_wal_and_maybe_compact("SAVE_SUSPENDED_FRAME", frame.to_json(), &mut guard);
+    }
+
+    pub fn get_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        let guard = self.state.read().unwrap();
+        guard.suspended_frames.get(execution_id).cloned()
+    }
+
+    pub fn delete_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        let mut guard = self.state.write().unwrap();
+        let removed = guard.suspended_frames.remove(execution_id);
+        if removed.is_some() {
+            self.append_wal_and_maybe_compact(
+                "DELETE_SUSPENDED_FRAME",
+                JsonValue::from(execution_id),
+                &mut guard,
+            );
+        }
+        removed
+    }
+
+    pub fn list_suspended_frames(&self) -> Vec<SuspendedExecutionFrame> {
+        let guard = self.state.read().unwrap();
+        guard.suspended_frames.values().cloned().collect()
     }
 
     pub fn close(&self) {

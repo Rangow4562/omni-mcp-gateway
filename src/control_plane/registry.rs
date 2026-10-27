@@ -3,7 +3,9 @@
 
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
-use crate::models::{ConfigDiff, HistoryEntry, ServerRecord, ToolRecord, ToolStatus};
+use crate::models::{
+    ConfigDiff, HistoryEntry, ServerRecord, SuspendedExecutionFrame, ToolRecord, ToolStatus,
+};
 use crate::storage::WalRegistryStore;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +16,7 @@ static DIFF_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct RegistryInner {
     servers: BTreeMap<String, ServerRecord>,
     diffs: BTreeMap<String, ConfigDiff>,
+    suspended_frames: BTreeMap<String, SuspendedExecutionFrame>,
     version_history: HashMap<String, Vec<JsonValue>>,
 }
 
@@ -33,6 +36,7 @@ impl MCPRegistry {
     pub fn new(persistent_store: Option<Arc<WalRegistryStore>>) -> Self {
         let mut servers = BTreeMap::new();
         let mut diffs = BTreeMap::new();
+        let mut suspended_frames = BTreeMap::new();
         let mut version_history: HashMap<String, Vec<JsonValue>> = HashMap::new();
 
         if let Some(store) = &persistent_store {
@@ -44,12 +48,16 @@ impl MCPRegistry {
             for d in store.list_diffs(false) {
                 diffs.insert(d.diff_id.clone(), d);
             }
+            for f in store.list_suspended_frames() {
+                suspended_frames.insert(f.execution_id.clone(), f);
+            }
         }
 
         Self {
             inner: Arc::new(RwLock::new(RegistryInner {
                 servers,
                 diffs,
+                suspended_frames,
                 version_history,
             })),
             store: persistent_store,
@@ -59,8 +67,19 @@ impl MCPRegistry {
     pub fn register_server(&self, server: ServerRecord) -> ServerRecord {
         let mut guard = self.inner.write().unwrap();
         let target = if let Some(existing) = guard.servers.get_mut(&server.name) {
-            for (t_name, tool) in server.tools {
-                existing.tools.entry(t_name).or_insert(tool);
+            for (t_name, mut tool) in server.tools {
+                if let Some(prev) = existing.tools.get(&t_name) {
+                    if prev.status == ToolStatus::Enabled && tool.status == ToolStatus::Disabled {
+                        tool.status = ToolStatus::Enabled;
+                    }
+                    if tool.compensation_spec.is_none() && prev.compensation_spec.is_some() {
+                        tool.compensation_spec = prev.compensation_spec.clone();
+                    }
+                    if !tool.is_mutation && prev.is_mutation {
+                        tool.is_mutation = true;
+                    }
+                }
+                existing.tools.insert(t_name, tool);
             }
             if server.heartbeat_timestamp.is_some() {
                 existing.heartbeat_timestamp = server.heartbeat_timestamp;
@@ -460,6 +479,52 @@ impl MCPRegistry {
             .filter(|d| !d.approved && server_name.map_or(true, |sn| d.server_name == sn))
             .cloned()
             .collect()
+    }
+
+    pub fn save_suspended_frame(&self, frame: SuspendedExecutionFrame) {
+        {
+            let mut guard = self.inner.write().unwrap();
+            guard
+                .suspended_frames
+                .insert(frame.execution_id.clone(), frame.clone());
+        }
+        if let Some(store) = &self.store {
+            store.save_suspended_frame(&frame);
+        }
+    }
+
+    pub fn get_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        if let Some(store) = &self.store {
+            if let Some(f) = store.get_suspended_frame(execution_id) {
+                return Some(f);
+            }
+        }
+        let guard = self.inner.read().unwrap();
+        guard.suspended_frames.get(execution_id).cloned()
+    }
+
+    pub fn delete_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        let removed_mem = {
+            let mut guard = self.inner.write().unwrap();
+            guard.suspended_frames.remove(execution_id)
+        };
+        if let Some(store) = &self.store {
+            if let Some(f) = store.delete_suspended_frame(execution_id) {
+                return Some(f);
+            }
+        }
+        removed_mem
+    }
+
+    pub fn list_suspended_frames(&self) -> Vec<SuspendedExecutionFrame> {
+        if let Some(store) = &self.store {
+            let frames = store.list_suspended_frames();
+            if !frames.is_empty() {
+                return frames;
+            }
+        }
+        let guard = self.inner.read().unwrap();
+        guard.suspended_frames.values().cloned().collect()
     }
 
     fn snapshot_server(server: &ServerRecord) -> JsonValue {

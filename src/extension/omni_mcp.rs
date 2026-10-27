@@ -12,6 +12,7 @@
 
 use crate::data_plane::cache::InMemoryConfigCache;
 use crate::data_plane::codemode::{CodeModeTypeGenerator, SandboxLimits};
+use crate::data_plane::dst::FaultInjectionConfig;
 use crate::data_plane::gateway::MCPProxyGateway;
 use crate::json::JsonValue;
 use crate::models::{
@@ -184,7 +185,7 @@ impl OmniMCPServer {
             }),
             json!({
                 "name": "get_codemode_types",
-                "description": "Code Mode Search & Execute helper: generates compact TypeScript `.d.ts` declarations (`declare namespace codemode { ... }`) for registered OmniMCP servers/tools, compressing verbose JSON Schemas by >90%.",
+                "description": "Code Mode Search & Speculative Pre-Injection helper: generates compact TypeScript `.d.ts` declarations (`declare namespace codemode { ... }`) for registered OmniMCP servers/tools, or performs 0-turn BM25 speculative schema routing when `intent` is provided.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -195,8 +196,64 @@ impl OmniMCPServer {
                         "query": {
                             "type": "string",
                             "description": "Optional search keyword to filter tool declarations"
+                        },
+                        "intent": {
+                            "type": "string",
+                            "description": "Optional natural language user prompt for 0-turn speculative BM25 top-K schema pre-injection"
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Maximum number of high-confidence tool declarations to pre-inject (default: 4)"
                         }
                     }
+                }
+            }),
+            json!({
+                "name": "resume_codemode",
+                "description": "Resumes a suspended CodeMode AST continuation (`SuspendedExecutionFrame`) from `WalRegistryStore` after human approval, verifying the SHA-256 script hash, executing the approved mutation, and continuing execution from `instruction_ptr + 1` without re-running prior read steps.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "execution_id": {
+                            "type": "string",
+                            "description": "26-character Crockford Base32 ULID of the suspended execution frame"
+                        },
+                        "approver": {
+                            "type": "string",
+                            "description": "Identity of the human operator or policy engine approving the mutation"
+                        }
+                    },
+                    "required": ["execution_id"]
+                }
+            }),
+            json!({
+                "name": "simulate_codemode",
+                "description": "Deterministic Simulation Testing (`dst`) for CodeMode scripts: runs a script across N seeded PRNG trajectories (`Xoshiro256StarStar`) with deterministic fault injection (network drops, circuit breakers, latency spikes, malformed payloads) and verifies LIFO Saga compensation rollbacks.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "CodeMode script to simulate under chaos faults"
+                        },
+                        "seed": {
+                            "type": "integer",
+                            "description": "Base 64-bit PRNG seed (default: 42)"
+                        },
+                        "runs": {
+                            "type": "integer",
+                            "description": "Number of deterministic simulation runs (default: 25)"
+                        },
+                        "network_drop_prob": {
+                            "type": "number",
+                            "description": "Probability [0.0..1.0] of a simulated network drop per tool call"
+                        },
+                        "circuit_open_prob": {
+                            "type": "number",
+                            "description": "Probability [0.0..1.0] of a simulated open circuit breaker per tool call"
+                        }
+                    },
+                    "required": ["code"]
                 }
             }),
         ]
@@ -241,8 +298,8 @@ impl OmniMCPServer {
                     },
                     "serverInfo": {
                         "name": "uber-omni-mcp-gateway",
-                        "version": "4.0.0",
-                        "description": "Uber Omni MCP Central Discovery, Code Mode & Resilience Gateway (Rust Engine v4.0)",
+                        "version": "4.5.0",
+                        "description": "Omni MCP Autonomous Mesh Gateway & Code Mode Runtime (Rust Engine v4.5)",
                         "runtime": "rust"
                     }
                 }),
@@ -251,15 +308,27 @@ impl OmniMCPServer {
                 RPCResponse::ok(request.id.clone(), JsonValue::object())
             }
             "tools/list" => {
-                let ts_gen = self.gateway.generate_codemode_types(None, None);
+                let intent_opt = request.params.get("intent").and_then(|x| x.as_str());
+                let top_k = request
+                    .params
+                    .get("top_k")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(4) as usize;
+                let decls = if let Some(intent) = intent_opt {
+                    self.gateway
+                        .generate_speculative_codemode_types(intent, top_k, 0.82)
+                        .typescript_declarations
+                } else {
+                    self.gateway
+                        .generate_codemode_types(None, None)
+                        .typescript_declarations
+                };
                 let mut tools = Self::omni_tools_spec();
                 for t in &mut tools {
                     if t.get("name").and_then(|n| n.as_str()) == Some("codemode") {
                         if let Some(desc) = t.get("description").and_then(|d| d.as_str()) {
-                            let injected = CodeModeTypeGenerator::inject_types_template(
-                                desc,
-                                &ts_gen.typescript_declarations,
-                            );
+                            let injected =
+                                CodeModeTypeGenerator::inject_types_template(desc, &decls);
                             t.insert("description", JsonValue::from(injected));
                         }
                     }
@@ -301,6 +370,12 @@ impl OmniMCPServer {
                     "explain_error" => self.call_explain_error(request, &arguments),
                     "codemode" => self.call_codemode(request, &arguments, caller_actor, user_token),
                     "get_codemode_types" => self.call_get_codemode_types(request, &arguments),
+                    "resume_codemode" => {
+                        self.call_resume_codemode(request, &arguments, caller_actor, user_token)
+                    }
+                    "simulate_codemode" => {
+                        self.call_simulate_codemode(request, &arguments, caller_actor, user_token)
+                    }
                     other => RPCResponse::err(
                         request.id.clone(),
                         RPCError::new(
@@ -1141,6 +1216,29 @@ impl OmniMCPServer {
     }
 
     fn call_get_codemode_types(&self, request: &RPCRequest, args: &JsonValue) -> RPCResponse {
+        if let Some(intent) = args.get("intent").and_then(|x| x.as_str()) {
+            let top_k = args.get("top_k").and_then(|x| x.as_u64()).unwrap_or(4) as usize;
+            let threshold = args
+                .get("confidence_threshold")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.82);
+            let spec =
+                self.gateway
+                    .generate_speculative_codemode_types(intent, top_k, threshold);
+            let payload = spec.to_json();
+            return RPCResponse::ok(
+                request.id.clone(),
+                json!({
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": payload.to_string_pretty()
+                        }
+                    ]
+                }),
+            );
+        }
+
         let server_filter = args.get("server_name").and_then(|x| x.as_str());
         let search_query = args.get("query").and_then(|x| x.as_str());
         let gen = self
@@ -1157,6 +1255,88 @@ impl OmniMCPServer {
                         "text": payload.to_string_pretty()
                     }
                 ]
+            }),
+        )
+    }
+
+    fn call_resume_codemode(
+        &self,
+        request: &RPCRequest,
+        args: &JsonValue,
+        caller_actor: &str,
+        user_token: Option<&str>,
+    ) -> RPCResponse {
+        let execution_id = match args.get("execution_id").and_then(|x| x.as_str()) {
+            Some(id) if !id.trim().is_empty() => id,
+            _ => {
+                return RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::new(
+                        INVALID_PARAMS,
+                        "Missing 'execution_id' ULID in resume_codemode",
+                    ),
+                )
+            }
+        };
+
+        let approver = args
+            .get("approver")
+            .and_then(|x| x.as_str())
+            .unwrap_or(caller_actor);
+
+        let output =
+            self.gateway
+                .resume_codemode(execution_id, approver, None, user_token, None);
+        let is_err = output.status == "ERROR";
+        let payload = output.to_json();
+
+        RPCResponse::ok(
+            request.id.clone(),
+            json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": payload.to_string_pretty()
+                    }
+                ],
+                "isError": is_err
+            }),
+        )
+    }
+
+    fn call_simulate_codemode(
+        &self,
+        request: &RPCRequest,
+        args: &JsonValue,
+        caller_actor: &str,
+        user_token: Option<&str>,
+    ) -> RPCResponse {
+        let code = match args.get("code").and_then(|x| x.as_str()) {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::new(INVALID_PARAMS, "Missing 'code' string in simulate_codemode"),
+                )
+            }
+        };
+
+        let cfg = FaultInjectionConfig::from_json(args);
+        let report =
+            self.gateway
+                .simulate_codemode(code, None, cfg, caller_actor, user_token);
+        let payload = report.to_json();
+
+        RPCResponse::ok(
+            request.id.clone(),
+            json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": payload.to_string_pretty()
+                    }
+                ],
+                "isError": false
             }),
         )
     }

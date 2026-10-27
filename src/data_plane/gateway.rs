@@ -7,21 +7,24 @@ use crate::data_plane::cache::InMemoryConfigCache;
 use crate::data_plane::circuit_breaker::{CircuitBreakerRegistry, SemanticResponseCache};
 use crate::data_plane::codemode::{
     CodeModeError, CodeModeExecutor, CodeModeTypeGenerator, CodeOutput, HostCallbacks,
-    PendingApproval, SandboxLimits, TypeGenerationResult,
+    PendingApproval, SandboxLimits, SpeculativeInjectionResult, TypeGenerationResult,
 };
+use crate::data_plane::dst::{DeterministicSimulator, FaultInjectionConfig, SimulationReport};
 use crate::data_plane::projection::ResponseProjectionEngine;
 use crate::data_plane::security::{PIIRedactor, SecurityCharterEngine};
 use crate::data_plane::translators::ProtocolTranslator;
 use crate::json::JsonValue;
 use crate::logging::now_epoch_micros;
 use crate::models::{
-    format_traceparent, generate_span_id, generate_trace_id, parse_traceparent, RPCBatchOrSingle,
-    RPCError, RPCRequest, RPCResponse, ServerRecord, ToolStatus, TraceSpan, CIRCUIT_OPEN,
-    INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, TOOL_DISABLED, UNAUTHORIZED,
+    format_traceparent, generate_span_id, generate_trace_id, parse_traceparent,
+    CompletedMutationRecord, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse,
+    SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame, ToolStatus, TraceSpan,
+    CIRCUIT_OPEN, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, TOOL_DISABLED, UNAUTHORIZED,
 };
+use crate::storage::audit_log::sha256_hex;
 use crate::storage::MerkleAuditStore;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -586,9 +589,286 @@ impl MCPProxyGateway {
         CodeModeTypeGenerator::generate_declarations(&servers, server_filter, search_query)
     }
 
+    /// Generates speculative 0-turn pre-injected TypeScript declarations (`declare namespace codemode`)
+    /// for the top-K highest-confidence tools matching `user_intent` via sub-millisecond BM25 routing.
+    pub fn generate_speculative_codemode_types(
+        &self,
+        user_intent: &str,
+        top_k: usize,
+        confidence_threshold: f64,
+    ) -> SpeculativeInjectionResult {
+        let servers = self.cache.list_servers();
+        CodeModeTypeGenerator::speculative_pre_inject(
+            &servers,
+            user_intent,
+            top_k,
+            confidence_threshold,
+        )
+    }
+
+    /// Internal helper to resolve and invoke a single tool call from inside CodeMode or Continuation Resume.
+    fn invoke_codemode_single_tool(
+        &self,
+        servers_snapshot: &[ServerRecord],
+        raw_srv: &str,
+        raw_tool: &str,
+        args_vec: Vec<JsonValue>,
+        require_mutation_approval: bool,
+        caller_actor: &str,
+        user_token: Option<&str>,
+        codemode_traceparent: &str,
+    ) -> Result<(JsonValue, Option<CompletedMutationRecord>), CodeModeError> {
+        let server_opt = self.cache.get_server(raw_srv).or_else(|| {
+            servers_snapshot
+                .iter()
+                .find(|s| {
+                    s.name.eq_ignore_ascii_case(raw_srv)
+                        || CodeModeTypeGenerator::sanitize_ident(&s.name)
+                            .eq_ignore_ascii_case(raw_srv)
+                })
+                .cloned()
+        });
+
+        let server = match server_opt {
+            Some(s) => s,
+            None => {
+                return Err(CodeModeError::RuntimeError(format!(
+                    "Virtual MCP server '{}' not found in catalog",
+                    raw_srv
+                )))
+            }
+        };
+
+        let tool = server
+            .tools
+            .get(raw_tool)
+            .or_else(|| {
+                server.tools.values().find(|t| {
+                    t.name.eq_ignore_ascii_case(raw_tool)
+                        || CodeModeTypeGenerator::sanitize_ident(&t.name)
+                            .eq_ignore_ascii_case(raw_tool)
+                })
+            })
+            .ok_or_else(|| {
+                CodeModeError::RuntimeError(format!(
+                    "Tool '{}' not found on server '{}'",
+                    raw_tool, server.name
+                ))
+            })?;
+
+        let arg_obj = if args_vec.is_empty() {
+            JsonValue::object()
+        } else if args_vec.len() == 1 && args_vec[0].is_object() {
+            args_vec[0].clone()
+        } else {
+            let mut obj = JsonValue::object();
+            if let Some(props) =
+                tool.input_schema.get("properties").and_then(|p| p.as_object())
+            {
+                for (idx, (prop_key, _)) in props.iter().enumerate() {
+                    if let Some(val) = args_vec.get(idx) {
+                        obj.insert(prop_key.clone(), val.clone());
+                    }
+                }
+            }
+            for (idx, val) in args_vec.iter().enumerate() {
+                let k = format!("arg{}", idx);
+                if !obj.contains_key(&k) {
+                    obj.insert(k, val.clone());
+                }
+            }
+            obj
+        };
+
+        if require_mutation_approval && tool.is_mutation {
+            return Err(CodeModeError::ApprovalRequired(PendingApproval {
+                server_name: server.name.clone(),
+                tool_name: tool.name.clone(),
+                arguments: arg_obj,
+                reason: format!(
+                    "Tool '{}.{}' is a state-mutating operation (is_mutation=true) and requires approval before execution.",
+                    server.name, tool.name
+                ),
+            }));
+        }
+
+        let rpc_req = RPCRequest::new(
+            1,
+            "tools/call",
+            json!({
+                "name": tool.name.clone(),
+                "arguments": arg_obj.clone()
+            }),
+        );
+
+        let rpc_resp = self.handle_request_with_trace(
+            &server.name,
+            &rpc_req,
+            caller_actor,
+            user_token,
+            Some(codemode_traceparent),
+        );
+
+        if let Some(err) = rpc_resp.error {
+            return Err(CodeModeError::RuntimeError(err.message));
+        }
+
+        let parsed_res = if let Some(res) = rpc_resp.result {
+            if let Some(text) = res
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                JsonValue::parse(text).unwrap_or(res)
+            } else {
+                res
+            }
+        } else {
+            JsonValue::Null
+        };
+
+        let completed_mutation = if tool.is_mutation {
+            Some(CompletedMutationRecord {
+                server_name: server.name.clone(),
+                tool_name: tool.name.clone(),
+                input_args: arg_obj,
+                output_val: parsed_res.clone(),
+                compensation_spec: tool.compensation_spec.clone(),
+            })
+        } else {
+            None
+        };
+
+        Ok((parsed_res, completed_mutation))
+    }
+
+    /// Unwinds completed mutations in reverse (`LIFO`) order when a multi-step script fails mid-flight,
+    /// invoking each tool's declarative `MutationCompensationSpec` and logging `"COMPENSATED:saga_rollback"`
+    /// in the cryptographic Merkle Audit Store.
+    fn unwind_saga_compensations(
+        &self,
+        completed_mutations: &mut Vec<CompletedMutationRecord>,
+        caller_actor: &str,
+        user_token: Option<&str>,
+        codemode_traceparent: &str,
+    ) -> Vec<SagaCompensationRecord> {
+        let mut records = Vec::new();
+        while let Some(completed) = completed_mutations.pop() {
+            let server_opt = self.cache.get_server(&completed.server_name);
+            let comp_spec_opt = completed.compensation_spec.clone().or_else(|| {
+                server_opt
+                    .as_ref()
+                    .and_then(|s| s.tools.get(&completed.tool_name))
+                    .and_then(|t| t.compensation_spec.clone())
+            });
+
+            if let Some(spec) = comp_spec_opt {
+                let target_srv = spec
+                    .compensating_server
+                    .clone()
+                    .unwrap_or_else(|| completed.server_name.clone());
+                let mut comp_args = JsonValue::object();
+                for (comp_param, expr_path) in &spec.arg_mapping {
+                    let resolved_val = if let Some(out_key) = expr_path
+                        .strip_prefix("$output.")
+                        .or_else(|| expr_path.strip_prefix("output."))
+                    {
+                        completed
+                            .output_val
+                            .get(out_key)
+                            .cloned()
+                            .unwrap_or_else(|| JsonValue::from(format!("saga_{}", out_key)))
+                    } else if let Some(in_key) = expr_path
+                        .strip_prefix("$input.")
+                        .or_else(|| expr_path.strip_prefix("input."))
+                    {
+                        completed
+                            .input_args
+                            .get(in_key)
+                            .cloned()
+                            .unwrap_or(JsonValue::Null)
+                    } else {
+                        JsonValue::from(expr_path.as_str())
+                    };
+                    comp_args.insert(comp_param.clone(), resolved_val);
+                }
+
+                let rpc_req = RPCRequest::new(
+                    1,
+                    "tools/call",
+                    json!({
+                        "name": spec.compensating_tool.clone(),
+                        "arguments": comp_args.clone()
+                    }),
+                );
+
+                let t_comp = Instant::now();
+                let resp = self.handle_request_with_trace(
+                    &target_srv,
+                    &rpc_req,
+                    caller_actor,
+                    user_token,
+                    Some(codemode_traceparent),
+                );
+                let comp_us = t_comp.elapsed().as_micros() as u64;
+                let status_str = if resp.error.is_none() {
+                    "COMPENSATED"
+                } else {
+                    "COMPENSATION_FAILED"
+                };
+                let comp_out = resp.result.unwrap_or(JsonValue::Null);
+
+                if let Some(store) = &self.audit_store {
+                    store.record_invocation(
+                        caller_actor,
+                        &target_srv,
+                        &spec.compensating_tool,
+                        &comp_args,
+                        "COMPENSATED:saga_rollback",
+                        comp_us,
+                    );
+                }
+
+                records.push(SagaCompensationRecord {
+                    forward_server: completed.server_name,
+                    forward_tool: completed.tool_name,
+                    compensating_server: target_srv,
+                    compensating_tool: spec.compensating_tool,
+                    compensating_args: comp_args,
+                    status: status_str.to_string(),
+                    compensation_output: comp_out,
+                });
+            } else {
+                if let Some(store) = &self.audit_store {
+                    store.record_invocation(
+                        caller_actor,
+                        &completed.server_name,
+                        &completed.tool_name,
+                        &completed.input_args,
+                        "UNCOMPENSATED:no_compensation_spec",
+                        0,
+                    );
+                }
+                records.push(SagaCompensationRecord {
+                    forward_server: completed.server_name.clone(),
+                    forward_tool: completed.tool_name.clone(),
+                    compensating_server: completed.server_name,
+                    compensating_tool: "none".to_string(),
+                    compensating_args: JsonValue::object(),
+                    status: "NO_COMPENSATION_SPEC".to_string(),
+                    compensation_output: JsonValue::Null,
+                });
+            }
+        }
+        records
+    }
+
     /// Executes an Omni Code Mode JS/TS (`async () => { ... }`) or Rust/Rhai script inside
     /// the sub-millisecond in-process sandbox, routing all `codemode.<server>.<tool>()` calls
-    /// through the governed OmniMCP Data Plane.
+    /// through the governed OmniMCP Data Plane with SSA Auto-Parallelization, Vectorized Pushdown,
+    /// Resumable Continuation Snapshots, and Declarative Saga Rollbacks.
     pub fn execute_codemode(
         &self,
         code: &str,
@@ -610,124 +890,7 @@ impl MCPProxyGateway {
         let codemode_traceparent = format_traceparent(&trace_id, &span_id);
 
         let servers_snapshot = self.cache.list_servers();
-
-        let mut invoke_cb =
-            |raw_srv: &str, raw_tool: &str, args_vec: Vec<JsonValue>| -> Result<JsonValue, CodeModeError> {
-                // Resolve server by exact name or sanitized TypeScript identifier
-                let server_opt = self.cache.get_server(raw_srv).or_else(|| {
-                    servers_snapshot
-                        .iter()
-                        .find(|s| {
-                            s.name.eq_ignore_ascii_case(raw_srv)
-                                || CodeModeTypeGenerator::sanitize_ident(&s.name)
-                                    .eq_ignore_ascii_case(raw_srv)
-                        })
-                        .cloned()
-                });
-
-                let server = match server_opt {
-                    Some(s) => s,
-                    None => {
-                        return Err(CodeModeError::RuntimeError(format!(
-                            "Virtual MCP server '{}' not found in catalog",
-                            raw_srv
-                        )))
-                    }
-                };
-
-                let tool = server
-                    .tools
-                    .get(raw_tool)
-                    .or_else(|| {
-                        server.tools.values().find(|t| {
-                            t.name.eq_ignore_ascii_case(raw_tool)
-                                || CodeModeTypeGenerator::sanitize_ident(&t.name)
-                                    .eq_ignore_ascii_case(raw_tool)
-                        })
-                    })
-                    .ok_or_else(|| {
-                        CodeModeError::RuntimeError(format!(
-                            "Tool '{}' not found on server '{}'",
-                            raw_tool, server.name
-                        ))
-                    })?;
-
-                // Convert positional arguments into named JSON object if needed
-                let arg_obj = if args_vec.is_empty() {
-                    JsonValue::object()
-                } else if args_vec.len() == 1 && args_vec[0].is_object() {
-                    args_vec[0].clone()
-                } else {
-                    let mut obj = JsonValue::object();
-                    if let Some(props) =
-                        tool.input_schema.get("properties").and_then(|p| p.as_object())
-                    {
-                        for (idx, (prop_key, _)) in props.iter().enumerate() {
-                            if let Some(val) = args_vec.get(idx) {
-                                obj.insert(prop_key.clone(), val.clone());
-                            }
-                        }
-                    }
-                    for (idx, val) in args_vec.iter().enumerate() {
-                        let k = format!("arg{}", idx);
-                        if !obj.contains_key(&k) {
-                            obj.insert(k, val.clone());
-                        }
-                    }
-                    obj
-                };
-
-                // Human-in-the-loop Mutation Approval Gate
-                if require_mutation_approval && tool.is_mutation {
-                    return Err(CodeModeError::ApprovalRequired(PendingApproval {
-                        server_name: server.name.clone(),
-                        tool_name: tool.name.clone(),
-                        arguments: arg_obj,
-                        reason: format!(
-                            "Tool '{}.{}' is a state-mutating operation (is_mutation=true) and requires approval before execution.",
-                            server.name, tool.name
-                        ),
-                    }));
-                }
-
-                let rpc_req = RPCRequest::new(
-                    1,
-                    "tools/call",
-                    json!({
-                        "name": tool.name.clone(),
-                        "arguments": arg_obj
-                    }),
-                );
-
-                let rpc_resp = self.handle_request_with_trace(
-                    &server.name,
-                    &rpc_req,
-                    caller_actor,
-                    user_token,
-                    Some(&codemode_traceparent),
-                );
-
-                if let Some(err) = rpc_resp.error {
-                    return Err(CodeModeError::RuntimeError(err.message));
-                }
-
-                if let Some(res) = rpc_resp.result {
-                    if let Some(text) = res
-                        .get("content")
-                        .and_then(|c| c.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|item| item.get("text"))
-                        .and_then(|t| t.as_str())
-                    {
-                        if let Ok(parsed) = JsonValue::parse(text) {
-                            return Ok(parsed);
-                        }
-                    }
-                    return Ok(res);
-                }
-
-                Ok(JsonValue::Null)
-            };
+        let completed_mutations: Mutex<Vec<CompletedMutationRecord>> = Mutex::new(Vec::new());
 
         let search_cb = |query: &str| -> JsonValue {
             let q = query.trim().to_lowercase();
@@ -766,14 +929,119 @@ impl MCPProxyGateway {
                 .typescript_declarations
         };
 
-        let mut host = HostCallbacks {
-            invoke_tool: &mut invoke_cb,
-            search_catalog: &search_cb,
-            describe_types: &describe_cb,
+        let mut output = {
+            let mut invoke_cb = |raw_srv: &str,
+                                 raw_tool: &str,
+                                 args_vec: Vec<JsonValue>|
+             -> Result<JsonValue, CodeModeError> {
+                let (val, maybe_mut) = self.invoke_codemode_single_tool(
+                    &servers_snapshot,
+                    raw_srv,
+                    raw_tool,
+                    args_vec,
+                    require_mutation_approval,
+                    caller_actor,
+                    user_token,
+                    &codemode_traceparent,
+                )?;
+                if let Some(m) = maybe_mut {
+                    completed_mutations.lock().unwrap().push(m);
+                }
+                Ok(val)
+            };
+
+            let mut invoke_parallel_cb =
+                |calls: Vec<(String, String, Vec<JsonValue>)>| -> Result<Vec<JsonValue>, CodeModeError> {
+                    let gw = self;
+                    let snap = &servers_snapshot;
+                    let tp = codemode_traceparent.as_str();
+                    let outcomes: Vec<Result<(JsonValue, Option<CompletedMutationRecord>), CodeModeError>> =
+                        std::thread::scope(|s| {
+                            let handles: Vec<_> = calls
+                                .into_iter()
+                                .map(|(srv, tl, a)| {
+                                    s.spawn(move || {
+                                        gw.invoke_codemode_single_tool(
+                                            snap,
+                                            &srv,
+                                            &tl,
+                                            a,
+                                            require_mutation_approval,
+                                            caller_actor,
+                                            user_token,
+                                            tp,
+                                        )
+                                    })
+                                })
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| {
+                                    h.join().unwrap_or_else(|_| {
+                                        Err(CodeModeError::RuntimeError(
+                                            "Parallel wave worker thread panicked".to_string(),
+                                        ))
+                                    })
+                                })
+                                .collect()
+                        });
+
+                    let mut results = Vec::with_capacity(outcomes.len());
+                    let mut first_err: Option<CodeModeError> = None;
+                    for res in outcomes {
+                        match res {
+                            Ok((val, maybe_mut)) => {
+                                if let Some(m) = maybe_mut {
+                                    completed_mutations.lock().unwrap().push(m);
+                                }
+                                results.push(val);
+                            }
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(err) = first_err {
+                        return Err(err);
+                    }
+                    Ok(results)
+                };
+
+            let mut host = HostCallbacks {
+                invoke_tool: &mut invoke_cb,
+                invoke_parallel_batch: &mut invoke_parallel_cb,
+                search_catalog: &search_cb,
+                describe_types: &describe_cb,
+            };
+
+            let executor = CodeModeExecutor::new(limits.unwrap_or_default());
+            executor.execute(code, &mut host, &codemode_traceparent)
         };
 
-        let executor = CodeModeExecutor::new(limits.unwrap_or_default());
-        let mut output = executor.execute(code, &mut host, &codemode_traceparent);
+        let mut completed_vec = completed_mutations.into_inner().unwrap();
+
+        // 1. If script suspended on an Approval Gate, persist `SuspendedExecutionFrame` into `WalRegistryStore`
+        if output.status == "APPROVAL_REQUIRED" {
+            if let Some(ref mut frame) = output.suspended_frame {
+                frame.caller_actor = caller_actor.to_string();
+                frame.completed_mutations = completed_vec.clone();
+                let _ = self.cache.registry.save_suspended_frame(frame.clone());
+            }
+        }
+
+        // 2. If script errored after completing one or more mutations, unwind in LIFO order via Saga Compensation
+        if output.status == "ERROR" && !completed_vec.is_empty() {
+            let compensations = self.unwind_saga_compensations(
+                &mut completed_vec,
+                caller_actor,
+                user_token,
+                &codemode_traceparent,
+            );
+            output.status = "SAGA_ROLLED_BACK".to_string();
+            output.saga_compensations = compensations;
+        }
 
         // Apply PII & Secret Redaction on the final sandbox result
         output.result = PIIRedactor::redact_payload(&output.result);
@@ -789,7 +1057,9 @@ impl MCPProxyGateway {
             &json!({
                 "ops_consumed": output.ops_consumed as i64,
                 "tool_calls": output.tool_calls as i64,
-                "require_mutation_approval": require_mutation_approval
+                "require_mutation_approval": require_mutation_approval,
+                "vectorized_pushdowns": output.vectorized_pushdowns as i64,
+                "auto_parallel_waves": output.auto_parallel_waves as i64
             }),
             &format!("{}:codemode", output.status),
             start_micros,
@@ -800,5 +1070,322 @@ impl MCPProxyGateway {
         );
 
         output
+    }
+
+    /// Statelessly resumes a suspended CodeMode AST continuation (`SuspendedExecutionFrame`) from
+    /// `WalRegistryStore` after human approval, verifying the SHA-256 script hash, executing the
+    /// approved mutation, and continuing execution from `instruction_ptr + 1` without re-running
+    /// prior read steps.
+    pub fn resume_codemode(
+        &self,
+        execution_id: &str,
+        approver: &str,
+        limits: Option<SandboxLimits>,
+        user_token: Option<&str>,
+        traceparent: Option<&str>,
+    ) -> CodeOutput {
+        let start_micros = now_epoch_micros();
+        let (trace_id, parent_span_id) = if let Some(tp) = traceparent {
+            parse_traceparent(tp)
+                .map(|(tid, sid)| (tid, Some(sid)))
+                .unwrap_or_else(|| (generate_trace_id(), None))
+        } else {
+            (generate_trace_id(), None)
+        };
+        let span_id = generate_span_id();
+        let codemode_traceparent = format_traceparent(&trace_id, &span_id);
+
+        let frame = match self.cache.registry.get_suspended_frame(execution_id) {
+            Some(f) => f,
+            None => {
+                return CodeOutput {
+                    status: "ERROR".to_string(),
+                    result: JsonValue::Null,
+                    logs: Vec::new(),
+                    pending_approvals: Vec::new(),
+                    error: Some(format!(
+                        "Suspended execution frame '{}' not found in WalRegistryStore",
+                        execution_id
+                    )),
+                    boot_parse_us: 0,
+                    eval_us: 0,
+                    ops_consumed: 0,
+                    peak_memory_bytes: 0,
+                    tool_calls: 0,
+                    intermediate_bytes_processed: 0,
+                    output_bytes_returned: 0,
+                    traceparent: codemode_traceparent,
+                    execution_id: Some(execution_id.to_string()),
+                    suspended_frame: None,
+                    saga_compensations: Vec::new(),
+                    vectorized_pushdowns: 0,
+                    rows_scanned_vectorized: 0,
+                    auto_parallel_waves: 0,
+                    parallelized_tool_calls: 0,
+                };
+            }
+        };
+
+        // Verify SHA-256 script integrity before resuming
+        let actual_hash = sha256_hex(frame.script_source.as_bytes());
+        if actual_hash != frame.script_hash {
+            return CodeOutput {
+                status: "ERROR".to_string(),
+                result: JsonValue::Null,
+                logs: frame.logs,
+                pending_approvals: Vec::new(),
+                error: Some(format!(
+                    "Continuation integrity check failed: expected script_hash {}, got {}",
+                    frame.script_hash, actual_hash
+                )),
+                boot_parse_us: 0,
+                eval_us: 0,
+                ops_consumed: 0,
+                peak_memory_bytes: 0,
+                tool_calls: 0,
+                intermediate_bytes_processed: 0,
+                output_bytes_returned: 0,
+                traceparent: codemode_traceparent,
+                execution_id: Some(execution_id.to_string()),
+                suspended_frame: None,
+                saga_compensations: Vec::new(),
+                vectorized_pushdowns: 0,
+                rows_scanned_vectorized: 0,
+                auto_parallel_waves: 0,
+                parallelized_tool_calls: 0,
+            };
+        }
+
+        // Record cryptographic approval event in Merkle Audit Store
+        if let Some(store) = &self.audit_store {
+            store.record_invocation(
+                approver,
+                &frame.pending_server,
+                &frame.pending_tool,
+                &frame.pending_arguments,
+                "APPROVED:continuation_resume",
+                0,
+            );
+        }
+
+        // Remove the consumed frame so it cannot be replayed twice
+        let _ = self.cache.registry.delete_suspended_frame(execution_id);
+
+        let servers_snapshot = self.cache.list_servers();
+        let mut initial_completed = frame.completed_mutations.clone();
+
+        // Execute the now-approved pending mutation
+        let (approved_output, maybe_mut) = match self.invoke_codemode_single_tool(
+            &servers_snapshot,
+            &frame.pending_server,
+            &frame.pending_tool,
+            vec![frame.pending_arguments.clone()],
+            false,
+            &frame.caller_actor,
+            user_token,
+            &codemode_traceparent,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let mut err_out = CodeOutput {
+                    status: "ERROR".to_string(),
+                    result: JsonValue::Null,
+                    logs: frame.logs,
+                    pending_approvals: Vec::new(),
+                    error: Some(e.message()),
+                    boot_parse_us: 0,
+                    eval_us: 0,
+                    ops_consumed: 0,
+                    peak_memory_bytes: 0,
+                    tool_calls: 1,
+                    intermediate_bytes_processed: 0,
+                    output_bytes_returned: 0,
+                    traceparent: codemode_traceparent.clone(),
+                    execution_id: Some(execution_id.to_string()),
+                    suspended_frame: None,
+                    saga_compensations: Vec::new(),
+                    vectorized_pushdowns: 0,
+                    rows_scanned_vectorized: 0,
+                    auto_parallel_waves: 0,
+                    parallelized_tool_calls: 0,
+                };
+                if !initial_completed.is_empty() {
+                    let comps = self.unwind_saga_compensations(
+                        &mut initial_completed,
+                        &frame.caller_actor,
+                        user_token,
+                        &codemode_traceparent,
+                    );
+                    err_out.status = "SAGA_ROLLED_BACK".to_string();
+                    err_out.saga_compensations = comps;
+                }
+                return err_out;
+            }
+        };
+
+        if let Some(m) = maybe_mut {
+            initial_completed.push(m);
+        }
+        let completed_mutations = Mutex::new(initial_completed);
+
+        let search_cb = |_query: &str| -> JsonValue { JsonValue::Array(Vec::new()) };
+        let describe_cb = |_srv: &str, _tool_opt: Option<&str>| -> String { String::new() };
+
+        let mut output = {
+            let mut invoke_cb = |raw_srv: &str,
+                                 raw_tool: &str,
+                                 args_vec: Vec<JsonValue>|
+             -> Result<JsonValue, CodeModeError> {
+                let (val, maybe_m) = self.invoke_codemode_single_tool(
+                    &servers_snapshot,
+                    raw_srv,
+                    raw_tool,
+                    args_vec,
+                    true,
+                    &frame.caller_actor,
+                    user_token,
+                    &codemode_traceparent,
+                )?;
+                if let Some(m) = maybe_m {
+                    completed_mutations.lock().unwrap().push(m);
+                }
+                Ok(val)
+            };
+
+            let mut invoke_parallel_cb =
+                |calls: Vec<(String, String, Vec<JsonValue>)>| -> Result<Vec<JsonValue>, CodeModeError> {
+                    let mut results = Vec::with_capacity(calls.len());
+                    for (srv, tl, a) in calls {
+                        let (val, maybe_m) = self.invoke_codemode_single_tool(
+                            &servers_snapshot,
+                            &srv,
+                            &tl,
+                            a,
+                            true,
+                            &frame.caller_actor,
+                            user_token,
+                            &codemode_traceparent,
+                        )?;
+                        if let Some(m) = maybe_m {
+                            completed_mutations.lock().unwrap().push(m);
+                        }
+                        results.push(val);
+                    }
+                    Ok(results)
+                };
+
+            let mut host = HostCallbacks {
+                invoke_tool: &mut invoke_cb,
+                invoke_parallel_batch: &mut invoke_parallel_cb,
+                search_catalog: &search_cb,
+                describe_types: &describe_cb,
+            };
+
+            let executor = CodeModeExecutor::new(limits.unwrap_or_default());
+            executor.resume_frame(&frame, approved_output, &mut host, &codemode_traceparent)
+        };
+
+        let mut completed_vec = completed_mutations.into_inner().unwrap();
+
+        if output.status == "APPROVAL_REQUIRED" {
+            if let Some(ref mut next_frame) = output.suspended_frame {
+                next_frame.caller_actor = frame.caller_actor.clone();
+                next_frame.completed_mutations = completed_vec.clone();
+                let _ = self
+                    .cache
+                    .registry
+                    .save_suspended_frame(next_frame.clone());
+            }
+        } else if output.status == "ERROR" && !completed_vec.is_empty() {
+            let comps = self.unwind_saga_compensations(
+                &mut completed_vec,
+                &frame.caller_actor,
+                user_token,
+                &codemode_traceparent,
+            );
+            output.status = "SAGA_ROLLED_BACK".to_string();
+            output.saga_compensations = comps;
+        }
+
+        output.result = PIIRedactor::redact_payload(&output.result);
+
+        let total_us = output.boot_parse_us + output.eval_us;
+        self.record_telemetry_and_audit(
+            &trace_id,
+            &span_id,
+            parent_span_id.as_deref(),
+            "omni-codemode",
+            "resume_codemode",
+            approver,
+            &json!({
+                "execution_id": execution_id,
+                "resumed_from_instruction_ptr": frame.instruction_ptr as i64,
+                "tool_calls": output.tool_calls as i64
+            }),
+            &format!("{}:resumed", output.status),
+            start_micros,
+            total_us,
+            false,
+            false,
+            false,
+        );
+
+        output
+    }
+
+    /// Runs Deterministic Simulation Testing (`dst`) on a CodeMode script across `config.num_runs`
+    /// seeded PRNG trajectories (`Xoshiro256StarStar`), injecting deterministic network drops,
+    /// circuit breakers, latency spikes, and malformed payloads while verifying Saga rollbacks.
+    pub fn simulate_codemode(
+        &self,
+        code: &str,
+        limits: Option<SandboxLimits>,
+        config: FaultInjectionConfig,
+        caller_actor: &str,
+        user_token: Option<&str>,
+    ) -> SimulationReport {
+        let servers_snapshot = self.cache.list_servers();
+        let sim_limits = limits.unwrap_or_default();
+
+        DeterministicSimulator::simulate_script(
+            code,
+            sim_limits,
+            config,
+            |raw_srv, raw_tool, args_slice| {
+                self.invoke_codemode_single_tool(
+                    &servers_snapshot,
+                    raw_srv,
+                    raw_tool,
+                    args_slice.to_vec(),
+                    false,
+                    caller_actor,
+                    user_token,
+                    "00-00000000000000000000000000000001-0000000000000001-01",
+                )
+            },
+            |completed| {
+                let mut single_vec = vec![completed.clone()];
+                let mut comps = self.unwind_saga_compensations(
+                    &mut single_vec,
+                    caller_actor,
+                    user_token,
+                    "00-00000000000000000000000000000001-0000000000000001-01",
+                );
+                comps.pop().unwrap_or(SagaCompensationRecord {
+                    forward_server: completed.server_name.clone(),
+                    forward_tool: completed.tool_name.clone(),
+                    compensating_server: completed.server_name.clone(),
+                    compensating_tool: "none".to_string(),
+                    compensating_args: JsonValue::object(),
+                    status: "NO_COMPENSATION_SPEC".to_string(),
+                    compensation_output: JsonValue::Null,
+                })
+            },
+        )
+    }
+
+    /// Lists all currently suspended execution frames in the durable `WalRegistryStore`.
+    pub fn list_suspended_codemode_frames(&self) -> Vec<SuspendedExecutionFrame> {
+        self.cache.registry.list_suspended_frames()
     }
 }

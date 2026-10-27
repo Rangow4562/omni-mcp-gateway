@@ -7,15 +7,15 @@ use crate::control_plane::{
     AutoCrawler, MCPFxHeartbeatMonitor, MCPRegistry, ThirdPartyAuthExchange,
 };
 use crate::data_plane::{
-    CircuitBreakerRegistry, InMemoryConfigCache, MCPProxyGateway, ProtocolTranslator, RateLimiter,
-    SandboxLimits, SemanticResponseCache,
+    CircuitBreakerRegistry, FaultInjectionConfig, InMemoryConfigCache, MCPProxyGateway,
+    ProtocolTranslator, RateLimiter, SandboxLimits, SemanticResponseCache,
 };
 use crate::extension::OmniMCPServer;
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
-    ProtocolType, RPCBatchOrSingle, ServerRecord, ToolRecord, ToolStatus, TraceSpan, PARSE_ERROR,
-    RATE_LIMITED,
+    MutationCompensationSpec, ProtocolType, RPCBatchOrSingle, ServerRecord, ToolRecord, ToolStatus,
+    TraceSpan, PARSE_ERROR, RATE_LIMITED,
 };
 use crate::storage::{MerkleAuditStore, WalRegistryStore};
 use std::collections::HashMap;
@@ -172,13 +172,14 @@ impl ProductionGatewayContext {
         {
           "openapi": "3.1.0",
           "info": {
-            "title": "Payments & Billing API",
+            "title": "PaymentsService",
             "version": "3.0.0",
             "description": "Enterprise payment processing, charge authorisations, and instant refunds."
           },
           "paths": {
             "/payments/charge": {
               "post": {
+                "operationId": "payments_charge",
                 "summary": "Process customer payment charge",
                 "tags": ["payments", "billing", "checkout"],
                 "parameters": [
@@ -190,6 +191,7 @@ impl ProductionGatewayContext {
             },
             "/payments/refund": {
               "post": {
+                "operationId": "payments_refund",
                 "summary": "Execute transaction refund",
                 "tags": ["payments", "refund", "billing"],
                 "parameters": [
@@ -216,7 +218,7 @@ impl ProductionGatewayContext {
             ToolStatus::Enabled,
         );
 
-        // Enable PaymentsService tools
+        // Enable PaymentsService tools and attach Declarative Saga Compensation to `payments_charge`
         self.registry
             .toggle_server_status("paymentsservice", ToolStatus::Enabled);
         self.registry.toggle_tool_status(
@@ -229,6 +231,21 @@ impl ProductionGatewayContext {
             "payments_refund",
             ToolStatus::Enabled,
         );
+        if let Some(mut pay_srv) = self.registry.get_server("paymentsservice") {
+            if let Some(charge_tool) = pay_srv.tools.get_mut("payments_charge") {
+                charge_tool.is_mutation = true;
+                let mut arg_mapping = std::collections::BTreeMap::new();
+                arg_mapping.insert("charge_id".to_string(), "$output.charge_id".to_string());
+                arg_mapping.insert("reason".to_string(), "saga_rollback".to_string());
+                charge_tool.compensation_spec = Some(MutationCompensationSpec {
+                    forward_tool: "payments_charge".to_string(),
+                    compensating_server: Some("paymentsservice".to_string()),
+                    compensating_tool: "payments_refund".to_string(),
+                    arg_mapping,
+                });
+            }
+            self.registry.register_server(pay_srv);
+        }
 
         // 5. Seed Code Mode multi-step services (`uber_rides` & `accounting`)
         let mut rides_srv = ServerRecord::new(
@@ -581,6 +598,17 @@ impl ProductionGatewayContext {
                 let gen = self.gateway.generate_codemode_types(None, None);
                 self.json_response(200, gen.to_json())
             }
+            "/api/codemode/suspended" => {
+                let frames = self.gateway.list_suspended_codemode_frames();
+                let frames_json: Vec<JsonValue> = frames.iter().map(|f| f.to_json()).collect();
+                self.json_response(
+                    200,
+                    json!({
+                        "total": frames_json.len() as i64,
+                        "suspended_frames": JsonValue::Array(frames_json)
+                    }),
+                )
+            }
             _ => self.serve_static_or_index(path),
         }
     }
@@ -845,6 +873,46 @@ impl ProductionGatewayContext {
                     traceparent,
                 );
                 self.json_response(200, out.to_json())
+            }
+            "/api/codemode/resume" => {
+                let execution_id = body
+                    .get("execution_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let approver = body
+                    .get("approver")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(actor);
+                let out = self.gateway.resume_codemode(
+                    execution_id,
+                    approver,
+                    None,
+                    Some(token),
+                    traceparent,
+                );
+                self.json_response(200, out.to_json())
+            }
+            "/api/codemode/speculative_types" => {
+                let intent = body.get("intent").and_then(|x| x.as_str()).unwrap_or("");
+                let top_k = body.get("top_k").and_then(|x| x.as_u64()).unwrap_or(4) as usize;
+                let threshold = body
+                    .get("confidence_threshold")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.82);
+                let spec = self.gateway.generate_speculative_codemode_types(
+                    intent,
+                    top_k,
+                    threshold,
+                );
+                self.json_response(200, spec.to_json())
+            }
+            "/api/codemode/simulate" => {
+                let code = body.get("code").and_then(|x| x.as_str()).unwrap_or("");
+                let cfg = FaultInjectionConfig::from_json(&body);
+                let report = self
+                    .gateway
+                    .simulate_codemode(code, None, cfg, actor, Some(token));
+                self.json_response(200, report.to_json())
             }
             _ => self.json_response(404, json!({"error": "Endpoint not found"})),
         }
