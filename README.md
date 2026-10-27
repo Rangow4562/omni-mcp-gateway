@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Rangow4562/omni-mcp-gateway/main/assets/omni-mcp-eink-banner.png" alt="Omni MCP Banner" width="100%" />
+  <img src="assets/omni-mcp-eink-banner.png" alt="Omni MCP Banner" width="100%" />
 </p>
 
 # Omni MCP (`omni-mcp` v4.5 — Autonomous Runtime & Distributed Mesh Gateway)

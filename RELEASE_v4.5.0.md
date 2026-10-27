@@ -63,3 +63,4 @@ aifx mcp types --intent "Process customer refund and verify payment ledger"
 - Linux x64 (`omni-gateway-linux-x64`)
 - Linux ARM64 (`omni-gateway-linux-arm64`)
 - Windows x64 (`omni-gateway-win32-x64.exe`)
+

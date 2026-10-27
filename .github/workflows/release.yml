@@ -27,13 +27,9 @@ jobs:
             binary_name: omni-gateway
             asset_name: omni-gateway-linux-arm64
           - os: macos-latest
-            target: aarch64-apple-darwin
+            target: macos-universal
             binary_name: omni-gateway
-            asset_name: omni-gateway-darwin-arm64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary_name: omni-gateway
-            asset_name: omni-gateway-darwin-x64
+            asset_name: omni-gateway-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: omni-gateway.exe
@@ -51,24 +47,27 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target == 'macos-universal' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
 
       - name: Build Release Binary
         shell: bash
         run: |
+          mkdir -p dist
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --release --target ${{ matrix.target }} --bin omni-gateway
-          else
+            cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
+            chmod +x dist/${{ matrix.asset_name }}
+          elif [ "${{ matrix.target }}" = "macos-universal" ]; then
+            cargo build --release --target aarch64-apple-darwin --bin omni-gateway
+            cargo build --release --target x86_64-apple-darwin --bin omni-gateway
+            cp target/aarch64-apple-darwin/release/omni-gateway dist/omni-gateway-darwin-arm64
+            cp target/x86_64-apple-darwin/release/omni-gateway dist/omni-gateway-darwin-x64
+            chmod +x dist/omni-gateway-darwin-*
+          elif [ "${{ matrix.os }}" = "windows-latest" ]; then
             cargo build --release --target ${{ matrix.target }} --bin omni-gateway
-          fi
-
-      - name: Prepare Binary Artifact
-        shell: bash
-        run: |
-          mkdir -p dist
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
           else
+            cargo build --release --target ${{ matrix.target }} --bin omni-gateway
             cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
             chmod +x dist/${{ matrix.asset_name }}
           fi
@@ -77,7 +76,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          path: dist/*
 
   release-and-publish:
     name: GitHub Release & NPM Publish
