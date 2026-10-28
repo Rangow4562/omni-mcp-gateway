@@ -13,14 +13,14 @@
 A high-performance, zero-dependency **Rust** enterprise Model Context Protocol (MCP) management platform and runtime gateway combining native in-process **Omni Code Mode** with enterprise service mesh governance, columnar SIMD-friendly predicate pushdown, resumable continuation snapshots, and declarative Saga compensations.
 
 Omni MCP unifies hundreds of microservices and thousands of tools behind a standardized, sub-millisecond, token-optimized Rust gateway with:
-- **Native Code Mode Execution (`codemode`)**: Polyglot in-process sandbox executing `async () => { ... }` JavaScript/TypeScript and Rust/Rhai scripts in **~0.10 ms (100 µs)**.
+- **Native Code Mode Execution (`codemode`)**: Polyglot in-process sandbox executing `async () => { ... }` JavaScript/TypeScript and Rust/Rhai scripts in $\sim 0.10\text{ ms}$ ($100\ \mu\text{s}$).
 - **Resumable AST Continuations**: Stateless suspend/resume of execution state (`SuspendedExecutionFrame`) across approval gates (`is_mutation: true`) via durable FNV-1a checksummed WAL snapshots.
 - **Zero-Copy Columnar Predicate Pushdown**: Compiles `.filter()` and `.map()` AST closures directly into vectorized `PhysicalExpr` pipelines over contiguous columnar batches (`ColumnarRecordBatch`).
 - **Static AST SSA Auto-Parallelization**: Automatic dependency analysis lifts independent sequential `await codemode.*` calls into concurrent `Stmt::ParallelWave` batches without requiring complex LLM `Promise.all` emissions.
 - **Declarative Saga Compensation Rollbacks**: Ephemeral execution transaction logs unwind completed mutations in reverse (`LIFO`) order when a downstream step fails.
 - **Speculative 0-Turn Schema Pre-Injection**: Ultra-fast BM25 + stem routing injects the top-$K$ highest-confidence `.d.ts` declarations on Turn 1 based on natural-language user prompts.
 - **Deterministic Simulation Testing (`dst`) Engine**: 64-bit `Xoshiro256StarStar` seeded PRNG fault-injection suite validating agent scripts against network drops, circuit trips, latency spikes, and malformed payloads.
-- **Dynamic TypeScript Declarations (`declare namespace codemode`)**: Automatically converts OpenAPI 3.1, Protobuf, and Thrift JSON Schemas into compact `.d.ts` declarations, compressing tool prompt token footprints by **>65–95%**.
+- **Dynamic TypeScript Declarations (`declare namespace codemode`)**: Automatically converts OpenAPI 3.1, Protobuf, and Thrift JSON Schemas into compact `.d.ts` declarations, compressing tool prompt token footprints by $65\%$ to $95\%$.
 - **Search & Execute Pattern**: Built-in `codemode.search(query)` and `codemode.describe(server, tool?)` allowing agents to discover and inspect typed definitions on demand without context bloat.
 - **Zero-Outbound Isolation & Approval Gates**: `globalOutbound: null` isolation blocks raw `fetch()` or filesystem calls, while human-in-the-loop approval gates intercept state-mutating operations (`is_mutation: true`).
 - **Full Mesh Governance**: Binary wire protocol translation (gRPC, HTTP, TChannel), circuit breaking, semantic caching, ABAC security, OpenTelemetry W3C distributed tracing, canary weighted routing, and SHA-256 Merkle audit trail.
@@ -30,9 +30,9 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
 ## 🚀 What's New in Version 4.5
 
 - 🔄 **Resumable AST Continuations for Approval Gates (Stateless Suspend/Resume)**: Serializes instruction pointer, scope heap, and Merkle hashes into Crockford Base32 ULID (`SuspendedExecutionFrame`) in durable WAL when hitting `APPROVAL_REQUIRED`, resuming at `instruction_ptr + 1` upon approval without re-running read tools.
-- ⚡ **Zero-Copy Columnar `RecordBatch` & Vectorized `PhysicalExpr` Pushdown**: Compiles `.filter()` and `.map()` AST closures into vectorized columnar physical expressions over typed contiguous arrays, avoiding per-row object allocations.
-- 🔀 **Static AST Auto-Parallelization (Compiler SSA DAG Pass)**: Automatically analyzes variable read/write sets and lifts consecutive independent `codemode.*` calls into concurrent `Stmt::ParallelWave` execution batches.
-- ↩️ **Declarative Saga Compensation for Multi-Mutation Rollbacks**: Unwinds completed mutations in reverse (`LIFO`) order via `MutationCompensationSpec` whenever a multi-step script fails mid-flight, logging cryptographic rollback events in the Merkle audit trail.
+- ⚡ **Zero-Copy Columnar `RecordBatch` & Vectorized `PhysicalExpr` Pushdown**: Compiles `.filter()` and `.map()` AST closures into vectorized columnar physical expressions over typed contiguous arrays, evaluating predicates ($\ge, \le, ==, !=, <, >$) over $50,000+$ records in microseconds without per-row object allocations.
+- 🔀 **Static AST Auto-Parallelization (Compiler SSA DAG Pass)**: Automatically analyzes variable read/write sets and lifts consecutive independent `codemode.*` calls into concurrent `Stmt::ParallelWave` execution batches via `std::thread::scope`.
+- ↩️ **Declarative Saga Compensation for Multi-Mutation Rollbacks**: Unwinds completed mutations in reverse (`LIFO`) order via `MutationCompensationSpec` whenever a multi-step script fails mid-flight or trips `-32030 CIRCUIT_OPEN`, logging cryptographic rollback events in the Merkle audit trail.
 - 🎯 **Speculative 0-Turn Schema Pre-Injection**: BM25 + stem/tag matching pre-populates `{{types}}` with the top-$K$ highest-confidence TypeScript declarations on Turn 1 based on natural-language user prompts.
 - 🎲 **Deterministic Simulation Testing (`dst`) Engine**: Pure Rust 64-bit `Xoshiro256StarStar` seeded PRNG chaos harness validating script resilience across $N$ deterministic runs with injected network drops, latency spikes, and circuit breakers.
 
@@ -42,10 +42,10 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
 
 - ⚡ **Omni Code Mode Engine**: Native in-process execution engine in pure Rust. LLMs write procedural scripts instead of juggling hundreds of flat tool schemas or suffering through slow multi-turn tool chaining.
 - 📜 **Automatic TypeScript Type Generation (`{{types}}`)**: Dynamically compiles registered tool JSON Schemas into compact `declare namespace codemode { ... }` TypeScript definitions. Supports `{{types}}` prompt template injection and `omni://codemode/types.d.ts` resource access.
-- 🔬 **Sub-Millisecond Polyglot Sandbox**: AST interpreter booting in **< 50 µs** and evaluating multi-step tool pipelines, loops, and closures (`.filter()`, `.map()`, `.reduce()`, `.dedup_by_key()`) with zero external C/C++ dependencies.
+- 🔬 **Sub-Millisecond Polyglot Sandbox**: AST interpreter booting in $< 50\ \mu\text{s}$ and evaluating multi-step tool pipelines, loops, and closures (`.filter()`, `.map()`, `.reduce()`, `.dedup_by_key()`) with zero external C/C++ dependencies.
 - 🖨️ **Captured Console Output**: Intercepts `console.log`, `console.warn`, `console.error`, and `print`, returning structured `CodeOutput { result, logs, pending_approvals, _metrics }` for seamless LLM self-correction.
 - 🚧 **Human-in-the-Loop Mutation Approval**: Pauses destructive operations (`is_mutation: true`) when `require_mutation_approval: true` is passed, returning structured `APPROVAL_REQUIRED` states with argument previews.
-- 🛡️ **Zero-Outbound Isolation (`globalOutbound: null`)**: Strictly denies unauthorized outbound network or filesystem calls, enforcing 100% mediation through governed `codemode.*` bindings.
+- 🛡️ **Zero-Outbound Isolation (`globalOutbound: null`)**: Strictly denies unauthorized outbound network or filesystem calls, enforcing $100\%$ mediation through governed `codemode.*` bindings.
 - 💻 **Universal Multi-Platform Support**: Pre-built native release binaries for **macOS ARM64 (Apple Silicon)**, **macOS x64 (Intel)**, **Linux ARM64**, **Linux x64**, and **Windows x64**.
 
 ---
@@ -64,6 +64,15 @@ npx -y @rangow2260/omni-mcp 8080
 # Run the Code Mode CLI
 npx -y @rangow2260/omni-mcp mcp list
 npx -y @rangow2260/omni-mcp mcp search driver
+
+# v4.5: Speculative 0-turn TypeScript declaration resolution
+npx -y @rangow2260/omni-mcp aifx mcp types --intent "Process customer refund and verify payment ledger"
+
+# v4.5: Resume suspended execution frame after human-in-the-loop approval
+npx -y @rangow2260/omni-mcp aifx mcp resume 01JC1234567890ABCDEFGHJKMN --approver "secops-lead"
+
+# v4.5: Run deterministic simulation testing (DST) with seeded fault injection
+npx -y @rangow2260/omni-mcp aifx mcp simulate --code "const res = await codemode.orders.charge({ id: 'ord_1' });" --seed 42 --runs 10
 ```
 
 ---
@@ -77,11 +86,11 @@ npx -y @rangow2260/omni-mcp mcp search driver
 - **JSON-RPC 2.0 Batch Execution & `batch_invoke_tools`**: Supports both array batch JSON-RPC 2.0 payloads and multi-tool batch execution via `/omni/mcp`.
 - **Durable WAL + Atomic Snapshot Storage Engine**: Crash-safe Write-Ahead Log (`.db-wal`) with 64-bit FNV-1a checksum verification and atomic snapshot compaction (`WalRegistryStore`).
 - **DFA PII & Secrets Scanner**: High-speed deterministic state-machine redaction for emails, phone numbers, SSNs, credit cards, AWS keys, GitHub tokens, and API tokens.
-- **Bounded Thread-Pool HTTP/1.1 Keep-Alive Server**: Persistent TCP connections with `TCP_NODELAY` and microsecond latency histograms (`p50`, `p95`, `p99`) exported to `/metrics`.
+- **Bounded Thread-Pool HTTP/1.1 Keep-Alive Server**: Persistent TCP connections with `TCP_NODELAY` and microsecond latency histograms ($p_{50}$, $p_{95}$, $p_{99}$) exported to `/metrics`.
 
 ---
 
-## REA Claim Audit & v3.0 Capabilities
+## REA Claim Audit & v3.0–v4.5 Capabilities
 
 | Document Claim / Capability | Document Statement | Omni MCP Rust Implementation | Status |
 | :--- | :--- | :--- | :--- |
@@ -93,7 +102,7 @@ npx -y @rangow2260/omni-mcp mcp search driver
 | **Diffs & Rollback** | Tool edits trigger diffs requiring approval; supports rollback | Versioned `ConfigDiff` engine with approval gates and rollback | **Verified Feature** |
 | **Dynamic Routing** | Materializes virtual servers at `/<service-name>/mcp` without redeploy | Dynamic HTTP/1.1 dispatch table refreshed on background cadence | **Verified Data Plane** |
 | **Wire Translation** | Translates JSON-RPC to HTTP, gRPC, TChannel wire formats | `ProtocolTranslator` binary framing for HTTP, gRPC, TChannel | **Verified Data Plane** |
-| **Muttley Delegation** | Downstream calls routed via Muttley service mesh sidecar | `MuttleyMeshClient` sidecar adapter with `p50`/`p95`/`p99` histograms | **Verified Integration** |
+| **Muttley Delegation** | Downstream calls routed via Muttley service mesh sidecar | `MuttleyMeshClient` sidecar adapter with $p_{50}$/$p_{95}$/$p_{99}$ histograms | **Verified Integration** |
 | **Security & ABAC** | Server/tool charter policies for humans, services, agents; PII redaction | `SecurityCharterEngine` + DFA `PIIRedactor` (with API key redaction) | **Verified Security Model** |
 | **Omni MCP Discovery** | Proxy enabling incremental discovery via standard tools | `OmniMCPServer` with BM25 ranking + `recommend_tools` + `explain_error` | **v3.0 Upgrade** |
 | **MCP Resources & Prompts**| Full resource catalog and diagnostic runbooks | `resources/list`, `resources/read`, `prompts/list`, `prompts/get` | **v3.0 Upgrade** |
@@ -105,6 +114,15 @@ npx -y @rangow2260/omni-mcp mcp search driver
 | **Code Mode (`aifx`)** | CLI for coding agents: `mcp list`, `mcp search`, `mcp call` | Native `omni` and `aifx` Rust binaries + `mcp bench` micro-benchmark | **Verified CLI Interface** |
 | **Resilience & Caching** | Enterprise fault tolerance and sub-millisecond tail latency | `CircuitBreakerRegistry` + `SemanticResponseCache` + Batch JSON-RPC | **Verified Data Plane** |
 | **Registry & Tool UI** | Web interfaces for reviewing configs, diffs, and testing | React 18 + Vite application served statically from `ui/dist` at `/` | **Verified Documented UI** |
+| **In-Process Code Mode** | Sub-millisecond polyglot script execution without multi-turn loops | Pure-Rust AST interpreter ($< 50\ \mu\text{s}$ boot) with captured `CodeOutput` | **v4.0 Upgrade** |
+| **Dynamic `.d.ts` Generation** | Compress tool prompt token footprint by $65\%$ to $95\%$ | Auto-compiled `declare namespace codemode` + `omni://codemode/types.d.ts` | **v4.0 Upgrade** |
+| **Zero-Outbound & HITL Gates** | Block raw network/FS access and gate destructive mutations | `globalOutbound: null` isolation + `is_mutation: true` `APPROVAL_REQUIRED` | **v4.0 Upgrade** |
+| **Resumable Continuations** | Stateless suspend/resume of paused scripts across cluster nodes | Crockford Base32 ULID `SuspendedExecutionFrame` in FNV-1a checksummed WAL | **v4.5 Upgrade** |
+| **Columnar Pushdown** | Vectorized closure filtering without per-row heap allocations | `ColumnarRecordBatch` contiguous arrays + compiled `PhysicalExpr` pipelines | **v4.5 Upgrade** |
+| **SSA Auto-Parallelization** | Automatic parallelization of sequential independent tool calls | Static AST read/write analysis lifting calls into `Stmt::ParallelWave` | **v4.5 Upgrade** |
+| **Declarative Saga Rollbacks** | Automatic reverse-order unwinding of partial multi-step mutations | `MutationCompensationSpec` LIFO unwind + Merkle cryptographic receipts | **v4.5 Upgrade** |
+| **Speculative 0-Turn Types** | Eliminate discovery round-trip on initial agent turn | Sub-ms BM25 + stem/tag routing pre-populating Turn 1 `{{types}}` | **v4.5 Upgrade** |
+| **Deterministic Simulation** | Fault-injection chaos testing for agent scripts prior to rollout | 64-bit `Xoshiro256StarStar` seeded PRNG harness (`aifx mcp simulate`) | **v4.5 Upgrade** |
 
 ---
 
@@ -119,11 +137,23 @@ npx -y @rangow2260/omni-mcp mcp search driver
                         │                         │
                         ▼                         ▼
                   Omni MCP Proxy              omni / aifx CLI
-             (BM25 Search + Planning)       (Native Rust Binary)
+           (BM25 + 0-Turn {{types}})       (Native Rust Binary)
                         │                         │
                         └──────────┬──────────────┘
                                    │
                                    ▼
+             ┌──────────────────────────────────────────────────┐
+             │   AUTONOMOUS CODE MODE ENGINE (v4.0 / v4.5)      │
+             ├──────────────────────────────────────────────────┤
+             │  • Polyglot AST Sandbox (~100 us, Outbound:null) │
+             │  • Static SSA Pass (Stmt::ParallelWave Batching) │
+             │  • ColumnarRecordBatch & PhysicalExpr Pushdown   │
+             │  • Resumable Continuations (SuspendedExecFrame)  │
+             │  • Declarative Saga Rollbacks (LIFO Unwinding)   │
+             │  • Xoshiro256StarStar Seeded DST Fault Harness   │
+             └───────────────────────┬──────────────────────────┘
+                                     │
+                                     ▼
              ┌──────────────────────────────────────────────────┐
              │     RUST DATA PLANE (Proxy Gateway Runtime)      │
              │   Dynamic Virtual Servers: /<service-name>/mcp   │
@@ -147,7 +177,7 @@ npx -y @rangow2260/omni-mcp mcp search driver
      (HTTP / gRPC / TChannel)                     (via MCPFx)
 
                                    ▲
-                                   │ (Syncs Config)
+                                   │ (Syncs Config & WAL Snapshots)
                                    │
              ┌──────────────────────────────────────────────────┐
              │       RUST CONTROL PLANE (MCP Registry)          │
@@ -155,6 +185,7 @@ npx -y @rangow2260/omni-mcp mcp search driver
              │  • Durable WAL + Atomic Snapshot Store           │
              │  • Disabled-by-Default Policy Enforcer           │
              │  • Config Diff Review, Approval & Rollback       │
+             │  • MutationCompensationSpec Saga Registry        │
              │  • AutoCrawler Universal IDL Engine              │
              │    - Protobuf v2/v3 AST Parser                   │
              │    - Thrift AST Parser                           │
