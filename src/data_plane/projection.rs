@@ -20,11 +20,7 @@ impl ResponseProjectionEngine {
 
         let mut result = JsonValue::object();
         for path in paths {
-            let parts: Vec<&str> = path
-                .trim()
-                .split('.')
-                .filter(|s| !s.is_empty())
-                .collect();
+            let parts: Vec<&str> = path.trim().split('.').filter(|s| !s.is_empty()).collect();
             if !parts.is_empty() {
                 Self::extract_nested_path(response_data, &parts, &mut result);
             }
@@ -44,7 +40,7 @@ impl ResponseProjectionEngine {
                     if parts.len() == 1 {
                         target.insert(k.clone(), v.clone());
                     } else {
-                        if !target.get(k).map_or(false, |x| x.is_object()) {
+                        if !target.get(k).is_some_and(|x| x.is_object()) {
                             target.insert(k.clone(), JsonValue::object());
                         }
                         if let Some(sub_target) = target.get_mut(k) {
@@ -79,7 +75,7 @@ impl ResponseProjectionEngine {
                 Some(a) => a,
                 None => return,
             };
-            if !target.get(clean_key).map_or(false, |x| x.is_array()) {
+            if !target.get(clean_key).is_some_and(|x| x.is_array()) {
                 target.insert(clean_key.to_string(), JsonValue::array());
             }
             if let Some(target_arr) = target.get_mut(clean_key).and_then(|x| x.as_array_mut()) {
@@ -95,7 +91,7 @@ impl ResponseProjectionEngine {
                 }
             }
         } else {
-            if !target.get(clean_key).map_or(false, |x| x.is_object()) {
+            if !target.get(clean_key).is_some_and(|x| x.is_object()) {
                 target.insert(clean_key.to_string(), JsonValue::object());
             }
             if let Some(sub_target) = target.get_mut(clean_key) {
@@ -104,4 +100,3 @@ impl ResponseProjectionEngine {
         }
     }
 }
-

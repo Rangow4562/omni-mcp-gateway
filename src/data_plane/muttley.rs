@@ -1,5 +1,5 @@
-//! Muttley Service Mesh Sidecar Client - Uber's service-to-service routing and transport layer.
-//! Tracks distributed trace IDs, call logs, and microsecond latency histograms.
+//! Muttley Service Mesh Sidecar Adapter - In-memory service-to-service routing and mock downstream responder.
+//! Tracks distributed trace IDs, call logs, and microsecond latency histograms ($p_{50}$, $p_{95}$, $p_{99}$).
 
 use crate::json::JsonValue;
 use crate::logging::{now_epoch_millis, now_epoch_secs};

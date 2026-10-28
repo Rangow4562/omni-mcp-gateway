@@ -67,7 +67,7 @@ impl IDLParser {
 
         // 1. Extract `message Name { ... }` blocks
         let mut messages: HashMap<String, Vec<FieldDefinition>> = HashMap::new();
-        for ( _doc, name, body) in extract_named_blocks(content, "message") {
+        for (_doc, name, body) in extract_named_blocks(content, "message") {
             let mut fields = Vec::new();
             for raw_line in body.lines() {
                 let line = raw_line.trim();
@@ -141,14 +141,20 @@ impl IDLParser {
                     if let Some((method_part, after_open)) = rest.split_once('(') {
                         let method_name = method_part.trim().to_string();
                         if let Some((req_part, after_req)) = after_open.split_once(')') {
-                            let req_type = req_part.trim().trim_start_matches("stream ").trim().to_string();
+                            let req_type = req_part
+                                .trim()
+                                .trim_start_matches("stream ")
+                                .trim()
+                                .to_string();
                             if let Some((_, resp_open)) = after_req.split_once('(') {
                                 if let Some((resp_part, _)) = resp_open.split_once(')') {
-                                    let resp_type = resp_part.trim().trim_start_matches("stream ").trim().to_string();
-                                    let method_fields = messages
-                                        .get(&req_type)
-                                        .cloned()
-                                        .unwrap_or_default();
+                                    let resp_type = resp_part
+                                        .trim()
+                                        .trim_start_matches("stream ")
+                                        .trim()
+                                        .to_string();
+                                    let method_fields =
+                                        messages.get(&req_type).cloned().unwrap_or_default();
                                     let is_mutation = is_mutation_name(&method_name);
                                     methods.push(MethodDefinition {
                                         name: method_name,

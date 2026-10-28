@@ -122,7 +122,9 @@ impl JsonValue {
 
     pub fn get_mut(&mut self, key: &str) -> Option<&mut JsonValue> {
         match self {
-            JsonValue::Object(entries) => entries.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v),
+            JsonValue::Object(entries) => {
+                entries.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)
+            }
             _ => None,
         }
     }
@@ -213,7 +215,11 @@ impl JsonValue {
         let pad = "  ".repeat(indent);
         let next_pad = "  ".repeat(indent + 1);
         match self {
-            JsonValue::Null | JsonValue::Bool(_) | JsonValue::Int(_) | JsonValue::Float(_) | JsonValue::Str(_) => {
+            JsonValue::Null
+            | JsonValue::Bool(_)
+            | JsonValue::Int(_)
+            | JsonValue::Float(_)
+            | JsonValue::Str(_) => {
                 self.write_compact(out);
             }
             JsonValue::Array(items) => {
@@ -260,7 +266,10 @@ impl JsonValue {
         let val = parser.parse_value()?;
         parser.skip_whitespace();
         if parser.pos < parser.bytes.len() {
-            return Err(format!("Unexpected trailing characters at byte {}", parser.pos));
+            return Err(format!(
+                "Unexpected trailing characters at byte {}",
+                parser.pos
+            ));
         }
         Ok(val)
     }
@@ -323,7 +332,10 @@ impl<'a> JsonParser<'a> {
             Some(b'[') => self.parse_array(),
             Some(b'{') => self.parse_object(),
             Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
-            Some(c) => Err(format!("Unexpected character '{}' at pos {}", c as char, self.pos)),
+            Some(c) => Err(format!(
+                "Unexpected character '{}' at pos {}",
+                c as char, self.pos
+            )),
             None => Err("Unexpected end of JSON input".to_string()),
         }
     }
@@ -682,4 +694,32 @@ macro_rules! json {
     ($other:expr) => {
         $crate::json::JsonValue::from($other)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_parser_round_trip_escapes_and_ordering() {
+        let val = json!({
+            "alpha": "line1\nline2\t\"quoted\"",
+            "beta": -42,
+            "gamma": 3.125,
+            "nested": [true, false, null, {"k": "v"}]
+        });
+        let compact = val.to_string_compact();
+        let reparsed = JsonValue::parse(&compact).expect("Must parse valid compact JSON");
+        assert_eq!(val, reparsed);
+        assert_eq!(reparsed["alpha"].as_str(), Some("line1\nline2\t\"quoted\""));
+        assert_eq!(reparsed["beta"].as_i64(), Some(-42));
+        assert_eq!(reparsed["nested"][3]["k"].as_str(), Some("v"));
+    }
+
+    #[test]
+    fn test_json_parser_rejects_malformed_and_trailing_bytes() {
+        assert!(JsonValue::parse(r#"{"a": 1} trailing"#).is_err());
+        assert!(JsonValue::parse(r#"{"unclosed": [1, 2}"#).is_err());
+        assert!(JsonValue::parse(r#""unterminated"#).is_err());
+    }
 }

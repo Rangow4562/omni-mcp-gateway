@@ -19,7 +19,7 @@ use omni_mcp::models::{
     ToolStatus, CIRCUIT_OPEN, TOOL_DISABLED, UNAUTHORIZED,
 };
 use omni_mcp::server::ProductionGatewayContext;
-use omni_mcp::storage::{WalRegistryStore, MerkleAuditStore, GENESIS_HASH};
+use omni_mcp::storage::{MerkleAuditStore, WalRegistryStore, GENESIS_HASH};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -201,11 +201,21 @@ fn test_protobuf_and_thrift_idl_parsing() {
     let schema = IDLParser::translate_to_json_schema(m);
     let props = schema.get("properties").unwrap();
     assert_eq!(
-        props.get("vehicle_id").unwrap().get("type").unwrap().as_str(),
+        props
+            .get("vehicle_id")
+            .unwrap()
+            .get("type")
+            .unwrap()
+            .as_str(),
         Some("string")
     );
     assert_eq!(
-        props.get("sensor_ids").unwrap().get("type").unwrap().as_str(),
+        props
+            .get("sensor_ids")
+            .unwrap()
+            .get("type")
+            .unwrap()
+            .as_str(),
         Some("array")
     );
     assert_eq!(
@@ -232,7 +242,13 @@ fn test_protobuf_and_thrift_idl_parsing() {
 fn test_native_mcpfx_heartbeat_and_autocrawler() {
     let registry = MCPRegistry::new(None);
     let monitor = MCPFxHeartbeatMonitor::new();
-    monitor.emit_heartbeat("geospatial-index", "10.0.1.20", 9090, "maps-team", "Geospatial Index");
+    monitor.emit_heartbeat(
+        "geospatial-index",
+        "10.0.1.20",
+        9090,
+        "maps-team",
+        "Geospatial Index",
+    );
 
     let crawler = AutoCrawler::new(registry.clone(), Some(monitor), None);
     let res = crawler.run_discovery_workflow();
@@ -309,7 +325,10 @@ fn test_data_plane_routing_and_protocol_translation() {
         .unwrap()
         .clone();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].get("name").unwrap().as_str(), Some("FindNearbyDrivers"));
+    assert_eq!(
+        tools[0].get("name").unwrap().as_str(),
+        Some("FindNearbyDrivers")
+    );
 
     // 3. tools/call over gRPC -> Muttley
     let call_req = RPCRequest::new(
@@ -325,7 +344,11 @@ fn test_data_plane_routing_and_protocol_translation() {
     assert_eq!(mesh.get_call_count(Some("dispatch-service")), 1);
 
     // 4. Disable tool and verify rejection
-    registry.toggle_tool_status("dispatch-service", "FindNearbyDrivers", ToolStatus::Disabled);
+    registry.toggle_tool_status(
+        "dispatch-service",
+        "FindNearbyDrivers",
+        ToolStatus::Disabled,
+    );
     cache.refresh_now();
     let disabled_resp = gateway.handle_request("dispatch-service", &call_req, "agent", None);
     assert_eq!(disabled_resp.error.unwrap().code, TOOL_DISABLED);
@@ -342,8 +365,10 @@ fn test_pii_redactor_and_abac_charter_policy() {
     assert!(redacted.contains("[REDACTED_CARD]"));
     assert!(redacted.contains("[REDACTED_TOKEN]"));
 
-    let mut policy = CharterPolicy::default();
-    policy.allowed_actors = vec![ActorType::Human];
+    let policy = CharterPolicy {
+        allowed_actors: vec![ActorType::Human],
+        ..Default::default()
+    };
     let mut tool = ToolRecord::new("DeleteCustomerData", "GDPR deletion", JsonValue::object());
     tool.charter_policy = Some(policy);
     let server = ServerRecord::new("security-svc", "Security", "", "sec");
@@ -382,7 +407,12 @@ fn test_response_projection_and_omni_mcp_discovery() {
     ];
     let projected = ResponseProjectionEngine::apply_projection(&full_payload, Some(&paths));
     assert_eq!(
-        projected.get("driver").unwrap().get("name").unwrap().as_str(),
+        projected
+            .get("driver")
+            .unwrap()
+            .get("name")
+            .unwrap()
+            .as_str(),
         Some("Alex")
     );
     assert_eq!(
@@ -396,7 +426,11 @@ fn test_response_projection_and_omni_mcp_discovery() {
             .as_str(),
         Some("Tesla")
     );
-    assert!(projected.get("driver").unwrap().get("internal_metrics").is_none());
+    assert!(projected
+        .get("driver")
+        .unwrap()
+        .get("internal_metrics")
+        .is_none());
     assert!(projected.get("unrelated_logs").is_none());
     assert_eq!(
         projected.get("trips").unwrap().as_array().unwrap()[0]
@@ -405,11 +439,9 @@ fn test_response_projection_and_omni_mcp_discovery() {
             .as_str(),
         Some("t1")
     );
-    assert!(
-        projected.get("trips").unwrap().as_array().unwrap()[0]
-            .get("secret")
-            .is_none()
-    );
+    assert!(projected.get("trips").unwrap().as_array().unwrap()[0]
+        .get("secret")
+        .is_none());
 
     // Omni MCP 4-step flow
     let registry = MCPRegistry::new(None);
@@ -458,9 +490,12 @@ fn test_response_projection_and_omni_mcp_discovery() {
         json!({"name": "discover_tools", "arguments": {"server_name": "eats-catalog"}}),
     );
     let tools_resp = omni.handle_request(&tools_req, "agent", None);
-    let parsed_tools =
-        JsonValue::parse(tools_resp.result.unwrap()["content"][0]["text"].as_str().unwrap())
-            .unwrap();
+    let parsed_tools = JsonValue::parse(
+        tools_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(parsed_tools["tools"][0]["name"].as_str(), Some("GetMenu"));
 
     // Step 3: get_tool_schema
@@ -470,9 +505,12 @@ fn test_response_projection_and_omni_mcp_discovery() {
         json!({"name": "get_tool_schema", "arguments": {"server_name": "eats-catalog", "tool_name": "GetMenu"}}),
     );
     let schema_resp = omni.handle_request(&schema_req, "agent", None);
-    let schema_data =
-        JsonValue::parse(schema_resp.result.unwrap()["content"][0]["text"].as_str().unwrap())
-            .unwrap();
+    let schema_data = JsonValue::parse(
+        schema_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert!(schema_data["inputSchema"]["properties"]
         .get("store_id")
         .is_some());
@@ -619,8 +657,10 @@ fn test_omni_mcp_batch_invoke_tools() {
 #[test]
 fn test_aifx_cli_and_http_gateway_endpoints() {
     let dir = temp_test_path("omni_http_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // Test CLI list, search, call to file, and benchmark
@@ -669,7 +709,7 @@ fn test_aifx_cli_and_http_gateway_endpoints() {
 #[test]
 fn test_v3_openapi_and_swagger_idl_discovery() {
     let dir = temp_test_path("omni_openapi_test");
-    let store = Arc::new(WalRegistryStore::new(&format!("{}/reg.db", dir)));
+    let store = Arc::new(WalRegistryStore::new(format!("{}/reg.db", dir)));
     let registry = MCPRegistry::new(Some(store.clone()));
     let crawler = AutoCrawler::new(registry.clone(), None, None);
 
@@ -717,15 +757,29 @@ fn test_v3_openapi_and_swagger_idl_discovery() {
     crawler.run_discovery_workflow();
 
     let servers = registry.list_servers(None);
-    let s_delivery = servers.iter().find(|s| s.name.contains("eatsdelivery")).expect("EatsDelivery should be registered");
+    let s_delivery = servers
+        .iter()
+        .find(|s| s.name.contains("eatsdelivery"))
+        .expect("EatsDelivery should be registered");
     assert_eq!(s_delivery.protocol, ProtocolType::Http);
-    let tool_deliver = s_delivery.tools.values().next().expect("Tool deliver should exist");
+    let tool_deliver = s_delivery
+        .tools
+        .values()
+        .next()
+        .expect("Tool deliver should exist");
     assert!(tool_deliver.name.contains("deliver"));
     assert!(tool_deliver.tags.contains(&"delivery".to_string()));
     assert!(tool_deliver.is_mutation);
 
-    let s_loyalty = servers.iter().find(|s| s.name.contains("riderloyalty")).expect("RiderLoyalty should be registered");
-    let tool_points = s_loyalty.tools.values().next().expect("Tool points should exist");
+    let s_loyalty = servers
+        .iter()
+        .find(|s| s.name.contains("riderloyalty"))
+        .expect("RiderLoyalty should be registered");
+    let tool_points = s_loyalty
+        .tools
+        .values()
+        .next()
+        .expect("Tool points should exist");
     assert!(tool_points.name.contains("points"));
     assert!(!tool_points.is_mutation);
 
@@ -784,7 +838,7 @@ fn test_v3_merkle_chained_audit_trail() {
 #[test]
 fn test_v3_opentelemetry_w3c_tracing_and_canary_routing() {
     let dir = temp_test_path("omni_otel_test");
-    let store = Arc::new(WalRegistryStore::new(&format!("{}/reg.db", dir)));
+    let store = Arc::new(WalRegistryStore::new(format!("{}/reg.db", dir)));
     let registry = MCPRegistry::new(Some(store.clone()));
     let cache = InMemoryConfigCache::new(registry.clone(), 60.0);
 
@@ -812,8 +866,8 @@ fn test_v3_opentelemetry_w3c_tracing_and_canary_routing() {
 
     let audit_store = Arc::new(MerkleAuditStore::new(None));
     let traces = Arc::new(RwLock::new(Vec::new()));
-    let gateway = MCPProxyGateway::new(cache, None)
-        .with_observability(audit_store.clone(), traces.clone());
+    let gateway =
+        MCPProxyGateway::new(cache, None).with_observability(audit_store.clone(), traces.clone());
 
     // Incoming standard W3C traceparent header
     let incoming_traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -836,7 +890,10 @@ fn test_v3_opentelemetry_w3c_tracing_and_canary_routing() {
 
     assert!(resp.error.is_none());
     let meta = &resp.result.unwrap()["_metadata"];
-    assert_eq!(meta["trace_id"].as_str(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+    assert_eq!(
+        meta["trace_id"].as_str(),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736")
+    );
     assert_eq!(meta["canary"].as_bool(), Some(true));
     assert_eq!(meta["version"].as_i64(), Some(2));
 
@@ -846,7 +903,10 @@ fn test_v3_opentelemetry_w3c_tracing_and_canary_routing() {
     let span = &spans_guard[0];
     assert_eq!(span.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
     assert_eq!(span.parent_span_id.as_deref(), Some("00f067aa0ba902b7"));
-    assert_eq!(span.attributes.get("mcp.canary").unwrap().as_bool(), Some(true));
+    assert_eq!(
+        span.attributes.get("mcp.canary").unwrap().as_bool(),
+        Some(true)
+    );
 
     store.close();
     let _ = fs::remove_dir_all(&dir);
@@ -855,7 +915,7 @@ fn test_v3_opentelemetry_w3c_tracing_and_canary_routing() {
 #[test]
 fn test_v3_resilient_fallback_execution() {
     let dir = temp_test_path("omni_fallback_test");
-    let store = Arc::new(WalRegistryStore::new(&format!("{}/reg.db", dir)));
+    let store = Arc::new(WalRegistryStore::new(format!("{}/reg.db", dir)));
     let registry = MCPRegistry::new(Some(store.clone()));
     let cache = InMemoryConfigCache::new(registry.clone(), 60.0);
 
@@ -912,8 +972,10 @@ fn test_v3_resilient_fallback_execution() {
 #[test]
 fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
     let dir = temp_test_path("omni_planning_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
     let omni = &ctx.omni_mcp;
 
@@ -931,9 +993,14 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
     );
     let plan_resp = omni.handle_request(&plan_req, "agent", None);
     assert!(plan_resp.error.is_none());
-    let plan_text = plan_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    let plan_text = plan_resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let plan_json = JsonValue::parse(&plan_text).unwrap();
-    let pipeline = plan_json["recommended_pipeline"].as_array().expect("Pipeline array");
+    let pipeline = plan_json["recommended_pipeline"]
+        .as_array()
+        .expect("Pipeline array");
     assert!(!pipeline.is_empty());
     assert_eq!(pipeline[0]["tool_name"].as_str(), Some("GetDriverLocation"));
 
@@ -952,17 +1019,28 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
     );
     let diag_resp = omni.handle_request(&diag_req, "agent", None);
     assert!(diag_resp.error.is_none());
-    let diag_text = diag_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    let diag_text = diag_resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let diag_json = JsonValue::parse(&diag_text).unwrap();
     assert_eq!(diag_json["tool_status"].as_str(), Some("NOT_FOUND"));
-    assert!(diag_json["suggested_action"].as_str().unwrap().contains("discover_tools"));
+    assert!(diag_json["suggested_action"]
+        .as_str()
+        .unwrap()
+        .contains("discover_tools"));
 
     // 3. Test MCP Resources list and read
     let res_list_req = RPCRequest::new(3003i64, "resources/list", json!({}));
     let res_list_resp = omni.handle_request(&res_list_req, "agent", None);
     assert!(res_list_resp.error.is_none());
-    let resources = res_list_resp.result.unwrap()["resources"].as_array().unwrap().clone();
-    assert!(resources.iter().any(|r| r["uri"].as_str() == Some("omni://audit/merkle-head")));
+    let resources = res_list_resp.result.unwrap()["resources"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(resources
+        .iter()
+        .any(|r| r["uri"].as_str() == Some("omni://audit/merkle-head")));
 
     let res_read_req = RPCRequest::new(
         3004i64,
@@ -971,15 +1049,26 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
     );
     let res_read_resp = omni.handle_request(&res_read_req, "agent", None);
     assert!(res_read_resp.error.is_none());
-    let res_contents = res_read_resp.result.unwrap()["contents"].as_array().unwrap().clone();
-    assert_eq!(res_contents[0]["uri"].as_str(), Some("omni://audit/merkle-head"));
+    let res_contents = res_read_resp.result.unwrap()["contents"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        res_contents[0]["uri"].as_str(),
+        Some("omni://audit/merkle-head")
+    );
 
     // 4. Test MCP Prompts list and get
     let prompt_list_req = RPCRequest::new(3005i64, "prompts/list", json!({}));
     let prompt_list_resp = omni.handle_request(&prompt_list_req, "agent", None);
     assert!(prompt_list_resp.error.is_none());
-    let prompts = prompt_list_resp.result.unwrap()["prompts"].as_array().unwrap().clone();
-    assert!(prompts.iter().any(|p| p["name"].as_str() == Some("incident-investigation")));
+    let prompts = prompt_list_resp.result.unwrap()["prompts"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(prompts
+        .iter()
+        .any(|p| p["name"].as_str() == Some("incident-investigation")));
 
     let prompt_get_req = RPCRequest::new(
         3006i64,
@@ -994,17 +1083,21 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
 
     // 5. Test HTTP SSE and Tracing / Audit endpoints
     let headers = HashMap::new();
-    let (sse_status, sse_ctype, _sse_headers, sse_body) = ctx.handle_http("GET", "/sse", &headers, &[]);
+    let (sse_status, sse_ctype, _sse_headers, sse_body) =
+        ctx.handle_http("GET", "/sse", &headers, &[]);
     assert_eq!(sse_status, 200);
     assert!(sse_ctype.contains("text/event-stream"));
-    assert!(String::from_utf8(sse_body).unwrap().contains("event: endpoint"));
+    assert!(String::from_utf8(sse_body)
+        .unwrap()
+        .contains("event: endpoint"));
 
     let (traces_status, _, _, traces_body) = ctx.handle_http("GET", "/api/traces", &headers, &[]);
     assert_eq!(traces_status, 200);
     let traces_json = JsonValue::parse(&String::from_utf8(traces_body).unwrap()).unwrap();
     assert!(traces_json.get("spans").is_some());
 
-    let (audit_status, _, _, audit_body) = ctx.handle_http("GET", "/api/audit/verify", &headers, &[]);
+    let (audit_status, _, _, audit_body) =
+        ctx.handle_http("GET", "/api/audit/verify", &headers, &[]);
     assert_eq!(audit_status, 200);
     let audit_json = JsonValue::parse(&String::from_utf8(audit_body).unwrap()).unwrap();
     assert_eq!(audit_json["verified"].as_bool(), Some(true));
@@ -1016,30 +1109,44 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
 #[test]
 fn test_v4_codemode_typescript_declaration_generation_and_token_compression() {
     let dir = temp_test_path("omni_codemode_types_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // 1. Generate TypeScript declarations across all enabled servers
     let ts_res = ctx.gateway.generate_codemode_types(None, None);
-    assert!(ts_res.typescript_declarations.contains("declare namespace codemode {"));
-    assert!(ts_res.typescript_declarations.contains("namespace uber_rides {"));
-    assert!(ts_res.typescript_declarations.contains("function list_recent(input: { user_id: string }): Promise<any>;"));
-    assert!(ts_res.typescript_declarations.contains("namespace accounting {"));
+    assert!(ts_res
+        .typescript_declarations
+        .contains("declare namespace codemode {"));
+    assert!(ts_res
+        .typescript_declarations
+        .contains("namespace uber_rides {"));
+    assert!(ts_res
+        .typescript_declarations
+        .contains("function list_recent(input: { user_id: string }): Promise<any>;"));
+    assert!(ts_res
+        .typescript_declarations
+        .contains("namespace accounting {"));
     assert!(ts_res.typescript_declarations.contains("[MUTATION]"));
     assert!(ts_res.typescript_declarations.contains("function refund("));
     assert!(ts_res.token_savings_pct > 50.0);
 
     // 2. Test {{types}} prompt template injection
     let template = "Use the following TypeScript APIs:\n```ts\n{{types}}\n```";
-    let injected = CodeModeTypeGenerator::inject_types_template(template, &ts_res.typescript_declarations);
+    let injected =
+        CodeModeTypeGenerator::inject_types_template(template, &ts_res.typescript_declarations);
     assert!(injected.contains("declare namespace codemode"));
     assert!(!injected.contains("{{types}}"));
 
     // 3. Verify `tools/list` on OmniMCPServer dynamically injects {{types}} into `codemode` description
     let list_req = RPCRequest::new(4001i64, "tools/list", json!({}));
     let list_resp = ctx.omni_mcp.handle_request(&list_req, "agent", None);
-    let tools = list_resp.result.unwrap()["tools"].as_array().unwrap().clone();
+    let tools = list_resp.result.unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
     let codemode_tool = tools
         .iter()
         .find(|t| t["name"].as_str() == Some("codemode"))
@@ -1056,8 +1163,10 @@ fn test_v4_codemode_typescript_declaration_generation_and_token_compression() {
 #[test]
 fn test_v4_codemode_js_ts_and_rhai_multi_tool_chaining_with_console_logs() {
     let dir = temp_test_path("omni_codemode_exec_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // 1. Omni Code Mode JS/TS async script with console.log and multi-tool chaining
@@ -1078,14 +1187,9 @@ fn test_v4_codemode_js_ts_and_rhai_multi_tool_chaining_with_console_logs() {
     }
     "#;
 
-    let out_js = ctx.gateway.execute_codemode(
-        js_script,
-        None,
-        false,
-        "agent",
-        Some("uber_token_1"),
-        None,
-    );
+    let out_js =
+        ctx.gateway
+            .execute_codemode(js_script, None, false, "agent", Some("uber_token_1"), None);
     assert_eq!(out_js.status, "OK", "JS error: {:?}", out_js.error);
     assert_eq!(out_js.result["refunded_count"].as_i64(), Some(2));
     assert_eq!(out_js.result["total_amount"].as_f64(), Some(72.5));
@@ -1129,8 +1233,10 @@ fn test_v4_codemode_js_ts_and_rhai_multi_tool_chaining_with_console_logs() {
 #[test]
 fn test_v4_codemode_search_and_execute_plus_mutation_approval_gate() {
     let dir = temp_test_path("omni_codemode_approval_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // 1. In-sandbox `codemode.search()` and `codemode.describe()` (Search & Execute pattern)
@@ -1141,7 +1247,9 @@ fn test_v4_codemode_search_and_execute_plus_mutation_approval_gate() {
         return { match_count: matches.length, has_dts: dts.includes("function refund") };
     }
     "#;
-    let search_out = ctx.gateway.execute_codemode(search_script, None, false, "agent", None, None);
+    let search_out = ctx
+        .gateway
+        .execute_codemode(search_script, None, false, "agent", None, None);
     assert_eq!(search_out.status, "OK");
     assert!(search_out.result["match_count"].as_i64().unwrap_or(0) >= 1);
     assert_eq!(search_out.result["has_dts"].as_bool(), Some(true));
@@ -1156,12 +1264,8 @@ fn test_v4_codemode_search_and_execute_plus_mutation_approval_gate() {
     }
     "#;
     let approval_out = ctx.gateway.execute_codemode(
-        mut_script,
-        None,
-        true, // require_mutation_approval = true
-        "agent",
-        None,
-        None,
+        mut_script, None, true, // require_mutation_approval = true
+        "agent", None, None,
     );
     assert_eq!(approval_out.status, "APPROVAL_REQUIRED");
     assert_eq!(approval_out.logs.len(), 1);
@@ -1176,8 +1280,10 @@ fn test_v4_codemode_search_and_execute_plus_mutation_approval_gate() {
 #[test]
 fn test_v4_codemode_zero_outbound_isolation_and_fuel_guardrails() {
     let dir = temp_test_path("omni_codemode_security_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // 1. Verify `globalOutbound: null` blocks direct `fetch()`
@@ -1187,7 +1293,9 @@ fn test_v4_codemode_zero_outbound_isolation_and_fuel_guardrails() {
         return res;
     }
     "#;
-    let out_blocked = ctx.gateway.execute_codemode(outbound_script, None, false, "agent", None, None);
+    let out_blocked =
+        ctx.gateway
+            .execute_codemode(outbound_script, None, false, "agent", None, None);
     assert_eq!(out_blocked.status, "ERROR");
     assert!(out_blocked
         .error
@@ -1196,22 +1304,19 @@ fn test_v4_codemode_zero_outbound_isolation_and_fuel_guardrails() {
         .contains("GlobalOutboundBlocked"));
 
     // 2. Verify Fuel Metering terminates infinite loops (`while (true) {}`) deterministically
-    let mut strict_limits = SandboxLimits::default();
-    strict_limits.max_operations = 500;
+    let strict_limits = SandboxLimits {
+        max_operations: 500,
+        ..Default::default()
+    };
     let inf_loop = r#"
     let i = 0;
     while (true) {
         i += 1;
     }
     "#;
-    let out_fuel = ctx.gateway.execute_codemode(
-        inf_loop,
-        Some(strict_limits),
-        false,
-        "agent",
-        None,
-        None,
-    );
+    let out_fuel =
+        ctx.gateway
+            .execute_codemode(inf_loop, Some(strict_limits), false, "agent", None, None);
     assert_eq!(out_fuel.status, "ERROR");
     assert!(out_fuel
         .error
@@ -1231,8 +1336,10 @@ fn test_v4_codemode_zero_outbound_isolation_and_fuel_guardrails() {
 #[test]
 fn test_v4_5_resumable_ast_continuation_suspend_and_resume() {
     let dir = temp_test_path("omni_v45_continuation_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // Script has 3 top-level statements:
@@ -1283,20 +1390,32 @@ fn test_v4_5_resumable_ast_continuation_suspend_and_resume() {
     assert_eq!(listed[0].execution_id, exec_id);
 
     // Resume after human approval without re-running step 0 (`uber_rides.list_recent`)
-    let resumed_out = ctx.gateway.resume_codemode(
-        &exec_id,
-        "security_lead",
-        None,
-        Some("uber_token_1"),
-        None,
+    let resumed_out =
+        ctx.gateway
+            .resume_codemode(&exec_id, "security_lead", None, Some("uber_token_1"), None);
+    assert_eq!(
+        resumed_out.status, "OK",
+        "Resume error: {:?}",
+        resumed_out.error
     );
-    assert_eq!(resumed_out.status, "OK", "Resume error: {:?}", resumed_out.error);
-    assert_eq!(resumed_out.tool_calls, 1, "Only the approved mutation should run on resume");
-    assert_eq!(resumed_out.result["resumed_from_snapshot"].as_bool(), Some(true));
+    assert_eq!(
+        resumed_out.tool_calls, 1,
+        "Only the approved mutation should run on resume"
+    );
+    assert_eq!(
+        resumed_out.result["resumed_from_snapshot"].as_bool(),
+        Some(true)
+    );
     assert_eq!(resumed_out.result["total_rides_in_scope"].as_i64(), Some(4));
-    assert_eq!(resumed_out.result["refunded_ride_id"].as_str(), Some("ride_102"));
+    assert_eq!(
+        resumed_out.result["refunded_ride_id"].as_str(),
+        Some("ride_102")
+    );
     assert_eq!(resumed_out.result["refund_id"].as_str(), Some("rfnd_99201"));
-    assert_eq!(resumed_out.result["refund_status"].as_str(), Some("REFUNDED"));
+    assert_eq!(
+        resumed_out.result["refund_status"].as_str(),
+        Some("REFUNDED")
+    );
 
     // Frame must be deleted after consumption
     assert!(ctx.gateway.list_suspended_codemode_frames().is_empty());
@@ -1308,8 +1427,10 @@ fn test_v4_5_resumable_ast_continuation_suspend_and_resume() {
 #[test]
 fn test_v4_5_vectorized_columnar_record_batch_pushdown() {
     let dir = temp_test_path("omni_v45_vectorized_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // Register a synthetic analytics dataset tool returning 2,000 rows
@@ -1346,7 +1467,9 @@ fn test_v4_5_vectorized_columnar_record_batch_pushdown() {
     }
     "#;
 
-    let out = ctx.gateway.execute_codemode(script, None, false, "agent", None, None);
+    let out = ctx
+        .gateway
+        .execute_codemode(script, None, false, "agent", None, None);
     assert_eq!(out.status, "OK", "Vectorized error: {:?}", out.error);
     assert_eq!(
         out.vectorized_pushdowns, 2,
@@ -1367,18 +1490,17 @@ fn test_v4_5_vectorized_columnar_record_batch_pushdown() {
 #[test]
 fn test_v4_5_ssa_ast_auto_parallelization() {
     let dir = temp_test_path("omni_v45_ssa_parallel_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // Enable tripbillingservice so we have 3 distinct microservices to call
     ctx.registry
         .toggle_server_status("tripbillingservice", ToolStatus::Enabled);
-    ctx.registry.toggle_tool_status(
-        "tripbillingservice",
-        "getTripFare",
-        ToolStatus::Enabled,
-    );
+    ctx.registry
+        .toggle_tool_status("tripbillingservice", "getTripFare", ToolStatus::Enabled);
     ctx.cache.refresh_now();
 
     // LLM writes 3 sequential independent awaits followed by a dependent return statement.
@@ -1396,7 +1518,9 @@ fn test_v4_5_ssa_ast_auto_parallelization() {
     }
     "#;
 
-    let out = ctx.gateway.execute_codemode(script, None, false, "agent", None, None);
+    let out = ctx
+        .gateway
+        .execute_codemode(script, None, false, "agent", None, None);
     assert_eq!(out.status, "OK", "Parallel wave error: {:?}", out.error);
     assert_eq!(
         out.auto_parallel_waves, 1,
@@ -1416,8 +1540,10 @@ fn test_v4_5_ssa_ast_auto_parallelization() {
 #[test]
 fn test_v4_5_declarative_saga_compensation_lifo_rollback() {
     let dir = temp_test_path("omni_v45_saga_rollback_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // Script performs 2 mutations (`payments_charge`) that succeed, then calls a non-existent tool
@@ -1432,7 +1558,9 @@ fn test_v4_5_declarative_saga_compensation_lifo_rollback() {
     }
     "#;
 
-    let out = ctx.gateway.execute_codemode(script, None, false, "agent", None, None);
+    let out = ctx
+        .gateway
+        .execute_codemode(script, None, false, "agent", None, None);
     assert_eq!(
         out.status, "SAGA_ROLLED_BACK",
         "Expected SAGA_ROLLED_BACK when script fails after mutations"
@@ -1443,10 +1571,16 @@ fn test_v4_5_declarative_saga_compensation_lifo_rollback() {
         "Both completed mutations must be compensated in LIFO order"
     );
     assert_eq!(out.saga_compensations[0].forward_tool, "payments_charge");
-    assert_eq!(out.saga_compensations[0].compensating_tool, "payments_refund");
+    assert_eq!(
+        out.saga_compensations[0].compensating_tool,
+        "payments_refund"
+    );
     assert_eq!(out.saga_compensations[0].status, "COMPENSATED");
     assert_eq!(out.saga_compensations[1].forward_tool, "payments_charge");
-    assert_eq!(out.saga_compensations[1].compensating_tool, "payments_refund");
+    assert_eq!(
+        out.saga_compensations[1].compensating_tool,
+        "payments_refund"
+    );
     assert_eq!(out.saga_compensations[1].status, "COMPENSATED");
 
     // Verify Merkle Audit Store logged "COMPENSATED:saga_rollback"
@@ -1464,8 +1598,10 @@ fn test_v4_5_declarative_saga_compensation_lifo_rollback() {
 #[test]
 fn test_v4_5_speculative_zero_turn_schema_pre_injection() {
     let dir = temp_test_path("omni_v45_speculative_schema_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     let spec = ctx.gateway.generate_speculative_codemode_types(
@@ -1495,8 +1631,10 @@ fn test_v4_5_speculative_zero_turn_schema_pre_injection() {
 #[test]
 fn test_v4_5_deterministic_simulation_testing_dst() {
     let dir = temp_test_path("omni_v45_dst_simulation_test");
-    let mut cfg = OmniConfig::default();
-    cfg.data_dir = dir.clone();
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
     let ctx = ProductionGatewayContext::new(Some(cfg));
 
     // Script performs a mutation (`payments_charge`) followed by a second tool call (`list_recent`).
@@ -1519,25 +1657,16 @@ fn test_v4_5_deterministic_simulation_testing_dst() {
         malformed_payload_prob: 0.05,
     };
 
-    let report_1 = ctx.gateway.simulate_codemode(
-        script,
-        None,
-        fault_cfg.clone(),
-        "agent",
-        None,
-    );
-    let report_2 = ctx.gateway.simulate_codemode(
-        script,
-        None,
-        fault_cfg,
-        "agent",
-        None,
-    );
+    let report_1 = ctx
+        .gateway
+        .simulate_codemode(script, None, fault_cfg.clone(), "agent", None);
+    let report_2 = ctx
+        .gateway
+        .simulate_codemode(script, None, fault_cfg, "agent", None);
 
     assert_eq!(report_1.total_runs, 20);
     assert_eq!(
-        report_1.deterministic_fingerprint,
-        report_2.deterministic_fingerprint,
+        report_1.deterministic_fingerprint, report_2.deterministic_fingerprint,
         "Same seed must produce bit-for-bit identical DST simulation trajectories"
     );
     assert!(
@@ -1545,6 +1674,116 @@ fn test_v4_5_deterministic_simulation_testing_dst() {
         "Expected chaos faults on step 2 to trigger Saga rollbacks of step 1"
     );
     assert!(report_1.succeeded_runs > 0);
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_6_protocol_version_negotiation_and_error_contract() {
+    use omni_mcp::models::{
+        FeatureStatus, RPCError, APPROVAL_REQUIRED, FUEL_EXHAUSTED, LATEST_MCP_PROTOCOL_VERSION,
+        LEGACY_MCP_PROTOCOL_VERSION, OUTBOUND_BLOCKED, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED,
+    };
+
+    let dir = temp_test_path("omni_v46_negotiation_and_contract_test");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // 1. M4: Verify MCP Protocol Version Negotiation on `OmniMCPServer` and `MCPProxyGateway`
+    let init_legacy = RPCRequest::new(1i64, "initialize", json!({"protocolVersion": "2024-11-05"}));
+    let resp_legacy = ctx.omni_mcp.handle_request(&init_legacy, "agent", None);
+    assert_eq!(
+        resp_legacy.result.as_ref().unwrap()["protocolVersion"].as_str(),
+        Some(LEGACY_MCP_PROTOCOL_VERSION)
+    );
+    assert_eq!(
+        resp_legacy.result.as_ref().unwrap()["serverInfo"]["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+
+    let init_2025 = RPCRequest::new(2i64, "initialize", json!({"protocolVersion": "2025-03-26"}));
+    let resp_2025 = ctx.omni_mcp.handle_request(&init_2025, "agent", None);
+    assert_eq!(
+        resp_2025.result.as_ref().unwrap()["protocolVersion"].as_str(),
+        Some(LATEST_MCP_PROTOCOL_VERSION)
+    );
+
+    let init_unknown =
+        RPCRequest::new(3i64, "initialize", json!({"protocolVersion": "2099-01-01"}));
+    let resp_unknown =
+        ctx.gateway
+            .handle_request("driverdispatchservice", &init_unknown, "agent", None);
+    assert_eq!(
+        resp_unknown.result.as_ref().unwrap()["protocolVersion"].as_str(),
+        Some(LATEST_MCP_PROTOCOL_VERSION)
+    );
+
+    // Verify 2025-03-26 additive tool annotations on `tools/list`
+    let list_req = RPCRequest::new(4i64, "tools/list", JsonValue::object());
+    let list_resp = ctx
+        .gateway
+        .handle_request("driverdispatchservice", &list_req, "agent", None);
+    let tools = list_resp.result.unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(!tools.is_empty());
+    assert_eq!(
+        tools[0]["annotations"]["readOnlyHint"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        tools[0]["annotations"]["destructiveHint"].as_bool(),
+        Some(false)
+    );
+
+    // 2. M3: Verify authoritative -320xx error code table & RPCError::from_status
+    assert_eq!(CIRCUIT_OPEN, -32030);
+    assert_eq!(APPROVAL_REQUIRED, -32031);
+    assert_eq!(FUEL_EXHAUSTED, -32032);
+    assert_eq!(OUTBOUND_BLOCKED, -32033);
+    assert_eq!(SAGA_COMPENSATED, -32034);
+    assert_eq!(SCHEMA_PREFLIGHT_FAILED, -32035);
+
+    let rpc_err = RPCError::from_status(
+        FeatureStatus::OutboundBlocked,
+        "fetch() is blocked by globalOutbound: null",
+    );
+    assert_eq!(rpc_err.code, OUTBOUND_BLOCKED);
+    let err_json = rpc_err.to_json();
+    assert_eq!(err_json["code"].as_i64(), Some(-32033));
+    assert_eq!(
+        err_json["data"]["status"].as_str(),
+        Some("OUTBOUND_BLOCKED")
+    );
+
+    // Verify explain_error surfaces -320xx error_code
+    let explain_req = RPCRequest::new(
+        5i64,
+        "tools/call",
+        json!({
+            "name": "explain_error",
+            "arguments": {
+                "server_name": "accounting",
+                "tool_name": "refund",
+                "error_message": "FuelExhausted: exceeded instruction budget (-32032)"
+            }
+        }),
+    );
+    let explain_resp = ctx.omni_mcp.handle_request(&explain_req, "agent", None);
+    let explain_text = explain_resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let explain_parsed = JsonValue::parse(&explain_text).unwrap();
+    assert_eq!(
+        explain_parsed["error_code"].as_i64(),
+        Some(FUEL_EXHAUSTED as i64)
+    );
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);

@@ -51,7 +51,11 @@ impl ThirdPartyAuthExchange {
         None
     }
 
-    pub fn create_third_party_server(&self, provider_name: &str, owning_team: &str) -> ServerRecord {
+    pub fn create_third_party_server(
+        &self,
+        provider_name: &str,
+        owning_team: &str,
+    ) -> ServerRecord {
         let provider = provider_name.to_lowercase();
         let mut tools = BTreeMap::new();
 

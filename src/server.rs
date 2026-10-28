@@ -24,7 +24,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -159,7 +159,8 @@ impl ProductionGatewayContext {
             TripFare getTripFare(1: string trip_id, 2: bool include_discounts)
         }
         "#;
-        self.crawler.register_idl_source("trip-billing", trip_thrift);
+        self.crawler
+            .register_idl_source("trip-billing", trip_thrift);
 
         // 3. Third-party integrations (Jira)
         let jira_srv = self
@@ -221,16 +222,10 @@ impl ProductionGatewayContext {
         // Enable PaymentsService tools and attach Declarative Saga Compensation to `payments_charge`
         self.registry
             .toggle_server_status("paymentsservice", ToolStatus::Enabled);
-        self.registry.toggle_tool_status(
-            "paymentsservice",
-            "payments_charge",
-            ToolStatus::Enabled,
-        );
-        self.registry.toggle_tool_status(
-            "paymentsservice",
-            "payments_refund",
-            ToolStatus::Enabled,
-        );
+        self.registry
+            .toggle_tool_status("paymentsservice", "payments_charge", ToolStatus::Enabled);
+        self.registry
+            .toggle_tool_status("paymentsservice", "payments_refund", ToolStatus::Enabled);
         if let Some(mut pay_srv) = self.registry.get_server("paymentsservice") {
             if let Some(charge_tool) = pay_srv.tools.get_mut("payments_charge") {
                 charge_tool.is_mutation = true;
@@ -270,8 +265,14 @@ impl ProductionGatewayContext {
         list_recent.protocol = ProtocolType::Grpc;
         list_recent.downstream_endpoint = "muttley://uber_rides/list_recent".to_string();
         list_recent.status = ToolStatus::Enabled;
-        list_recent.tags = vec!["rides".to_string(), "trip".to_string(), "history".to_string()];
-        rides_srv.tools.insert("list_recent".to_string(), list_recent);
+        list_recent.tags = vec![
+            "rides".to_string(),
+            "trip".to_string(),
+            "history".to_string(),
+        ];
+        rides_srv
+            .tools
+            .insert("list_recent".to_string(), list_recent);
         self.registry.register_server(rides_srv);
 
         let mut acct_srv = ServerRecord::new(
@@ -298,7 +299,11 @@ impl ProductionGatewayContext {
         refund_tool.downstream_endpoint = "muttley://accounting/refund".to_string();
         refund_tool.status = ToolStatus::Enabled;
         refund_tool.is_mutation = true;
-        refund_tool.tags = vec!["refund".to_string(), "accounting".to_string(), "billing".to_string()];
+        refund_tool.tags = vec![
+            "refund".to_string(),
+            "accounting".to_string(),
+            "billing".to_string(),
+        ];
         acct_srv.tools.insert("refund".to_string(), refund_tool);
         self.registry.register_server(acct_srv);
 
@@ -425,8 +430,7 @@ impl ProductionGatewayContext {
             "/api/stats" => {
                 let servers = self.registry.list_servers(None);
                 let total_tools: usize = servers.iter().map(|s| s.tools.len()).sum();
-                let enabled_tools: usize =
-                    servers.iter().map(|s| s.enabled_tools_count()).sum();
+                let enabled_tools: usize = servers.iter().map(|s| s.enabled_tools_count()).sum();
                 let (hits, misses) = self.gateway.semantic_cache.stats();
                 let (p50_us, _p95_us, p99_us) =
                     self.gateway.translator.mesh_client.latency_percentiles_us();
@@ -739,11 +743,9 @@ impl ProductionGatewayContext {
             };
             match RPCBatchOrSingle::from_json(&json_val) {
                 Ok(batch_or_single) => {
-                    let resp_json = self.omni_mcp.handle_batch_or_single(
-                        batch_or_single,
-                        actor,
-                        Some(token),
-                    );
+                    let resp_json =
+                        self.omni_mcp
+                            .handle_batch_or_single(batch_or_single, actor, Some(token));
                     return self.json_response(200, resp_json);
                 }
                 Err(e) => {
@@ -769,7 +771,10 @@ impl ProductionGatewayContext {
                 self.json_response(200, res)
             }
             "/api/tools/toggle_status" => {
-                let s_name = body.get("serverName").and_then(|x| x.as_str()).unwrap_or("");
+                let s_name = body
+                    .get("serverName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 let t_name = body.get("toolName").and_then(|x| x.as_str()).unwrap_or("");
                 let status_str = body
                     .get("status")
@@ -782,7 +787,10 @@ impl ProductionGatewayContext {
                 self.json_response(200, json!({"success": ok}))
             }
             "/api/servers/toggle_status" => {
-                let s_name = body.get("serverName").and_then(|x| x.as_str()).unwrap_or("");
+                let s_name = body
+                    .get("serverName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 let status_str = body
                     .get("status")
                     .and_then(|x| x.as_str())
@@ -793,7 +801,10 @@ impl ProductionGatewayContext {
                 self.json_response(200, json!({"success": ok}))
             }
             "/api/tools/propose_update" => {
-                let s_name = body.get("serverName").and_then(|x| x.as_str()).unwrap_or("");
+                let s_name = body
+                    .get("serverName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 let t_name = body.get("toolName").and_then(|x| x.as_str()).unwrap_or("");
                 let new_desc = body.get("description").and_then(|x| x.as_str());
                 let new_schema = body.get("inputSchema").cloned();
@@ -835,7 +846,10 @@ impl ProductionGatewayContext {
                 self.json_response(200, json!({"success": ok}))
             }
             "/api/tools/rollback" => {
-                let s_name = body.get("serverName").and_then(|x| x.as_str()).unwrap_or("");
+                let s_name = body
+                    .get("serverName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 let t_name = body.get("toolName").and_then(|x| x.as_str()).unwrap_or("");
                 let target_v = body
                     .get("targetVersion")
@@ -847,11 +861,27 @@ impl ProductionGatewayContext {
                 self.json_response(200, json!({"success": ok}))
             }
             "/api/execute" => {
-                let srv = body.get("server_name").and_then(|x| x.as_str()).unwrap_or("");
+                let srv = body
+                    .get("server_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 let tool = body.get("tool_name").and_then(|x| x.as_str()).unwrap_or("");
-                let args = body.get("arguments").cloned().unwrap_or_else(JsonValue::object);
-                let req = crate::models::RPCRequest::new(1, "tools/call", json!({"name": tool, "arguments": args}));
-                let resp = self.gateway.handle_request_with_trace(srv, &req, actor, Some(token), traceparent);
+                let args = body
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(JsonValue::object);
+                let req = crate::models::RPCRequest::new(
+                    1,
+                    "tools/call",
+                    json!({"name": tool, "arguments": args}),
+                );
+                let resp = self.gateway.handle_request_with_trace(
+                    srv,
+                    &req,
+                    actor,
+                    Some(token),
+                    traceparent,
+                );
                 self.json_response(200, resp.to_json())
             }
             "/api/codemode/eval" => {
@@ -899,11 +929,9 @@ impl ProductionGatewayContext {
                     .get("confidence_threshold")
                     .and_then(|x| x.as_f64())
                     .unwrap_or(0.82);
-                let spec = self.gateway.generate_speculative_codemode_types(
-                    intent,
-                    top_k,
-                    threshold,
-                );
+                let spec = self
+                    .gateway
+                    .generate_speculative_codemode_types(intent, top_k, threshold);
                 self.json_response(200, spec.to_json())
             }
             "/api/codemode/simulate" => {
@@ -991,11 +1019,20 @@ pub fn run_server(host: &str, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind(&bind_addr)
         .map_err(|e| format!("Failed to bind HTTP server on {}: {}", bind_addr, e))?;
 
-    println!("[*] Omni MCP Gateway (Rust 2.0 Engine) running at http://{}:{}", host, port);
+    println!(
+        "[*] Omni MCP Gateway (Rust 2.0 Engine) running at http://{}:{}",
+        host, port
+    );
     println!("[*] Liveness probe: http://{}:{}/healthz", host, port);
     println!("[*] Prometheus metrics: http://{}:{}/metrics", host, port);
-    println!("[*] Omni MCP proxy available at http://{}:{}/omni/mcp", host, port);
-    println!("[*] Dynamic virtual servers available at http://{}:{}/<service>/mcp", host, port);
+    println!(
+        "[*] Omni MCP proxy available at http://{}:{}/omni/mcp",
+        host, port
+    );
+    println!(
+        "[*] Dynamic virtual servers available at http://{}:{}/<service>/mcp",
+        host, port
+    );
 
     // Bounded worker pool for zero-spawn-overhead request handling
     let num_workers = ctx.config.worker_threads.max(4);
@@ -1017,11 +1054,9 @@ pub fn run_server(host: &str, port: u16) -> Result<(), String> {
         });
     }
 
-    for incoming in listener.incoming() {
-        if let Ok(stream) = incoming {
-            let _ = stream.set_nodelay(true);
-            let _ = tx.send(stream);
-        }
+    for stream in listener.incoming().flatten() {
+        let _ = stream.set_nodelay(true);
+        let _ = tx.send(stream);
     }
 
     Ok(())
@@ -1074,13 +1109,17 @@ pub fn run_stdio_server(specific_server: Option<&str>) -> i32 {
 
                 let resp_json = match specific_server {
                     Some(srv) => match batch_or_single {
-                        RPCBatchOrSingle::Single(req) => {
-                            gateway.handle_request(srv, &req, "agent", Some("stdio-token")).to_json()
-                        }
+                        RPCBatchOrSingle::Single(req) => gateway
+                            .handle_request(srv, &req, "agent", Some("stdio-token"))
+                            .to_json(),
                         RPCBatchOrSingle::Batch(reqs) => {
                             let results: Vec<JsonValue> = reqs
                                 .iter()
-                                .map(|r| gateway.handle_request(srv, r, "agent", Some("stdio-token")).to_json())
+                                .map(|r| {
+                                    gateway
+                                        .handle_request(srv, r, "agent", Some("stdio-token"))
+                                        .to_json()
+                                })
                                 .collect();
                             JsonValue::Array(results)
                         }
@@ -1129,7 +1168,7 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
             Ok(_) => {}
         }
 
-        let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 2 {
             return;
         }
@@ -1164,10 +1203,8 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
         }
 
         let mut body_bytes = vec![0u8; content_length.min(ctx.config.max_body_size_bytes + 1)];
-        if content_length > 0 {
-            if reader.read_exact(&mut body_bytes).is_err() {
-                return;
-            }
+        if content_length > 0 && reader.read_exact(&mut body_bytes).is_err() {
+            return;
         }
 
         let (status, content_type, extra_headers, resp_body) =

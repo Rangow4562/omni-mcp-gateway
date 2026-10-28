@@ -116,4 +116,3 @@ pub fn set_config(cfg: OmniConfig) {
         *guard = cfg;
     }
 }
-

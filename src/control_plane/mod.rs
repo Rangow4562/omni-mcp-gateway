@@ -11,4 +11,3 @@ pub use idl_parser::{FieldDefinition, IDLParser, MethodDefinition, ServiceDefini
 pub use native_monitor::MCPFxHeartbeatMonitor;
 pub use registry::MCPRegistry;
 pub use third_party::ThirdPartyAuthExchange;
-

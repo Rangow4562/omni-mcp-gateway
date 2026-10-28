@@ -2,7 +2,7 @@ use crate::data_plane::codemode::{
     CodeModeError, CodeModeExecutor, CodeOutput, HostCallbacks, SandboxLimits,
 };
 use crate::json::JsonValue;
-use crate::models::{CompletedMutationRecord, SagaCompensationRecord};
+use crate::models::{CompletedMutationRecord, FeatureStatus, SagaCompensationRecord};
 use crate::storage::audit_log::sha256_hex;
 use std::sync::Mutex;
 
@@ -140,8 +140,14 @@ impl FaultInjectionConfig {
 
     pub fn to_json(&self) -> JsonValue {
         let mut m = JsonValue::object();
-        m.insert("base_seed".to_string(), JsonValue::from(self.base_seed as i64));
-        m.insert("num_runs".to_string(), JsonValue::from(self.num_runs as i64));
+        m.insert(
+            "base_seed".to_string(),
+            JsonValue::from(self.base_seed as i64),
+        );
+        m.insert(
+            "num_runs".to_string(),
+            JsonValue::from(self.num_runs as i64),
+        );
         m.insert(
             "network_drop_prob".to_string(),
             JsonValue::from(self.network_drop_prob),
@@ -278,7 +284,11 @@ impl DeterministicSimulator {
         mut resolve_compensation: C,
     ) -> SimulationReport
     where
-        F: FnMut(&str, &str, &[JsonValue]) -> Result<(JsonValue, Option<CompletedMutationRecord>), CodeModeError>,
+        F: FnMut(
+            &str,
+            &str,
+            &[JsonValue],
+        ) -> Result<(JsonValue, Option<CompletedMutationRecord>), CodeModeError>,
         C: FnMut(&CompletedMutationRecord) -> SagaCompensationRecord,
     {
         let executor = CodeModeExecutor::new(limits);
@@ -296,47 +306,49 @@ impl DeterministicSimulator {
             let completed_mutations: Mutex<Vec<CompletedMutationRecord>> = Mutex::new(Vec::new());
 
             let output: CodeOutput = {
-                let mut invoke_tool_cb =
-                    |server: &str, tool: &str, args: Vec<JsonValue>| -> Result<JsonValue, CodeModeError> {
-                        if prng.gen_bool(config.network_drop_prob) {
-                            let msg = format!(
-                                "DST_FAULT[seed={}]: network_drop on {}.{}",
-                                seed, server, tool
-                            );
-                            injected_faults.lock().unwrap().push(msg.clone());
-                            return Err(CodeModeError::RuntimeError(msg));
-                        }
-                        if prng.gen_bool(config.circuit_open_prob) {
-                            let msg = format!(
-                                "DST_FAULT[seed={}]: circuit_breaker_open on {}.{}",
-                                seed, server, tool
-                            );
-                            injected_faults.lock().unwrap().push(msg.clone());
-                            return Err(CodeModeError::RuntimeError(msg));
-                        }
-                        if prng.gen_bool(config.latency_spike_prob) {
-                            injected_faults.lock().unwrap().push(format!(
-                                "DST_FAULT[seed={}]: latency_spike_250ms on {}.{}",
-                                seed, server, tool
-                            ));
-                        }
-                        if prng.gen_bool(config.malformed_payload_prob) {
-                            injected_faults.lock().unwrap().push(format!(
-                                "DST_FAULT[seed={}]: malformed_payload on {}.{}",
-                                seed, server, tool
-                            ));
-                            let mut corrupted = JsonValue::object();
-                            corrupted.insert("_dst_corrupted".to_string(), JsonValue::Bool(true));
-                            return Ok(corrupted);
-                        }
+                let mut invoke_tool_cb = |server: &str,
+                                          tool: &str,
+                                          args: Vec<JsonValue>|
+                 -> Result<JsonValue, CodeModeError> {
+                    if prng.gen_bool(config.network_drop_prob) {
+                        let msg = format!(
+                            "DST_FAULT[seed={}]: network_drop on {}.{}",
+                            seed, server, tool
+                        );
+                        injected_faults.lock().unwrap().push(msg.clone());
+                        return Err(CodeModeError::RuntimeError(msg));
+                    }
+                    if prng.gen_bool(config.circuit_open_prob) {
+                        let msg = format!(
+                            "DST_FAULT[seed={}]: circuit_breaker_open on {}.{}",
+                            seed, server, tool
+                        );
+                        injected_faults.lock().unwrap().push(msg.clone());
+                        return Err(CodeModeError::RuntimeError(msg));
+                    }
+                    if prng.gen_bool(config.latency_spike_prob) {
+                        injected_faults.lock().unwrap().push(format!(
+                            "DST_FAULT[seed={}]: latency_spike_250ms on {}.{}",
+                            seed, server, tool
+                        ));
+                    }
+                    if prng.gen_bool(config.malformed_payload_prob) {
+                        injected_faults.lock().unwrap().push(format!(
+                            "DST_FAULT[seed={}]: malformed_payload on {}.{}",
+                            seed, server, tool
+                        ));
+                        let mut corrupted = JsonValue::object();
+                        corrupted.insert("_dst_corrupted".to_string(), JsonValue::Bool(true));
+                        return Ok(corrupted);
+                    }
 
-                        let mut h = handler_mutex.lock().unwrap();
-                        let (val, maybe_mutation) = (*h)(server, tool, &args)?;
-                        if let Some(rec) = maybe_mutation {
-                            completed_mutations.lock().unwrap().push(rec);
-                        }
-                        Ok(val)
-                    };
+                    let mut h = handler_mutex.lock().unwrap();
+                    let (val, maybe_mutation) = (*h)(server, tool, &args)?;
+                    if let Some(rec) = maybe_mutation {
+                        completed_mutations.lock().unwrap().push(rec);
+                    }
+                    Ok(val)
+                };
 
                 // In simulation mode, even parallel waves MUST execute in deterministic index order
                 // so PRNG state transitions are 100% reproducible for a given seed.
@@ -391,17 +403,17 @@ impl DeterministicSimulator {
             let mut completed_vec = completed_mutations.into_inner().unwrap();
             let faults_vec = injected_faults.into_inner().unwrap();
 
-            if final_status == "ERROR" && !completed_vec.is_empty() {
+            if final_status == FeatureStatus::Error.as_str() && !completed_vec.is_empty() {
                 // Unwind completed mutations in LIFO order
                 while let Some(completed) = completed_vec.pop() {
                     let _comp_rec = resolve_compensation(&completed);
                     saga_count += 1;
                 }
-                final_status = "SAGA_ROLLED_BACK".to_string();
+                final_status = FeatureStatus::SagaRolledBack.as_str().to_string();
                 compensated_rollback_runs += 1;
-            } else if final_status == "OK" {
+            } else if final_status == FeatureStatus::Ok.as_str() {
                 succeeded_runs += 1;
-            } else if final_status == "APPROVAL_REQUIRED" {
+            } else if final_status == FeatureStatus::ApprovalRequired.as_str() {
                 approval_suspended_runs += 1;
             } else {
                 unhandled_failure_runs += 1;

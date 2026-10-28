@@ -57,11 +57,13 @@ impl CircuitBreakerRegistry {
     pub fn allow_request(&self, service_name: &str) -> Result<CircuitState, String> {
         let now = now_epoch_secs();
         let mut guard = self.circuits.write().unwrap();
-        let entry = guard.entry(service_name.to_string()).or_insert(ServiceCircuit {
-            state: CircuitState::Closed,
-            consecutive_failures: 0,
-            opened_at: 0.0,
-        });
+        let entry = guard
+            .entry(service_name.to_string())
+            .or_insert(ServiceCircuit {
+                state: CircuitState::Closed,
+                consecutive_failures: 0,
+                opened_at: 0.0,
+            });
 
         match entry.state {
             CircuitState::Closed | CircuitState::HalfOpen => Ok(entry.state),
@@ -90,11 +92,13 @@ impl CircuitBreakerRegistry {
     pub fn record_failure(&self, service_name: &str) {
         let now = now_epoch_secs();
         let mut guard = self.circuits.write().unwrap();
-        let entry = guard.entry(service_name.to_string()).or_insert(ServiceCircuit {
-            state: CircuitState::Closed,
-            consecutive_failures: 0,
-            opened_at: 0.0,
-        });
+        let entry = guard
+            .entry(service_name.to_string())
+            .or_insert(ServiceCircuit {
+                state: CircuitState::Closed,
+                consecutive_failures: 0,
+                opened_at: 0.0,
+            });
         entry.consecutive_failures += 1;
         if entry.consecutive_failures >= self.failure_threshold
             || entry.state == CircuitState::HalfOpen
@@ -151,7 +155,12 @@ impl SemanticResponseCache {
     }
 
     pub fn make_key(service_name: &str, tool_name: &str, args: &JsonValue) -> String {
-        format!("{}::{}::{}", service_name, tool_name, args.to_string_compact())
+        format!(
+            "{}::{}::{}",
+            service_name,
+            tool_name,
+            args.to_string_compact()
+        )
     }
 
     pub fn get(&self, key: &str) -> Option<JsonValue> {
@@ -202,4 +211,3 @@ impl SemanticResponseCache {
         )
     }
 }
-

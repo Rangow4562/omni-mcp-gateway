@@ -1,4 +1,4 @@
-//! Protocol Translators - Converts MCP JSON-RPC payloads to HTTP, gRPC (Protobuf), and TChannel (Thrift) wire formats.
+//! Protocol Translators - Converts MCP JSON-RPC payloads into in-memory HTTP, gRPC (Protobuf length-prefixed), and TChannel (Thrift) wire envelope frames.
 
 use crate::control_plane::third_party::ThirdPartyAuthExchange;
 use crate::data_plane::muttley::MuttleyMeshClient;
@@ -98,7 +98,7 @@ impl ProtocolTranslator {
         JsonValue::parse(&resp_str)
     }
 
-    /// gRPC length-prefixed binary envelope simulation (1-byte compression flag + 4-byte BE length + method + payload).
+    /// In-memory gRPC length-prefixed binary envelope framing (1-byte compression flag + 4-byte BE length + method + JSON payload).
     pub fn serialize_protobuf(method: &str, args: &JsonValue) -> Vec<u8> {
         let body = args.to_string_compact().into_bytes();
         let method_bytes = method.as_bytes();
@@ -112,7 +112,7 @@ impl ProtocolTranslator {
         frame
     }
 
-    /// Thrift TBinaryProtocol strict-version envelope (`0x80 0x01 0x00 0x01` + method + payload).
+    /// In-memory Thrift TBinaryProtocol strict-version envelope framing (`0x80 0x01 0x00 0x01` + method + JSON payload).
     pub fn serialize_thrift(method: &str, args: &JsonValue) -> Vec<u8> {
         let body = args.to_string_compact().into_bytes();
         let method_bytes = method.as_bytes();

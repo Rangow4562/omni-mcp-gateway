@@ -91,8 +91,7 @@ impl AifxCLI {
         for s in servers {
             for t in s.tools.values() {
                 let mut score = 0usize;
-                let search_text =
-                    format!("{} {} {}", s.name, t.name, t.description).to_lowercase();
+                let search_text = format!("{} {} {}", s.name, t.name, t.description).to_lowercase();
                 for tok in &tokens {
                     if search_text.contains(tok) {
                         score += 1;
@@ -142,6 +141,7 @@ impl AifxCLI {
         lines.join("\n")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn call_tool(
         &self,
         server_name: &str,
@@ -188,9 +188,7 @@ impl AifxCLI {
             }),
         );
 
-        let resp = self
-            .gateway
-            .handle_request(server_name, &req, actor, token);
+        let resp = self.gateway.handle_request(server_name, &req, actor, token);
         let out_str = resp.to_json().to_string_pretty();
 
         if let Some(out_path) = output_file {
@@ -251,14 +249,9 @@ impl AifxCLI {
         token: Option<&str>,
     ) -> String {
         self.cache.refresh_now();
-        let out = self.gateway.execute_codemode(
-            code,
-            None,
-            require_approval,
-            actor,
-            token,
-            None,
-        );
+        let out = self
+            .gateway
+            .execute_codemode(code, None, require_approval, actor, token, None);
         out.to_json().to_string_pretty()
     }
 
@@ -301,9 +294,11 @@ impl AifxCLI {
         token: Option<&str>,
     ) -> String {
         self.cache.refresh_now();
-        let mut cfg = FaultInjectionConfig::default();
-        cfg.base_seed = seed;
-        cfg.num_runs = runs.clamp(1, 1000);
+        let cfg = FaultInjectionConfig {
+            base_seed: seed,
+            num_runs: runs.clamp(1, 1000),
+            ..Default::default()
+        };
         let report = self
             .gateway
             .simulate_codemode(code, None, cfg, actor, token);
@@ -449,15 +444,7 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
                 }
             }
 
-            let res = cli.call_tool(
-                server,
-                tool,
-                json_args,
-                project,
-                output,
-                actor,
-                Some(token),
-            );
+            let res = cli.call_tool(server, tool, json_args, project, output, actor, Some(token));
             println!("{}", res);
             0
         }
@@ -661,16 +648,20 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
 
 fn print_help() {
     println!(
-        "omni / aifx - High-Performance Rust CLI for Agentic Operations & Omni Code Mode MCP (v4.5)\n\n\
-         USAGE:\n\
-         \x20 aifx mcp list [--format table|json]\n\
-         \x20 aifx mcp search [query] [--format table|json]\n\
-         \x20 aifx mcp call <server> <tool> [--args '<json>'] [--project '<fields>'] [--output <path>] [--actor <actor>]\n\
-         \x20 aifx mcp codemode --code '<script>' [--require-approval]\n\
-         \x20 aifx mcp resume <execution_id> [--approver <name>]\n\
-         \x20 aifx mcp simulate --code '<script>' [--seed <u64>] [--runs <N>]\n\
-         \x20 aifx mcp types [--server <name>] [--query <q>] [--intent '<prompt>']\n\
-         \x20 aifx mcp bench [--iterations <N>]\n\
-         \x20 aifx mcp bench-codemode [--iterations <N>]"
+        concat!(
+            "omni / aifx - High-Performance Rust CLI for Agentic Operations & Omni Code Mode MCP (v",
+            env!("CARGO_PKG_VERSION"),
+            ")\n\n",
+            "USAGE:\n",
+            "  aifx mcp list [--format table|json]\n",
+            "  aifx mcp search [query] [--format table|json]\n",
+            "  aifx mcp call <server> <tool> [--args '<json>'] [--project '<fields>'] [--output <path>] [--actor <actor>]\n",
+            "  aifx mcp codemode --code '<script>' [--require-approval]\n",
+            "  aifx mcp resume <execution_id> [--approver <name>]\n",
+            "  aifx mcp simulate --code '<script>' [--seed <u64>] [--runs <N>]\n",
+            "  aifx mcp types [--server <name>] [--query <q>] [--intent '<prompt>']\n",
+            "  aifx mcp bench [--iterations <N>]\n",
+            "  aifx mcp bench-codemode [--iterations <N>]"
+        )
     );
 }

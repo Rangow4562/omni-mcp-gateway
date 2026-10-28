@@ -15,7 +15,8 @@
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
-    generate_ulid, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame, ToolStatus,
+    generate_ulid, FeatureStatus, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame,
+    ToolStatus, APPROVAL_REQUIRED, FUEL_EXHAUSTED, INTERNAL_ERROR, OUTBOUND_BLOCKED,
 };
 use crate::storage::audit_log::sha256_hex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,12 +70,16 @@ impl PendingApproval {
 }
 
 /// Output structure for Code Mode script execution,
-/// enriched with OmniMCP v4.5 sub-millisecond telemetry, vectorized pushdown, SSA parallelization,
-/// stateful suspend/resume frames, and Saga rollback metrics.
+/// enriched with OmniMCP sub-millisecond telemetry, vectorized pushdown, SSA parallelization,
+/// stateful suspend/resume frames, Saga rollback metrics, and `-320xx` error contracts.
 #[derive(Clone, Debug)]
 pub struct CodeOutput {
     /// `"OK"`, `"APPROVAL_REQUIRED"`, `"SAGA_ROLLED_BACK"`, or `"ERROR"`.
     pub status: String,
+    /// Compiler-checked feature status enum corresponding to the execution outcome.
+    pub feature_status: FeatureStatus,
+    /// Authoritative JSON-RPC 2.0 `-320xx` error code when `status != "OK"`.
+    pub error_code: Option<i32>,
     /// Final return value of the executed script.
     pub result: JsonValue,
     /// Captured `console.log`, `console.warn`, `console.error`, and `print` lines.
@@ -144,6 +149,7 @@ impl CodeOutput {
 
         let mut out = json!({
             "status": self.status.clone(),
+            "feature_status": self.feature_status.as_str(),
             "result": self.result.clone(),
             "logs": JsonValue::Array(logs_arr),
             "pending_approvals": JsonValue::Array(approvals_arr),
@@ -165,6 +171,9 @@ impl CodeOutput {
                 "traceparent": self.traceparent.clone()
             }
         });
+        if let Some(code) = self.error_code {
+            out.insert("error_code", JsonValue::from(code as i64));
+        }
         if let Some(ref exec_id) = self.execution_id {
             out.insert("execution_id", JsonValue::from(exec_id.as_str()));
         }
@@ -328,9 +337,7 @@ impl CodeModeTypeGenerator {
         }
 
         // Built-in Code Mode Search & Execute helpers
-        lines.push(
-            "  /** Search OmniMCP catalog for tools by keyword/intent */".to_string(),
-        );
+        lines.push("  /** Search OmniMCP catalog for tools by keyword/intent */".to_string());
         lines.push(
             "  function search(query: string): Promise<Array<{ server: string; tool: string; description: string; is_mutation: boolean }>>;"
                 .to_string(),
@@ -370,8 +377,13 @@ impl CodeModeTypeGenerator {
         template.replace("{{types}}", typescript_declarations)
     }
 
+    /// Standard Okapi BM25 term frequency saturation parameter ($k_1 \approx 1.2$).
+    pub const BM25_K1: f64 = 1.2;
+    /// Standard Okapi BM25 document length normalization parameter ($b \approx 0.75$).
+    pub const BM25_B: f64 = 0.75;
+
     /// Lightweight stemmer for sub-millisecond intent routing.
-    fn stem_token(tok: &str) -> String {
+    pub fn stem_token(tok: &str) -> String {
         let lower = tok.to_lowercase();
         if lower.len() <= 3 {
             return lower;
@@ -384,9 +396,140 @@ impl CodeModeTypeGenerator {
         lower
     }
 
+    /// Splits an arbitrary text or identifier (`camelCase`, `snake_case`, `kebab-case`, prose)
+    /// into normalized, stemmed tokens for Okapi BM25 indexing and querying.
+    pub fn tokenize_and_stem(text: &str) -> Vec<String> {
+        let mut raw_words = Vec::new();
+        let mut current = String::new();
+        let mut prev_is_lower = false;
+
+        for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() {
+                if ch.is_ascii_uppercase() && prev_is_lower && !current.is_empty() {
+                    raw_words.push(std::mem::take(&mut current));
+                }
+                current.push(ch.to_ascii_lowercase());
+                prev_is_lower = ch.is_ascii_lowercase();
+            } else {
+                if !current.is_empty() {
+                    raw_words.push(std::mem::take(&mut current));
+                }
+                prev_is_lower = false;
+            }
+        }
+        if !current.is_empty() {
+            raw_words.push(current);
+        }
+
+        raw_words
+            .into_iter()
+            .filter(|w| w.len() >= 2)
+            .map(|w| Self::stem_token(&w))
+            .collect()
+    }
+
+    /// Computes true Okapi BM25 scores ($k_1 = 1.2, b = 0.75$) over a corpus of multi-field documents.
+    /// Each document is represented as a slice of `(field_boost, field_text)` pairs.
+    pub fn bm25_score_corpus(query: &str, corpus: &[Vec<(f64, String)>]) -> Vec<f64> {
+        let n_docs = corpus.len();
+        if n_docs == 0 {
+            return Vec::new();
+        }
+
+        let query_stems = Self::tokenize_and_stem(query);
+        if query_stems.is_empty() {
+            return vec![0.0; n_docs];
+        }
+
+        // 1. Tokenize each document field and compute document lengths and weighted term frequencies
+        struct IndexedDoc {
+            doc_len: f64,
+            weighted_tf: BTreeMap<String, f64>,
+        }
+
+        let mut indexed_docs = Vec::with_capacity(n_docs);
+        let mut total_doc_len = 0.0f64;
+
+        for fields in corpus {
+            let mut doc_len = 0.0f64;
+            let mut weighted_tf: BTreeMap<String, f64> = BTreeMap::new();
+
+            for (boost, text) in fields {
+                let stems = Self::tokenize_and_stem(text);
+                doc_len += stems.len() as f64;
+                for st in stems {
+                    *weighted_tf.entry(st).or_insert(0.0) += *boost;
+                }
+            }
+
+            let effective_len = doc_len.max(1.0);
+            total_doc_len += effective_len;
+            indexed_docs.push(IndexedDoc {
+                doc_len: effective_len,
+                weighted_tf,
+            });
+        }
+
+        let avgdl = (total_doc_len / (n_docs as f64)).max(1.0);
+
+        // Helper to compute weighted term frequency of query stem `q` in `doc`
+        let term_freq_in_doc = |q: &str, doc: &IndexedDoc| -> f64 {
+            let mut tf = *doc.weighted_tf.get(q).unwrap_or(&0.0);
+            if tf == 0.0 && q.len() >= 3 {
+                for (tok, w) in &doc.weighted_tf {
+                    if tok.len() >= 3 && (tok.starts_with(q) || q.starts_with(tok)) {
+                        tf += *w * 0.65;
+                    }
+                }
+            }
+            tf
+        };
+
+        // 2. Deduplicate query stems while preserving query term multiplicity weight
+        let mut unique_query_stems: BTreeMap<String, f64> = BTreeMap::new();
+        for q in &query_stems {
+            *unique_query_stems.entry(q.clone()).or_insert(0.0) += 1.0;
+        }
+
+        // 3. Compute corpus Document Frequency (df) and Okapi BM25+ IDF for each unique query stem
+        let mut idf_map: BTreeMap<String, f64> = BTreeMap::new();
+        let n_f64 = n_docs as f64;
+        for q in unique_query_stems.keys() {
+            let df = indexed_docs
+                .iter()
+                .filter(|d| term_freq_in_doc(q, d) > 0.0)
+                .count() as f64;
+            if df > 0.0 {
+                let idf = (1.0 + (n_f64 - df + 0.5) / (df + 0.5)).ln() + 1.0;
+                idf_map.insert(q.clone(), idf);
+            }
+        }
+
+        // 4. Score each document using Okapi BM25 with TF saturation (k1) and length normalization (b)
+        let mut scores = Vec::with_capacity(n_docs);
+        for doc in &indexed_docs {
+            let mut doc_score = 0.0f64;
+            let len_norm = 1.0 - Self::BM25_B + Self::BM25_B * (doc.doc_len / avgdl);
+            for (q, q_count) in &unique_query_stems {
+                if let Some(&idf) = idf_map.get(q) {
+                    let tf = term_freq_in_doc(q, doc);
+                    if tf > 0.0 {
+                        let numerator = tf * (Self::BM25_K1 + 1.0);
+                        let denominator = tf + Self::BM25_K1 * len_norm;
+                        doc_score += idf * (numerator / denominator) * q_count.min(2.0);
+                    }
+                }
+            }
+            scores.push(doc_score);
+        }
+
+        scores
+    }
+
     /// Speculative 0-Turn Schema Pre-Injection (`SpeculativeSchemaRouter`):
-    /// Scores the active catalog against a user/agent task intent in < 200 µs using BM25 + stem/tag
-    /// matching and synthesizes a compact TypeScript `.d.ts` declaration containing only the top-K
+    /// Scores the active catalog against a user/agent task intent in < 200 µs using true Okapi BM25
+    /// ($k_1 = 1.2, b = 0.75$) over stemmed `name`, `server`, `tags`, `description`, and `schema` fields,
+    /// and synthesizes a compact TypeScript `.d.ts` declaration containing only the top-K
     /// highest-confidence tools. Collapses 2-turn `search -> execute` into a single 0-turn call.
     pub fn speculative_pre_inject(
         servers: &[ServerRecord],
@@ -396,15 +539,11 @@ impl CodeModeTypeGenerator {
     ) -> SpeculativeInjectionResult {
         let t0 = Instant::now();
         let top_k = top_k.max(1);
-
-        let raw_tokens: Vec<String> = intent
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|w| w.len() >= 2)
-            .map(Self::stem_token)
-            .collect();
+        let raw_tokens = Self::tokenize_and_stem(intent);
 
         let mut full_catalog_raw_bytes = 0usize;
-        let mut candidates = Vec::new();
+        let mut active_entries: Vec<(ServerRecord, crate::models::ToolRecord)> = Vec::new();
+        let mut corpus_fields: Vec<Vec<(f64, String)>> = Vec::new();
 
         for srv in servers {
             if srv.status != ToolStatus::Enabled {
@@ -417,39 +556,34 @@ impl CodeModeTypeGenerator {
                 let raw_len = tool.to_mcp_spec(true).to_string_pretty().len() + 512;
                 full_catalog_raw_bytes += raw_len;
 
-                let srv_lower = srv.name.to_lowercase();
-                let tool_lower = tool.name.to_lowercase();
-                let desc_lower = tool.description.to_lowercase();
-                let tags_lower: Vec<String> = tool.tags.iter().map(|t| t.to_lowercase()).collect();
                 let schema_keys: String = tool
                     .input_schema
                     .get("properties")
                     .and_then(|p| p.as_object())
-                    .map(|m| m.iter().map(|(k, _)| k.to_lowercase()).collect::<Vec<_>>().join(" "))
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, _)| k.clone())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
                     .unwrap_or_default();
 
-                let mut score = 0.0f64;
-                for stem in &raw_tokens {
-                    if tool_lower.contains(stem) {
-                        score += 6.0;
-                    }
-                    if srv_lower.contains(stem) {
-                        score += 4.5;
-                    }
-                    if tags_lower.iter().any(|tg| tg.contains(stem)) {
-                        score += 5.0;
-                    }
-                    if desc_lower.contains(stem) {
-                        score += 2.5;
-                    }
-                    if schema_keys.contains(stem) {
-                        score += 2.0;
-                    }
-                }
+                corpus_fields.push(vec![
+                    (3.5, tool.name.clone()),
+                    (2.5, srv.name.clone()),
+                    (3.0, tool.tags.join(" ")),
+                    (1.5, tool.description.clone()),
+                    (1.2, schema_keys),
+                ]);
+                active_entries.push((srv.clone(), tool.clone()));
+            }
+        }
 
-                if score > 0.0 {
-                    candidates.push((score, srv.clone(), tool.clone()));
-                }
+        let bm25_scores = Self::bm25_score_corpus(intent, &corpus_fields);
+        let mut candidates = Vec::new();
+        for ((srv, tool), score) in active_entries.into_iter().zip(bm25_scores) {
+            if score > 0.0 {
+                candidates.push((score, srv, tool));
             }
         }
 
@@ -461,7 +595,8 @@ impl CodeModeTypeGenerator {
         let top_score = selected.first().map(|c| c.0).unwrap_or(0.0);
         let total_selected_score: f64 = selected.iter().map(|c| c.0).sum();
         let confidence = if top_score > 0.0 {
-            let norm = (top_score / 12.0).max(total_selected_score / ((raw_tokens.len().max(1) as f64) * 4.0));
+            let norm = (top_score / 4.2)
+                .max(total_selected_score / ((raw_tokens.len().max(1) as f64) * 1.5));
             (norm.clamp(0.45, 0.99) * 100.0).round() / 100.0
         } else {
             0.0
@@ -634,6 +769,24 @@ pub enum CodeModeError {
 }
 
 impl CodeModeError {
+    pub fn feature_status(&self) -> FeatureStatus {
+        match self {
+            Self::FuelExhausted(_) => FeatureStatus::FuelExhausted,
+            Self::GlobalOutboundBlocked(_) => FeatureStatus::OutboundBlocked,
+            Self::ApprovalRequired(_) => FeatureStatus::ApprovalRequired,
+            _ => FeatureStatus::Error,
+        }
+    }
+
+    pub fn error_code(&self) -> i32 {
+        match self {
+            Self::FuelExhausted(_) => FUEL_EXHAUSTED,
+            Self::GlobalOutboundBlocked(_) => OUTBOUND_BLOCKED,
+            Self::ApprovalRequired(_) => APPROVAL_REQUIRED,
+            _ => INTERNAL_ERROR,
+        }
+    }
+
     pub fn message(&self) -> String {
         match self {
             Self::SyntaxError(msg) => format!("SyntaxError: {}", msg),
@@ -707,29 +860,29 @@ enum Token {
     Semicolon,
     Dot,
     Question,
-    Pipe,      // |
-    Arrow,     // =>
+    Pipe,  // |
+    Arrow, // =>
     // Operators
-    Assign,    // =
-    PlusEq,    // +=
-    MinusEq,   // -=
-    StarEq,    // *=
-    SlashEq,   // /=
+    Assign,  // =
+    PlusEq,  // +=
+    MinusEq, // -=
+    StarEq,  // *=
+    SlashEq, // /=
     Plus,
     Minus,
     Star,
     Slash,
     Percent,
-    EqEq,      // == or ===
-    NotEq,     // != or !==
+    EqEq,  // == or ===
+    NotEq, // != or !==
     Lt,
     LtEq,
     Gt,
     GtEq,
-    AndAnd,    // &&
-    OrOr,      // ||
+    AndAnd,       // &&
+    OrOr,         // ||
     NullCoalesce, // ??
-    Bang,      // !
+    Bang,         // !
     Eof,
 }
 
@@ -796,8 +949,10 @@ impl<'a> Lexer<'a> {
             if ch == '"' || ch == '\'' || ch == '`' {
                 let quote = self.advance().unwrap();
                 let mut s = String::new();
+                let mut terminated = false;
                 while let Some(c) = self.advance() {
                     if c == quote {
+                        terminated = true;
                         break;
                     }
                     if c == '\\' {
@@ -816,6 +971,11 @@ impl<'a> Lexer<'a> {
                         s.push(c);
                     }
                 }
+                if !terminated {
+                    return Err(CodeModeError::SyntaxError(
+                        "Unterminated string literal".to_string(),
+                    ));
+                }
                 tokens.push(Token::Str(s));
                 continue;
             }
@@ -828,7 +988,13 @@ impl<'a> Lexer<'a> {
                     if c.is_ascii_digit() {
                         num_str.push(c);
                         self.advance();
-                    } else if c == '.' && !is_float && self.peek_next().map(|n| n.is_ascii_digit()).unwrap_or(false) {
+                    } else if c == '.'
+                        && !is_float
+                        && self
+                            .peek_next()
+                            .map(|n| n.is_ascii_digit())
+                            .unwrap_or(false)
+                    {
                         is_float = true;
                         num_str.push(c);
                         self.advance();
@@ -1872,7 +2038,7 @@ impl AstAutoParallelizer {
                     || task
                         .target_var
                         .as_ref()
-                        .map_or(false, |tv| wave_written_vars.contains(tv));
+                        .is_some_and(|tv| wave_written_vars.contains(tv));
 
                 if has_data_hazard {
                     flush_wave(&mut pending_wave, &mut wave_written_vars, &mut out);
@@ -2328,8 +2494,12 @@ impl PhysicalExpr {
                     (ColumnVector::Float64(vals, valid), Some(target), _, _) => {
                         let t = *target;
                         let mask: Vec<bool> = match op {
-                            BinOp::Eq => (0..n).map(|i| valid[i] && (vals[i] - t).abs() < 1e-9).collect(),
-                            BinOp::NotEq => (0..n).map(|i| !valid[i] || (vals[i] - t).abs() >= 1e-9).collect(),
+                            BinOp::Eq => (0..n)
+                                .map(|i| valid[i] && (vals[i] - t).abs() < 1e-9)
+                                .collect(),
+                            BinOp::NotEq => (0..n)
+                                .map(|i| !valid[i] || (vals[i] - t).abs() >= 1e-9)
+                                .collect(),
                             BinOp::Lt => (0..n).map(|i| valid[i] && vals[i] < t).collect(),
                             BinOp::LtEq => (0..n).map(|i| valid[i] && vals[i] <= t).collect(),
                             BinOp::Gt => (0..n).map(|i| valid[i] && vals[i] > t).collect(),
@@ -2341,7 +2511,9 @@ impl PhysicalExpr {
                     (ColumnVector::Utf8(vals, valid), _, Some(target), _) => {
                         let mask: Vec<bool> = match op {
                             BinOp::Eq => (0..n).map(|i| valid[i] && &vals[i] == target).collect(),
-                            BinOp::NotEq => (0..n).map(|i| !valid[i] || &vals[i] != target).collect(),
+                            BinOp::NotEq => {
+                                (0..n).map(|i| !valid[i] || &vals[i] != target).collect()
+                            }
                             BinOp::Lt => (0..n).map(|i| valid[i] && &vals[i] < target).collect(),
                             BinOp::LtEq => (0..n).map(|i| valid[i] && &vals[i] <= target).collect(),
                             BinOp::Gt => (0..n).map(|i| valid[i] && &vals[i] > target).collect(),
@@ -2402,7 +2574,9 @@ impl PhysicalExpr {
             PhysicalExpr::StructProjection(fields) => {
                 let mut obj = JsonValue::object();
                 for (k, f_expr) in fields {
-                    let val = f_expr.eval_scalar_at(batch, row_idx).unwrap_or(JsonValue::Null);
+                    let val = f_expr
+                        .eval_scalar_at(batch, row_idx)
+                        .unwrap_or(JsonValue::Null);
                     obj.insert(k.clone(), val);
                 }
                 Some(obj)
@@ -2421,9 +2595,11 @@ impl PhysicalExpr {
 }
 
 /// Callbacks provided by the OmniMCP host (`MCPProxyGateway`) into the sandbox.
+#[allow(clippy::type_complexity)]
 pub struct HostCallbacks<'a> {
     /// Invokes `(server_name, tool_name, args_vec) -> Result<JsonValue, CodeModeError>`
-    pub invoke_tool: &'a mut dyn FnMut(&str, &str, Vec<JsonValue>) -> Result<JsonValue, CodeModeError>,
+    pub invoke_tool:
+        &'a mut dyn FnMut(&str, &str, Vec<JsonValue>) -> Result<JsonValue, CodeModeError>,
     /// Executes a parallel wave of independent tool calls concurrently via scoped threads or batching.
     pub invoke_parallel_batch: &'a mut dyn FnMut(
         Vec<(String, String, Vec<JsonValue>)>,
@@ -2464,7 +2640,9 @@ impl CodeModeExecutor {
             Ok(t) => t,
             Err(e) => {
                 return CodeOutput {
-                    status: "ERROR".to_string(),
+                    status: FeatureStatus::Error.as_str().to_string(),
+                    feature_status: e.feature_status(),
+                    error_code: Some(e.error_code()),
                     result: JsonValue::Null,
                     logs: Vec::new(),
                     pending_approvals: Vec::new(),
@@ -2493,7 +2671,9 @@ impl CodeModeExecutor {
             Ok(s) => s,
             Err(e) => {
                 return CodeOutput {
-                    status: "ERROR".to_string(),
+                    status: FeatureStatus::Error.as_str().to_string(),
+                    feature_status: e.feature_status(),
+                    error_code: Some(e.error_code()),
                     result: JsonValue::Null,
                     logs: Vec::new(),
                     pending_approvals: Vec::new(),
@@ -2546,7 +2726,9 @@ impl CodeModeExecutor {
                 let eval_us = t_eval.elapsed().as_micros() as u64;
                 let output_bytes = val.to_string_compact().len();
                 CodeOutput {
-                    status: "OK".to_string(),
+                    status: FeatureStatus::Ok.as_str().to_string(),
+                    feature_status: FeatureStatus::Ok,
+                    error_code: None,
                     result: val,
                     logs: vm.logs,
                     pending_approvals: Vec::new(),
@@ -2593,7 +2775,9 @@ impl CodeModeExecutor {
                     created_at: now_epoch_secs(),
                 };
                 CodeOutput {
-                    status: "APPROVAL_REQUIRED".to_string(),
+                    status: FeatureStatus::ApprovalRequired.as_str().to_string(),
+                    feature_status: FeatureStatus::ApprovalRequired,
+                    error_code: Some(APPROVAL_REQUIRED),
                     result: JsonValue::Null,
                     logs: vm.logs,
                     pending_approvals: vec![pending],
@@ -2618,7 +2802,9 @@ impl CodeModeExecutor {
             Err(e) => {
                 let eval_us = t_eval.elapsed().as_micros() as u64;
                 CodeOutput {
-                    status: "ERROR".to_string(),
+                    status: FeatureStatus::Error.as_str().to_string(),
+                    feature_status: e.feature_status(),
+                    error_code: Some(e.error_code()),
                     result: JsonValue::Null,
                     logs: vm.logs,
                     pending_approvals: Vec::new(),
@@ -2656,7 +2842,9 @@ impl CodeModeExecutor {
         let actual_hash = sha256_hex(frame.script_source.as_bytes());
         if actual_hash != frame.script_hash {
             return CodeOutput {
-                status: "ERROR".to_string(),
+                status: FeatureStatus::Error.as_str().to_string(),
+                feature_status: FeatureStatus::Error,
+                error_code: Some(INTERNAL_ERROR),
                 result: JsonValue::Null,
                 logs: frame.logs.clone(),
                 pending_approvals: Vec::new(),
@@ -2687,7 +2875,9 @@ impl CodeModeExecutor {
             Ok(t) => t,
             Err(e) => {
                 return CodeOutput {
-                    status: "ERROR".to_string(),
+                    status: FeatureStatus::Error.as_str().to_string(),
+                    feature_status: e.feature_status(),
+                    error_code: Some(e.error_code()),
                     result: JsonValue::Null,
                     logs: frame.logs.clone(),
                     pending_approvals: Vec::new(),
@@ -2716,7 +2906,9 @@ impl CodeModeExecutor {
             Ok(s) => s,
             Err(e) => {
                 return CodeOutput {
-                    status: "ERROR".to_string(),
+                    status: FeatureStatus::Error.as_str().to_string(),
+                    feature_status: e.feature_status(),
+                    error_code: Some(e.error_code()),
                     result: JsonValue::Null,
                     logs: frame.logs.clone(),
                     pending_approvals: Vec::new(),
@@ -2757,7 +2949,7 @@ impl CodeModeExecutor {
             env.insert(name.clone(), approved_mutation_output.clone());
         }
 
-        let remaining_stmts = if frame.instruction_ptr + 1 <= stmts.len() {
+        let remaining_stmts = if frame.instruction_ptr < stmts.len() {
             &stmts[frame.instruction_ptr + 1..]
         } else {
             &[]
@@ -2792,7 +2984,9 @@ impl CodeModeExecutor {
                 let eval_us = t_eval.elapsed().as_micros() as u64;
                 let output_bytes = val.to_string_compact().len();
                 CodeOutput {
-                    status: "OK".to_string(),
+                    status: FeatureStatus::Ok.as_str().to_string(),
+                    feature_status: FeatureStatus::Ok,
+                    error_code: None,
                     result: val,
                     logs: vm.logs,
                     pending_approvals: Vec::new(),
@@ -2817,7 +3011,9 @@ impl CodeModeExecutor {
             Err(e) => {
                 let eval_us = t_eval.elapsed().as_micros() as u64;
                 CodeOutput {
-                    status: "ERROR".to_string(),
+                    status: FeatureStatus::Error.as_str().to_string(),
+                    feature_status: e.feature_status(),
+                    error_code: Some(e.error_code()),
                     result: JsonValue::Null,
                     logs: vm.logs,
                     pending_approvals: Vec::new(),
@@ -2981,7 +3177,7 @@ impl<'a> VmState<'a> {
                     self.auto_parallel_waves += 1;
                     self.parallelized_tool_calls += tasks.len();
 
-                    for (task, resp) in tasks.iter().zip(results.into_iter()) {
+                    for (task, resp) in tasks.iter().zip(results) {
                         let resp_bytes = resp.to_string_compact().len();
                         self.intermediate_bytes_processed += resp_bytes;
                         self.check_memory(resp_bytes)?;
@@ -3449,7 +3645,9 @@ impl<'a> VmState<'a> {
                     0
                 };
                 let end = if let Some(a1) = args.get(1) {
-                    self.eval_expr(a1, host)?.as_u64().unwrap_or(arr.len() as u64) as usize
+                    self.eval_expr(a1, host)?
+                        .as_u64()
+                        .unwrap_or(arr.len() as u64) as usize
                 } else {
                     arr.len()
                 };
@@ -3503,7 +3701,8 @@ impl<'a> VmState<'a> {
                     CodeModeError::RuntimeError(".filter() requires a closure argument".to_string())
                 })?;
                 if !arr.is_empty() {
-                    if let Some((phys, cols)) = PhysicalExpr::try_compile_closure(closure, &self.env)
+                    if let Some((phys, cols)) =
+                        PhysicalExpr::try_compile_closure(closure, &self.env)
                     {
                         if let Some(batch) = ColumnarRecordBatch::from_rows(&arr, &cols) {
                             if let Some(mask) = phys.eval_filter_mask(&batch) {
@@ -3512,7 +3711,7 @@ impl<'a> VmState<'a> {
                                 self.rows_scanned_vectorized += arr.len();
                                 let out: Vec<JsonValue> = arr
                                     .into_iter()
-                                    .zip(mask.into_iter())
+                                    .zip(mask)
                                     .filter_map(|(row, keep)| if keep { Some(row) } else { None })
                                     .collect();
                                 return Ok(JsonValue::Array(out));
@@ -3522,7 +3721,7 @@ impl<'a> VmState<'a> {
                 }
                 let mut out = Vec::new();
                 for item in arr {
-                    let keep = self.invoke_closure(closure, &[item.clone()], host)?;
+                    let keep = self.invoke_closure(closure, std::slice::from_ref(&item), host)?;
                     if Self::is_truthy(&keep) {
                         out.push(item);
                     }
@@ -3534,7 +3733,8 @@ impl<'a> VmState<'a> {
                     CodeModeError::RuntimeError(".map() requires a closure argument".to_string())
                 })?;
                 if !arr.is_empty() {
-                    if let Some((phys, cols)) = PhysicalExpr::try_compile_closure(closure, &self.env)
+                    if let Some((phys, cols)) =
+                        PhysicalExpr::try_compile_closure(closure, &self.env)
                     {
                         if let Some(batch) = ColumnarRecordBatch::from_rows(&arr, &cols) {
                             if let Some(projected) = phys.eval_projection_columnar(&batch) {
@@ -3557,7 +3757,8 @@ impl<'a> VmState<'a> {
                     CodeModeError::RuntimeError(".find() requires a closure argument".to_string())
                 })?;
                 for item in arr {
-                    let matched = self.invoke_closure(closure, &[item.clone()], host)?;
+                    let matched =
+                        self.invoke_closure(closure, std::slice::from_ref(&item), host)?;
                     if Self::is_truthy(&matched) {
                         return Ok(item);
                     }
@@ -3620,7 +3821,8 @@ impl<'a> VmState<'a> {
                 let mut seen = Vec::new();
                 let mut out = Vec::new();
                 for item in flattened {
-                    let key_val = self.invoke_closure(closure, &[item.clone()], host)?;
+                    let key_val =
+                        self.invoke_closure(closure, std::slice::from_ref(&item), host)?;
                     let key_str = Self::val_to_display_string(&key_val);
                     if !seen.contains(&key_str) {
                         seen.push(key_str);
@@ -3638,7 +3840,7 @@ impl<'a> VmState<'a> {
                 })?;
                 let mut keyed = Vec::with_capacity(arr.len());
                 for item in arr.drain(..) {
-                    let k = self.invoke_closure(closure, &[item.clone()], host)?;
+                    let k = self.invoke_closure(closure, std::slice::from_ref(&item), host)?;
                     keyed.push((k, item));
                 }
                 keyed.sort_by(|(ka, _), (kb, _)| {
@@ -3676,10 +3878,7 @@ impl<'a> VmState<'a> {
             "trim" => Ok(JsonValue::from(s.trim())),
             "includes" | "contains" => {
                 let pat = if let Some(a0) = args.first() {
-                    self.eval_expr(a0, host)?
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string()
+                    self.eval_expr(a0, host)?.as_str().unwrap_or("").to_string()
                 } else {
                     String::new()
                 };
@@ -3888,5 +4087,288 @@ impl<'a> VmState<'a> {
             )),
             BinOp::And | BinOp::Or | BinOp::NullCoalesce => Ok(JsonValue::Bool(false)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ProtocolType, ToolRecord};
+
+    fn run_noop_script(code: &str, limits: SandboxLimits) -> CodeOutput {
+        let mut invoke_cb =
+            |_srv: &str, _tool: &str, _args: Vec<JsonValue>| -> Result<JsonValue, CodeModeError> {
+                Ok(json!({"ok": true}))
+            };
+        let mut parallel_cb =
+            |calls: Vec<(String, String, Vec<JsonValue>)>| -> Result<Vec<JsonValue>, CodeModeError> {
+                Ok(calls.into_iter().map(|_| json!({"ok": true})).collect())
+            };
+        let search_cb = |_q: &str| JsonValue::Array(Vec::new());
+        let describe_cb = |_s: &str, _t: Option<&str>| String::new();
+        let mut host = HostCallbacks {
+            invoke_tool: &mut invoke_cb,
+            invoke_parallel_batch: &mut parallel_cb,
+            search_catalog: &search_cb,
+            describe_types: &describe_cb,
+        };
+        CodeModeExecutor::new(limits).execute(
+            code,
+            &mut host,
+            "00-00000000000000000000000000000001-0000000000000001-01",
+        )
+    }
+
+    #[test]
+    fn test_parser_errors_and_nesting_depth_guard() {
+        let out_unterm =
+            run_noop_script("const x = \"unterminated string;", SandboxLimits::default());
+        assert_eq!(out_unterm.status, "ERROR");
+        assert_eq!(out_unterm.feature_status, FeatureStatus::Error);
+        assert_eq!(out_unterm.error_code, Some(INTERNAL_ERROR));
+        assert!(out_unterm
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("SyntaxError"));
+
+        let shallow_limits = SandboxLimits {
+            max_expr_depth: 4,
+            ..Default::default()
+        };
+        let deep_expr = "return ((((((1 + 2) + 3) + 4) + 5) + 6) + 7);";
+        let out_deep = run_noop_script(deep_expr, shallow_limits);
+        assert_eq!(out_deep.status, "ERROR");
+        assert!(out_deep
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("ExprDepthExceeded"));
+    }
+
+    #[test]
+    fn test_evaluator_semantics_closures_and_console_logs() {
+        let script = r#"
+        async () => {
+            const nums = [10, 25, 30, 5];
+            const filtered = nums.filter(n => n >= 20);
+            const doubled = filtered.map(n => n * 2);
+            const sum = doubled.reduce((acc, v) => acc + v, 0);
+            console.log("computed sum:", sum);
+            return { count: doubled.length, sum: sum };
+        }
+        "#;
+        let out = run_noop_script(script, SandboxLimits::default());
+        assert_eq!(out.status, "OK");
+        assert_eq!(out.feature_status, FeatureStatus::Ok);
+        assert_eq!(out.error_code, None);
+        assert_eq!(out.result["count"].as_i64(), Some(2));
+        assert_eq!(out.result["sum"].as_i64(), Some(110));
+        assert_eq!(out.logs.len(), 1);
+        assert!(out.logs[0].contains("110"));
+    }
+
+    #[test]
+    fn test_fuel_exhaustion_returns_32032_error_contract() {
+        let limits = SandboxLimits {
+            max_operations: 120,
+            ..Default::default()
+        };
+        let out = run_noop_script("let i = 0; while (true) { i += 1; }", limits);
+        assert_eq!(out.status, "ERROR");
+        assert_eq!(out.feature_status, FeatureStatus::FuelExhausted);
+        assert_eq!(out.error_code, Some(FUEL_EXHAUSTED));
+        assert_eq!(out.error_code, Some(-32032));
+        assert!(out.error.as_deref().unwrap_or("").contains("FuelExhausted"));
+    }
+
+    #[test]
+    fn test_outbound_isolation_returns_32033_error_contract() {
+        let out_fetch = run_noop_script(
+            r#"async () => { return await fetch("https://example.com"); }"#,
+            SandboxLimits::default(),
+        );
+        assert_eq!(out_fetch.status, "ERROR");
+        assert_eq!(out_fetch.feature_status, FeatureStatus::OutboundBlocked);
+        assert_eq!(out_fetch.error_code, Some(OUTBOUND_BLOCKED));
+        assert_eq!(out_fetch.error_code, Some(-32033));
+
+        let out_fs = run_noop_script(
+            r#"async () => { return fs.readFileSync("/etc/passwd"); }"#,
+            SandboxLimits::default(),
+        );
+        assert_eq!(out_fs.feature_status, FeatureStatus::OutboundBlocked);
+        assert_eq!(out_fs.error_code, Some(OUTBOUND_BLOCKED));
+    }
+
+    #[test]
+    fn test_physical_expr_vectorized_columnar_eval() {
+        let script = r#"
+        async () => {
+            const rows = [
+                { id: "r1", score: 0.92, active: true, tier: "gold" },
+                { id: "r2", score: 0.45, active: true, tier: "silver" },
+                { id: "r3", score: 0.88, active: false, tier: "gold" },
+                { id: "r4", score: 0.95, active: true, tier: "gold" }
+            ];
+            const selected = rows
+                .filter(r => r.score >= 0.85 && r.tier == "gold" && r.active == true)
+                .map(r => ({ id: r.id, pct: r.score * 100 }));
+            return selected;
+        }
+        "#;
+        let out = run_noop_script(script, SandboxLimits::default());
+        assert_eq!(out.status, "OK");
+        assert_eq!(out.vectorized_pushdowns, 2);
+        assert_eq!(out.rows_scanned_vectorized, 6);
+        let arr = out.result.as_array().expect("Expected array result");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"].as_str(), Some("r1"));
+        assert_eq!(arr[1]["id"].as_str(), Some("r4"));
+    }
+
+    #[test]
+    fn test_suspended_execution_frame_serialize_and_resume_identity() {
+        let script = r#"
+        async () => {
+            const base = await codemode.orders.fetch_order({ id: "ord_7" });
+            const mut_res = await codemode.orders.capture_payment({ id: base.id, amount: 42 });
+            return { order_id: base.id, receipt: mut_res.tx_id };
+        }
+        "#;
+
+        let mut invoke_cb =
+            |srv: &str, tool: &str, args: Vec<JsonValue>| -> Result<JsonValue, CodeModeError> {
+                if srv == "orders" && tool == "fetch_order" {
+                    Ok(json!({"id": "ord_7", "status": "pending"}))
+                } else if srv == "orders" && tool == "capture_payment" {
+                    Err(CodeModeError::ApprovalRequired(PendingApproval {
+                        server_name: srv.to_string(),
+                        tool_name: tool.to_string(),
+                        arguments: args.first().cloned().unwrap_or_else(JsonValue::object),
+                        reason: "Requires human approval".to_string(),
+                    }))
+                } else {
+                    Ok(JsonValue::Null)
+                }
+            };
+        let mut parallel_cb =
+            |_calls: Vec<(String, String, Vec<JsonValue>)>| -> Result<Vec<JsonValue>, CodeModeError> {
+                Ok(Vec::new())
+            };
+        let search_cb = |_q: &str| JsonValue::Array(Vec::new());
+        let describe_cb = |_s: &str, _t: Option<&str>| String::new();
+
+        let executor = CodeModeExecutor::new(SandboxLimits::default());
+        let suspended = {
+            let mut host = HostCallbacks {
+                invoke_tool: &mut invoke_cb,
+                invoke_parallel_batch: &mut parallel_cb,
+                search_catalog: &search_cb,
+                describe_types: &describe_cb,
+            };
+            executor.execute(
+                script,
+                &mut host,
+                "00-00000000000000000000000000000001-0000000000000001-01",
+            )
+        };
+
+        assert_eq!(suspended.status, "APPROVAL_REQUIRED");
+        assert_eq!(suspended.feature_status, FeatureStatus::ApprovalRequired);
+        assert_eq!(suspended.error_code, Some(APPROVAL_REQUIRED));
+        assert_eq!(suspended.error_code, Some(-32031));
+
+        let orig_frame = suspended
+            .suspended_frame
+            .expect("Must capture SuspendedExecutionFrame");
+        let round_trip_json = orig_frame.to_json();
+        let restored_frame = SuspendedExecutionFrame::from_json(&round_trip_json)
+            .expect("Must deserialize SuspendedExecutionFrame");
+        assert_eq!(orig_frame, restored_frame);
+
+        // Resume using restored frame without re-running step 0
+        let mut resume_invoke_cb =
+            |_srv: &str, _tool: &str, _args: Vec<JsonValue>| -> Result<JsonValue, CodeModeError> {
+                panic!("Step 0 must not be re-invoked during continuation resume");
+            };
+        let resumed = {
+            let mut host = HostCallbacks {
+                invoke_tool: &mut resume_invoke_cb,
+                invoke_parallel_batch: &mut parallel_cb,
+                search_catalog: &search_cb,
+                describe_types: &describe_cb,
+            };
+            executor.resume_frame(
+                &restored_frame,
+                json!({"tx_id": "tx_999"}),
+                &mut host,
+                "00-00000000000000000000000000000001-0000000000000002-01",
+            )
+        };
+        assert_eq!(resumed.status, "OK");
+        assert_eq!(resumed.result["order_id"].as_str(), Some("ord_7"));
+        assert_eq!(resumed.result["receipt"].as_str(), Some("tx_999"));
+    }
+
+    #[test]
+    fn test_okapi_bm25_idf_and_length_normalization() {
+        // 1. IDF preference: "service" appears in all 3 docs (low IDF), while "settlement" appears in only doc 2 (high IDF).
+        let corpus = vec![
+            vec![(1.0, "service status check".to_string())],
+            vec![(1.0, "service health ping".to_string())],
+            vec![(1.0, "service ledger settlement".to_string())],
+        ];
+        let scores = CodeModeTypeGenerator::bm25_score_corpus("service settlement", &corpus);
+        assert!(
+            scores[2] > scores[0] && scores[2] > scores[1],
+            "Document matching rare high-IDF term 'settlement' must rank highest: {:?}",
+            scores
+        );
+
+        // 2. Length normalization (b = 0.75): two docs with identical TF = 1 for "refund",
+        // but doc 0 is concise while doc 1 has many unrelated filler words.
+        let len_corpus = vec![
+            vec![(1.0, "refund payment".to_string())],
+            vec![(
+                1.0,
+                "refund payment general utility helper miscellaneous extra verbose metadata"
+                    .to_string(),
+            )],
+        ];
+        let len_scores = CodeModeTypeGenerator::bm25_score_corpus("refund", &len_corpus);
+        assert!(
+            len_scores[0] > len_scores[1],
+            "Shorter document with equal TF must score higher under BM25 length normalization: {:?}",
+            len_scores
+        );
+
+        // 3. Speculative 0-turn pre-injection threshold
+        let mut srv = ServerRecord::new(
+            "billing_service",
+            "Billing Service",
+            "Handles customer invoices and refunds",
+            "fintech",
+        );
+        srv.protocol = ProtocolType::Grpc;
+        srv.status = ToolStatus::Enabled;
+        let mut t1 = ToolRecord::new(
+            "issue_refund",
+            "Issue refund for cancelled customer invoice",
+            json!({"type": "object", "properties": {"invoice_id": {"type": "string"}}}),
+        );
+        t1.status = ToolStatus::Enabled;
+        t1.tags = vec!["refund".to_string(), "billing".to_string()];
+        srv.add_tool(t1);
+
+        let spec = CodeModeTypeGenerator::speculative_pre_inject(
+            &[srv],
+            "issue customer billing refund for invoice",
+            2,
+            0.80,
+        );
+        assert_eq!(spec.routing_mode, "ZERO_TURN_SPECULATIVE");
+        assert!(spec.confidence_score >= 0.80);
+        assert!(spec.typescript_declarations.contains("issue_refund"));
     }
 }

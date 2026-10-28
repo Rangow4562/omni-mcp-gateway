@@ -1,9 +1,9 @@
 [package]
 name = "omni-mcp"
-version = "4.5.0"
+version = "4.6.0"
 edition = "2021"
 authors = ["Omni MCP Engineering"]
-description = "High-performance Rust enterprise Model Context Protocol (MCP) & Omni Code Mode Gateway: AutoCrawler IDL discovery, TypeScript .d.ts type generation, sub-millisecond in-process Code Mode sandbox, binary wire protocol translation, circuit breaking, OTel W3C distributed tracing, and SHA-256 Merkle audit trail."
+description = "High-performance Rust enterprise Model Context Protocol (MCP) & Omni Code Mode Gateway: AutoCrawler IDL discovery, TypeScript .d.ts type generation, sub-millisecond in-process Code Mode sandbox, wire envelope framing & protocol translation, Okapi BM25 ranking, circuit breaking, OTel W3C distributed tracing, and SHA-256 Merkle audit trail."
 readme = "README.md"
 
 [lib]

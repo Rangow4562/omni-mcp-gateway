@@ -346,8 +346,10 @@ impl SecurityCharterEngine {
         caller_actor: &str,
         _user_token: Option<&str>,
     ) -> (bool, Option<String>) {
-        let effective_policy: &CharterPolicy =
-            tool.charter_policy.as_ref().unwrap_or(&server.charter_policy);
+        let effective_policy: &CharterPolicy = tool
+            .charter_policy
+            .as_ref()
+            .unwrap_or(&server.charter_policy);
 
         if !effective_policy.is_actor_allowed(caller_actor) {
             return (
@@ -372,4 +374,3 @@ impl SecurityCharterEngine {
         (true, None)
     }
 }
-

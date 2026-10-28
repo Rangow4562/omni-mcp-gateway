@@ -8,4 +8,3 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     process::exit(run_aifx_cli(&args));
 }
-

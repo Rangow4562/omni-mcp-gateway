@@ -8,6 +8,7 @@
 //! - `batch_invoke_tools`
 //! - `recommend_tools` (Autonomous Planning)
 //! - `explain_error` (Self-Healing Diagnostics)
+//!
 //! Full MCP Resources (`resources/list`, `resources/read`) and MCP Prompts (`prompts/list`, `prompts/get`).
 
 use crate::data_plane::cache::InMemoryConfigCache;
@@ -16,8 +17,9 @@ use crate::data_plane::dst::FaultInjectionConfig;
 use crate::data_plane::gateway::MCPProxyGateway;
 use crate::json::JsonValue;
 use crate::models::{
-    RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse, ToolStatus, INVALID_PARAMS,
-    METHOD_NOT_FOUND,
+    negotiate_protocol_version, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse, ToolStatus,
+    APPROVAL_REQUIRED, CIRCUIT_OPEN, FUEL_EXHAUSTED, INVALID_PARAMS, METHOD_NOT_FOUND,
+    OUTBOUND_BLOCKED, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED, TOOL_DISABLED, UNAUTHORIZED,
 };
 
 #[derive(Clone)]
@@ -266,9 +268,9 @@ impl OmniMCPServer {
         user_token: Option<&str>,
     ) -> JsonValue {
         match batch_or_single {
-            RPCBatchOrSingle::Single(req) => {
-                self.handle_request(&req, caller_actor, user_token).to_json()
-            }
+            RPCBatchOrSingle::Single(req) => self
+                .handle_request(&req, caller_actor, user_token)
+                .to_json(),
             RPCBatchOrSingle::Batch(reqs) => {
                 let responses: Vec<JsonValue> = reqs
                     .iter()
@@ -286,24 +288,35 @@ impl OmniMCPServer {
         user_token: Option<&str>,
     ) -> RPCResponse {
         match request.method.as_str() {
-            "initialize" => RPCResponse::ok(
-                request.id.clone(),
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {"listChanged": true},
-                        "resources": {"subscribe": false, "listChanged": true},
-                        "prompts": {"listChanged": true},
-                        "logging": {}
-                    },
-                    "serverInfo": {
-                        "name": "uber-omni-mcp-gateway",
-                        "version": "4.5.0",
-                        "description": "Omni MCP Autonomous Mesh Gateway & Code Mode Runtime (Rust Engine v4.5)",
-                        "runtime": "rust"
-                    }
-                }),
-            ),
+            "initialize" => {
+                let client_ver = request
+                    .params
+                    .get("protocolVersion")
+                    .and_then(|v| v.as_str());
+                let negotiated = negotiate_protocol_version(client_ver);
+                RPCResponse::ok(
+                    request.id.clone(),
+                    json!({
+                        "protocolVersion": negotiated,
+                        "capabilities": {
+                            "tools": {"listChanged": true},
+                            "resources": {"subscribe": false, "listChanged": true},
+                            "prompts": {"listChanged": true},
+                            "logging": {}
+                        },
+                        "serverInfo": {
+                            "name": "uber-omni-mcp-gateway",
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "description": concat!(
+                                "Omni MCP Autonomous Mesh Gateway & Code Mode Runtime (Rust Engine v",
+                                env!("CARGO_PKG_VERSION"),
+                                ")"
+                            ),
+                            "runtime": "rust"
+                        }
+                    }),
+                )
+            }
             "notifications/initialized" | "ping" => {
                 RPCResponse::ok(request.id.clone(), JsonValue::object())
             }
@@ -622,40 +635,43 @@ impl OmniMCPServer {
 
         let messages = match prompt_name {
             "incident-investigation" => {
-                let srv = args.get("service_name").and_then(|x| x.as_str()).unwrap_or("target-service");
-                vec![
-                    json!({
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": format!("Please investigate service '{}'. Step 1: Call 'explain_error' or check circuit breaker status. Step 2: Query recent trace spans via '/api/traces'. Step 3: Check fallback tool availability.", srv)
-                        }
-                    })
-                ]
+                let srv = args
+                    .get("service_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("target-service");
+                vec![json!({
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": format!("Please investigate service '{}'. Step 1: Call 'explain_error' or check circuit breaker status. Step 2: Query recent trace spans via '/api/traces'. Step 3: Check fallback tool availability.", srv)
+                    }
+                })]
             }
             "catalog-schema-audit" => {
-                vec![
-                    json!({
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": "Audit the entire Omni MCP catalog: identify all tools where status is 'PENDING_REVIEW' or 'DISABLED', inspect their schema completeness, and verify compliance."
-                        }
-                    })
-                ]
+                vec![json!({
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": "Audit the entire Omni MCP catalog: identify all tools where status is 'PENDING_REVIEW' or 'DISABLED', inspect their schema completeness, and verify compliance."
+                    }
+                })]
             }
             "canary-rollout" => {
-                let srv = args.get("server_name").and_then(|x| x.as_str()).unwrap_or("service");
-                let tool = args.get("tool_name").and_then(|x| x.as_str()).unwrap_or("tool");
-                vec![
-                    json!({
-                        "role": "user",
-                        "content": {
-                            "type": "text",
-                            "text": format!("Perform a verified canary test for '{}/{}'. Send test payloads with synthetic tokens, verify that canary percentage routing executes without error, and verify the SHA-256 Merkle audit trail.", srv, tool)
-                        }
-                    })
-                ]
+                let srv = args
+                    .get("server_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("service");
+                let tool = args
+                    .get("tool_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("tool");
+                vec![json!({
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": format!("Perform a verified canary test for '{}/{}'. Send test payloads with synthetic tokens, verify that canary percentage routing executes without error, and verify the SHA-256 Merkle audit trail.", srv, tool)
+                    }
+                })]
             }
             other => {
                 return RPCResponse::err(
@@ -679,42 +695,33 @@ impl OmniMCPServer {
             .get("query")
             .and_then(|x| x.as_str())
             .unwrap_or("")
-            .to_lowercase();
+            .trim()
+            .to_string();
         let limit = args.get("limit").and_then(|x| x.as_u64()).unwrap_or(5) as usize;
 
         let servers = self.cache.list_servers();
-        let tokens = tokenize_words(&query);
+        let mut corpus_fields: Vec<Vec<(f64, String)>> = Vec::with_capacity(servers.len());
 
-        let mut scored: Vec<(f64, JsonValue)> = Vec::new();
         for s in &servers {
             let tool_names_and_descs: String = s
                 .tools
                 .values()
-                .map(|t| format!("{} {}", t.name, t.description))
+                .map(|t| format!("{} {} {}", t.name, t.description, t.tags.join(" ")))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let doc_text = format!(
-                "{} {} {} {}",
-                s.name.to_lowercase(),
-                s.display_name.to_lowercase(),
-                s.description.to_lowercase(),
-                tool_names_and_descs.to_lowercase()
-            );
+            corpus_fields.push(vec![
+                (3.5, s.name.clone()),
+                (3.0, s.display_name.clone()),
+                (2.0, s.description.clone()),
+                (1.5, tool_names_and_descs),
+            ]);
+        }
 
-            let mut score = 0.0;
-            for token in &tokens {
-                if s.name.to_lowercase().contains(token) {
-                    score += 5.0;
-                }
-                if s.display_name.to_lowercase().contains(token) {
-                    score += 3.0;
-                }
-                if doc_text.contains(token) {
-                    score += 1.0;
-                }
-            }
-
-            if score > 0.0 || tokens.is_empty() {
+        let bm25_scores = CodeModeTypeGenerator::bm25_score_corpus(&query, &corpus_fields);
+        let mut scored: Vec<(f64, JsonValue)> = Vec::new();
+        for (s, score) in servers.iter().zip(bm25_scores) {
+            if score > 0.0 || query.is_empty() {
+                let rounded_score = (score * 100.0).round() / 100.0;
                 scored.push((
                     score,
                     json!({
@@ -725,7 +732,7 @@ impl OmniMCPServer {
                         "protocol": s.protocol.as_str(),
                         "version": s.version as i64,
                         "enabled_tools_count": s.enabled_tools_count() as i64,
-                        "relevance_score": score
+                        "relevance_score": rounded_score
                     }),
                 ));
             }
@@ -940,7 +947,10 @@ impl OmniMCPServer {
             None => {
                 return RPCResponse::err(
                     request.id.clone(),
-                    RPCError::new(INVALID_PARAMS, "Missing 'calls' array in batch_invoke_tools"),
+                    RPCError::new(
+                        INVALID_PARAMS,
+                        "Missing 'calls' array in batch_invoke_tools",
+                    ),
                 )
             }
         };
@@ -981,54 +991,58 @@ impl OmniMCPServer {
         };
         let limit = args.get("limit").and_then(|x| x.as_u64()).unwrap_or(5) as usize;
 
-        let tokens = tokenize_words(&goal.to_lowercase());
         let servers = self.cache.list_servers();
-
-        let mut candidates: Vec<(f64, String, String, String, bool, Vec<String>)> = Vec::new();
+        let mut active_tools: Vec<(String, String, String, bool, Vec<String>)> = Vec::new();
+        let mut corpus_fields: Vec<Vec<(f64, String)>> = Vec::new();
 
         for s in &servers {
             for tool in s.tools.values() {
                 if tool.status != ToolStatus::Enabled {
                     continue;
                 }
-                let mut score = 0.0;
-                let t_name_lower = tool.name.to_lowercase();
-                let t_desc_lower = tool.description.to_lowercase();
+                let schema_keys: String = tool
+                    .input_schema
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, _)| k.clone())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
 
-                for tok in &tokens {
-                    if t_name_lower.contains(tok) {
-                        score += 5.0;
-                    }
-                    if t_desc_lower.contains(tok) {
-                        score += 2.0;
-                    }
-                    if s.name.to_lowercase().contains(tok) {
-                        score += 3.0;
-                    }
-                    for tag in &tool.tags {
-                        if tag.to_lowercase().contains(tok) {
-                            score += 4.0;
-                        }
-                    }
-                }
+                corpus_fields.push(vec![
+                    (3.5, tool.name.clone()),
+                    (2.5, s.name.clone()),
+                    (3.0, tool.tags.join(" ")),
+                    (1.8, tool.description.clone()),
+                    (1.2, schema_keys),
+                ]);
+                active_tools.push((
+                    s.name.clone(),
+                    tool.name.clone(),
+                    tool.description.clone(),
+                    tool.is_mutation,
+                    tool.tags.clone(),
+                ));
+            }
+        }
 
-                if score > 0.0 {
-                    candidates.push((
-                        score,
-                        s.name.clone(),
-                        tool.name.clone(),
-                        tool.description.clone(),
-                        tool.is_mutation,
-                        tool.tags.clone(),
-                    ));
-                }
+        let bm25_scores = CodeModeTypeGenerator::bm25_score_corpus(goal, &corpus_fields);
+        let mut candidates: Vec<(f64, String, String, String, bool, Vec<String>)> = Vec::new();
+        for ((s_name, t_name, desc, is_mut, tags), score) in
+            active_tools.into_iter().zip(bm25_scores)
+        {
+            if score > 0.0 {
+                candidates.push((score, s_name, t_name, desc, is_mut, tags));
             }
         }
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut pipeline = Vec::new();
-        for (idx, (_, s_name, t_name, desc, is_mut, tags)) in
+        for (idx, (score, s_name, t_name, desc, is_mut, tags)) in
             candidates.into_iter().take(limit).enumerate()
         {
             pipeline.push(json!({
@@ -1037,6 +1051,7 @@ impl OmniMCPServer {
                 "tool_name": t_name,
                 "description": desc,
                 "is_mutation": is_mut,
+                "bm25_score": (score * 100.0).round() / 100.0,
                 "tags": tags.iter().map(|s| JsonValue::from(s.as_str())).collect::<Vec<_>>()
             }));
         }
@@ -1083,9 +1098,14 @@ impl OmniMCPServer {
             .get("error_message")
             .and_then(|x| x.as_str())
             .unwrap_or("");
+        let err_lower = error_message.to_lowercase();
 
         let server_opt = self.cache.get_server(server_name);
-        let cb_open = self.gateway.circuit_breaker.allow_request(server_name).is_err();
+        let cb_open = self
+            .gateway
+            .circuit_breaker
+            .allow_request(server_name)
+            .is_err();
 
         let (tool_status, fallback_tool, is_canary) = if let Some(ref s) = server_opt {
             if let Some(t) = s.tools.get(tool_name) {
@@ -1101,15 +1121,69 @@ impl OmniMCPServer {
             ("SERVER_NOT_FOUND", None, false)
         };
 
-        let (root_cause, suggested_action) = if cb_open {
+        let (error_code, root_cause, suggested_action) = if cb_open
+            || err_lower.contains("circuit_open")
+            || err_lower.contains("-32030")
+        {
             (
-                "Circuit breaker tripped open due to consecutive downstream microservice failures."
+                CIRCUIT_OPEN,
+                "Circuit breaker tripped open (-32030 CIRCUIT_OPEN) due to consecutive downstream microservice failures."
                     .to_string(),
                 "Wait for the circuit breaker cooldown reset window (typically 30s) or invoke the configured fallback tool."
                     .to_string(),
             )
+        } else if err_lower.contains("approval_required") || err_lower.contains("-32031") {
+            (
+                APPROVAL_REQUIRED,
+                "Mutating tool call paused at a human-in-the-loop approval gate (-32031 APPROVAL_REQUIRED)."
+                    .to_string(),
+                "Approve and resume the suspended execution frame via `resume_codemode` or `aifx mcp resume <execution_id>`."
+                    .to_string(),
+            )
+        } else if err_lower.contains("fuelexhausted")
+            || err_lower.contains("fuel_exhausted")
+            || err_lower.contains("-32032")
+        {
+            (
+                FUEL_EXHAUSTED,
+                "Code Mode script exceeded its deterministic instruction fuel budget (-32032 FUEL_EXHAUSTED)."
+                    .to_string(),
+                "Refactor unbounded loops, use vectorized `.filter()`/`.map()` pushdowns, or raise `max_operations`."
+                    .to_string(),
+            )
+        } else if err_lower.contains("globaloutboundblocked")
+            || err_lower.contains("outbound_blocked")
+            || err_lower.contains("-32033")
+        {
+            (
+                OUTBOUND_BLOCKED,
+                "Direct network or filesystem call blocked by `globalOutbound: null` sandbox isolation (-32033 OUTBOUND_BLOCKED)."
+                    .to_string(),
+                "Route all external I/O exclusively through governed `codemode.<server>.<tool>()` bindings."
+                    .to_string(),
+            )
+        } else if err_lower.contains("saga_rolled_back")
+            || err_lower.contains("saga_compensated")
+            || err_lower.contains("-32034")
+        {
+            (
+                SAGA_COMPENSATED,
+                "Multi-step script failed mid-flight; prior completed mutations were automatically unwound in LIFO order (-32034 SAGA_COMPENSATED)."
+                    .to_string(),
+                "Inspect `saga_compensations` receipts and fix the failing downstream call before retrying."
+                    .to_string(),
+            )
+        } else if err_lower.contains("schema_preflight_failed") || err_lower.contains("-32035") {
+            (
+                SCHEMA_PREFLIGHT_FAILED,
+                "Tool invocation arguments failed schema preflight validation (-32035 SCHEMA_PREFLIGHT_FAILED)."
+                    .to_string(),
+                "Call `get_tool_schema` or `codemode.describe()` to verify required parameter names and types."
+                    .to_string(),
+            )
         } else if tool_status == "DISABLED" {
             (
+                TOOL_DISABLED,
                 "Tool is discovered but disabled in the catalog ('discovery does not imply exposure')."
                     .to_string(),
                 "Request tool enablement from the service owner via the control plane API `/api/tools/toggle_status`."
@@ -1117,18 +1191,21 @@ impl OmniMCPServer {
             )
         } else if tool_status == "NOT_FOUND" || tool_status == "SERVER_NOT_FOUND" {
             (
+                METHOD_NOT_FOUND,
                 format!("Target '{}' is not registered in the active catalog.", tool_name),
                 "Execute 'discover_server' and 'discover_tools' to locate valid active tool identifiers."
                     .to_string(),
             )
-        } else if error_message.to_lowercase().contains("unauthorized") {
+        } else if err_lower.contains("unauthorized") {
             (
+                UNAUTHORIZED,
                 "ABAC security charter rejection for the caller role.".to_string(),
                 "Verify x-caller-actor header or ensure proper OAuth token is provided in the Authorization header."
                     .to_string(),
             )
         } else {
             (
+                -32003,
                 format!("Downstream execution failure: {}", error_message),
                 if fallback_tool.is_some() {
                     "Resilient fallback tool is available; retry with fallback or check downstream logs.".to_string()
@@ -1142,6 +1219,7 @@ impl OmniMCPServer {
             "server_name": server_name,
             "tool_name": tool_name,
             "tool_status": tool_status,
+            "error_code": error_code as i64,
             "circuit_breaker_open": cb_open,
             "canary_active": is_canary,
             "fallback_tool": fallback_tool.map(JsonValue::from).unwrap_or(JsonValue::Null),
@@ -1222,9 +1300,9 @@ impl OmniMCPServer {
                 .get("confidence_threshold")
                 .and_then(|x| x.as_f64())
                 .unwrap_or(0.82);
-            let spec =
-                self.gateway
-                    .generate_speculative_codemode_types(intent, top_k, threshold);
+            let spec = self
+                .gateway
+                .generate_speculative_codemode_types(intent, top_k, threshold);
             let payload = spec.to_json();
             return RPCResponse::ok(
                 request.id.clone(),
@@ -1284,9 +1362,9 @@ impl OmniMCPServer {
             .and_then(|x| x.as_str())
             .unwrap_or(caller_actor);
 
-        let output =
-            self.gateway
-                .resume_codemode(execution_id, approver, None, user_token, None);
+        let output = self
+            .gateway
+            .resume_codemode(execution_id, approver, None, user_token, None);
         let is_err = output.status == "ERROR";
         let payload = output.to_json();
 
@@ -1322,9 +1400,9 @@ impl OmniMCPServer {
         };
 
         let cfg = FaultInjectionConfig::from_json(args);
-        let report =
-            self.gateway
-                .simulate_codemode(code, None, cfg, caller_actor, user_token);
+        let report = self
+            .gateway
+            .simulate_codemode(code, None, cfg, caller_actor, user_token);
         let payload = report.to_json();
 
         RPCResponse::ok(
@@ -1340,20 +1418,4 @@ impl OmniMCPServer {
             }),
         )
     }
-}
-
-fn tokenize_words(query: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut cur = String::new();
-    for ch in query.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            cur.push(ch);
-        } else if !cur.is_empty() {
-            words.push(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.is_empty() {
-        words.push(cur);
-    }
-    words
 }

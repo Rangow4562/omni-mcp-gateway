@@ -16,16 +16,24 @@ use crate::data_plane::translators::ProtocolTranslator;
 use crate::json::JsonValue;
 use crate::logging::now_epoch_micros;
 use crate::models::{
-    format_traceparent, generate_span_id, generate_trace_id, parse_traceparent,
-    CompletedMutationRecord, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse,
-    SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame, ToolStatus, TraceSpan,
-    CIRCUIT_OPEN, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, TOOL_DISABLED, UNAUTHORIZED,
+    format_traceparent, generate_span_id, generate_trace_id, negotiate_protocol_version,
+    parse_traceparent, CompletedMutationRecord, FeatureStatus, RPCBatchOrSingle, RPCError,
+    RPCRequest, RPCResponse, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame,
+    ToolStatus, TraceSpan, CIRCUIT_OPEN, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
+    SAGA_COMPENSATED, TOOL_DISABLED, UNAUTHORIZED,
 };
 use crate::storage::audit_log::sha256_hex;
 use crate::storage::MerkleAuditStore;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+
+/// Merkle audit-log-only status tag recorded when a completed mutation is unwound by a Saga compensation tool.
+pub const AUDIT_STATUS_SAGA_COMPENSATED: &str = "COMPENSATED:saga_rollback";
+/// Merkle audit-log-only status tag recorded when a completed mutation has no registered `MutationCompensationSpec`.
+pub const AUDIT_STATUS_SAGA_UNCOMPENSATED: &str = "UNCOMPENSATED:no_compensation_spec";
+/// Merkle audit-log-only status tag recorded when a human approves and resumes a `SuspendedExecutionFrame`.
+pub const AUDIT_STATUS_CONTINUATION_RESUMED: &str = "APPROVED:continuation_resume";
 
 #[derive(Clone)]
 pub struct MCPProxyGateway {
@@ -179,16 +187,24 @@ impl MCPProxyGateway {
             "prompts/list" => RPCResponse::ok(request.id.clone(), json!({"prompts": []})),
             other => RPCResponse::err(
                 request.id.clone(),
-                RPCError::new(METHOD_NOT_FOUND, format!("Method '{}' not supported.", other)),
+                RPCError::new(
+                    METHOD_NOT_FOUND,
+                    format!("Method '{}' not supported.", other),
+                ),
             ),
         }
     }
 
     fn handle_initialize(&self, server: &ServerRecord, request: &RPCRequest) -> RPCResponse {
+        let client_ver = request
+            .params
+            .get("protocolVersion")
+            .and_then(|v| v.as_str());
+        let negotiated = negotiate_protocol_version(client_ver);
         RPCResponse::ok(
             request.id.clone(),
             json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiated,
                 "capabilities": {
                     "tools": {"listChanged": true},
                     "logging": {}
@@ -263,7 +279,10 @@ impl MCPProxyGateway {
                     request.id.clone(),
                     RPCError::new(
                         METHOD_NOT_FOUND,
-                        format!("Tool '{}' not found on server '{}'.", tool_name, server.name),
+                        format!(
+                            "Tool '{}' not found on server '{}'.",
+                            tool_name, server.name
+                        ),
                     ),
                 )
             }
@@ -344,8 +363,7 @@ impl MCPProxyGateway {
         downstream_headers.insert("traceparent".to_string(), downstream_traceparent);
         if is_canary {
             downstream_headers.insert("x-omni-canary".to_string(), "true".to_string());
-            downstream_headers
-                .insert("x-omni-version".to_string(), effective_version.to_string());
+            downstream_headers.insert("x-omni-version".to_string(), effective_version.to_string());
         }
 
         // 6. Protocol Translation & Downstream Execution via Muttley (with semantic cache & resilient fallback)
@@ -607,6 +625,7 @@ impl MCPProxyGateway {
     }
 
     /// Internal helper to resolve and invoke a single tool call from inside CodeMode or Continuation Resume.
+    #[allow(clippy::too_many_arguments)]
     fn invoke_codemode_single_tool(
         &self,
         servers_snapshot: &[ServerRecord],
@@ -662,8 +681,10 @@ impl MCPProxyGateway {
             args_vec[0].clone()
         } else {
             let mut obj = JsonValue::object();
-            if let Some(props) =
-                tool.input_schema.get("properties").and_then(|p| p.as_object())
+            if let Some(props) = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
             {
                 for (idx, (prop_key, _)) in props.iter().enumerate() {
                     if let Some(val) = args_vec.get(idx) {
@@ -826,7 +847,7 @@ impl MCPProxyGateway {
                         &target_srv,
                         &spec.compensating_tool,
                         &comp_args,
-                        "COMPENSATED:saga_rollback",
+                        AUDIT_STATUS_SAGA_COMPENSATED,
                         comp_us,
                     );
                 }
@@ -847,7 +868,7 @@ impl MCPProxyGateway {
                         &completed.server_name,
                         &completed.tool_name,
                         &completed.input_args,
-                        "UNCOMPENSATED:no_compensation_spec",
+                        AUDIT_STATUS_SAGA_UNCOMPENSATED,
                         0,
                     );
                 }
@@ -1023,23 +1044,25 @@ impl MCPProxyGateway {
         let mut completed_vec = completed_mutations.into_inner().unwrap();
 
         // 1. If script suspended on an Approval Gate, persist `SuspendedExecutionFrame` into `WalRegistryStore`
-        if output.status == "APPROVAL_REQUIRED" {
+        if output.feature_status == FeatureStatus::ApprovalRequired {
             if let Some(ref mut frame) = output.suspended_frame {
                 frame.caller_actor = caller_actor.to_string();
                 frame.completed_mutations = completed_vec.clone();
-                let _ = self.cache.registry.save_suspended_frame(frame.clone());
+                self.cache.registry.save_suspended_frame(frame.clone());
             }
         }
 
         // 2. If script errored after completing one or more mutations, unwind in LIFO order via Saga Compensation
-        if output.status == "ERROR" && !completed_vec.is_empty() {
+        if output.status == FeatureStatus::Error.as_str() && !completed_vec.is_empty() {
             let compensations = self.unwind_saga_compensations(
                 &mut completed_vec,
                 caller_actor,
                 user_token,
                 &codemode_traceparent,
             );
-            output.status = "SAGA_ROLLED_BACK".to_string();
+            output.status = FeatureStatus::SagaRolledBack.as_str().to_string();
+            output.feature_status = FeatureStatus::SagaRolledBack;
+            output.error_code = Some(SAGA_COMPENSATED);
             output.saga_compensations = compensations;
         }
 
@@ -1099,7 +1122,9 @@ impl MCPProxyGateway {
             Some(f) => f,
             None => {
                 return CodeOutput {
-                    status: "ERROR".to_string(),
+                    status: FeatureStatus::Error.as_str().to_string(),
+                    feature_status: FeatureStatus::Error,
+                    error_code: Some(INTERNAL_ERROR),
                     result: JsonValue::Null,
                     logs: Vec::new(),
                     pending_approvals: Vec::new(),
@@ -1130,7 +1155,9 @@ impl MCPProxyGateway {
         let actual_hash = sha256_hex(frame.script_source.as_bytes());
         if actual_hash != frame.script_hash {
             return CodeOutput {
-                status: "ERROR".to_string(),
+                status: FeatureStatus::Error.as_str().to_string(),
+                feature_status: FeatureStatus::Error,
+                error_code: Some(INTERNAL_ERROR),
                 result: JsonValue::Null,
                 logs: frame.logs,
                 pending_approvals: Vec::new(),
@@ -1163,7 +1190,7 @@ impl MCPProxyGateway {
                 &frame.pending_server,
                 &frame.pending_tool,
                 &frame.pending_arguments,
-                "APPROVED:continuation_resume",
+                AUDIT_STATUS_CONTINUATION_RESUMED,
                 0,
             );
         }
@@ -1188,7 +1215,9 @@ impl MCPProxyGateway {
             Ok(pair) => pair,
             Err(e) => {
                 let mut err_out = CodeOutput {
-                    status: "ERROR".to_string(),
+                    status: FeatureStatus::Error.as_str().to_string(),
+                    feature_status: e.feature_status(),
+                    error_code: Some(e.error_code()),
                     result: JsonValue::Null,
                     logs: frame.logs,
                     pending_approvals: Vec::new(),
@@ -1216,7 +1245,9 @@ impl MCPProxyGateway {
                         user_token,
                         &codemode_traceparent,
                     );
-                    err_out.status = "SAGA_ROLLED_BACK".to_string();
+                    err_out.status = FeatureStatus::SagaRolledBack.as_str().to_string();
+                    err_out.feature_status = FeatureStatus::SagaRolledBack;
+                    err_out.error_code = Some(SAGA_COMPENSATED);
                     err_out.saga_compensations = comps;
                 }
                 return err_out;
@@ -1287,23 +1318,22 @@ impl MCPProxyGateway {
 
         let mut completed_vec = completed_mutations.into_inner().unwrap();
 
-        if output.status == "APPROVAL_REQUIRED" {
+        if output.feature_status == FeatureStatus::ApprovalRequired {
             if let Some(ref mut next_frame) = output.suspended_frame {
                 next_frame.caller_actor = frame.caller_actor.clone();
                 next_frame.completed_mutations = completed_vec.clone();
-                let _ = self
-                    .cache
-                    .registry
-                    .save_suspended_frame(next_frame.clone());
+                self.cache.registry.save_suspended_frame(next_frame.clone());
             }
-        } else if output.status == "ERROR" && !completed_vec.is_empty() {
+        } else if output.status == FeatureStatus::Error.as_str() && !completed_vec.is_empty() {
             let comps = self.unwind_saga_compensations(
                 &mut completed_vec,
                 &frame.caller_actor,
                 user_token,
                 &codemode_traceparent,
             );
-            output.status = "SAGA_ROLLED_BACK".to_string();
+            output.status = FeatureStatus::SagaRolledBack.as_str().to_string();
+            output.feature_status = FeatureStatus::SagaRolledBack;
+            output.error_code = Some(SAGA_COMPENSATED);
             output.saga_compensations = comps;
         }
 
@@ -1387,5 +1417,126 @@ impl MCPProxyGateway {
     /// Lists all currently suspended execution frames in the durable `WalRegistryStore`.
     pub fn list_suspended_codemode_frames(&self) -> Vec<SuspendedExecutionFrame> {
         self.cache.registry.list_suspended_frames()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_plane::MCPRegistry;
+    use crate::models::{MutationCompensationSpec, ProtocolType, ToolRecord};
+    use crate::storage::WalRegistryStore;
+
+    #[test]
+    fn test_saga_lifo_unwinding_order_and_32034_error_code() {
+        let store = Arc::new(WalRegistryStore::new(":memory:"));
+        let registry = MCPRegistry::new(Some(store));
+        let mut srv = ServerRecord::new(
+            "ledger",
+            "Ledger Service",
+            "Transactional ledger",
+            "fintech",
+        );
+        srv.protocol = ProtocolType::Grpc;
+        srv.status = ToolStatus::Enabled;
+
+        for step in &["step_1", "step_2", "step_3"] {
+            let undo_name = format!("undo_{}", step);
+            let mut fwd = ToolRecord::new(
+                *step,
+                "Forward mutation",
+                json!({"type": "object", "properties": {"tx_id": {"type": "string"}}}),
+            );
+            fwd.status = ToolStatus::Enabled;
+            fwd.is_mutation = true;
+            let mut arg_map = BTreeMap::new();
+            arg_map.insert("tx_id".to_string(), "$input.tx_id".to_string());
+            fwd.compensation_spec = Some(MutationCompensationSpec {
+                forward_tool: (*step).to_string(),
+                compensating_server: Some("ledger".to_string()),
+                compensating_tool: undo_name.clone(),
+                arg_mapping: arg_map,
+            });
+            srv.add_tool(fwd);
+
+            let mut undo = ToolRecord::new(
+                undo_name,
+                "Compensating undo tool",
+                json!({"type": "object", "properties": {"tx_id": {"type": "string"}}}),
+            );
+            undo.status = ToolStatus::Enabled;
+            srv.add_tool(undo);
+        }
+        registry.register_server(srv);
+        let cache = InMemoryConfigCache::new(registry, 60.0);
+        let gw = MCPProxyGateway::new(cache, None);
+
+        let script = r#"
+        async () => {
+            await codemode.ledger.step_1({ tx_id: "tx_A" });
+            await codemode.ledger.step_2({ tx_id: "tx_B" });
+            await codemode.ledger.step_3({ tx_id: "tx_C" });
+            await codemode.ledger.non_existent_commit({ tx_id: "tx_FAIL" });
+            return { ok: true };
+        }
+        "#;
+        let out = gw.execute_codemode(script, None, false, "agent", None, None);
+        assert_eq!(out.status, "SAGA_ROLLED_BACK");
+        assert_eq!(out.feature_status, FeatureStatus::SagaRolledBack);
+        assert_eq!(out.error_code, Some(SAGA_COMPENSATED));
+        assert_eq!(out.error_code, Some(-32034));
+        assert_eq!(out.saga_compensations.len(), 3);
+        // Verify strict LIFO unwinding order: step_3 -> step_2 -> step_1
+        assert_eq!(out.saga_compensations[0].forward_tool, "step_3");
+        assert_eq!(out.saga_compensations[0].compensating_tool, "undo_step_3");
+        assert_eq!(
+            out.saga_compensations[0].compensating_args["tx_id"].as_str(),
+            Some("tx_C")
+        );
+        assert_eq!(out.saga_compensations[1].forward_tool, "step_2");
+        assert_eq!(out.saga_compensations[1].compensating_tool, "undo_step_2");
+        assert_eq!(
+            out.saga_compensations[1].compensating_args["tx_id"].as_str(),
+            Some("tx_B")
+        );
+        assert_eq!(out.saga_compensations[2].forward_tool, "step_1");
+        assert_eq!(out.saga_compensations[2].compensating_tool, "undo_step_1");
+        assert_eq!(
+            out.saga_compensations[2].compensating_args["tx_id"].as_str(),
+            Some("tx_A")
+        );
+    }
+
+    #[test]
+    fn test_version_single_sourcing_drift_guard() {
+        let cargo_ver = env!("CARGO_PKG_VERSION");
+        let root_pkg =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/package.json"))
+                .expect("Must read package.json");
+        let root_json = JsonValue::parse(&root_pkg).expect("Valid package.json");
+        assert_eq!(
+            root_json["version"].as_str(),
+            Some(cargo_ver),
+            "package.json version must match Cargo.toml version"
+        );
+
+        let ui_pkg =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/package.json"))
+                .expect("Must read ui/package.json");
+        let ui_json = JsonValue::parse(&ui_pkg).expect("Valid ui/package.json");
+        assert_eq!(
+            ui_json["version"].as_str(),
+            Some(cargo_ver),
+            "ui/package.json version must match Cargo.toml version"
+        );
+
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("Must read README.md");
+        let major_minor: String = cargo_ver.split('.').take(2).collect::<Vec<_>>().join(".");
+        assert!(
+            readme.contains(&format!("v{}", major_minor)),
+            "README.md must reference current major.minor version v{}",
+            major_minor
+        );
     }
 }

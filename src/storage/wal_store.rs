@@ -9,8 +9,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::RwLock;
 
-pub type SQLiteRegistryStore = WalRegistryStore;
-
 struct StoreState {
     servers: BTreeMap<String, ServerRecord>,
     diffs: BTreeMap<String, ConfigDiff>,
@@ -81,7 +79,9 @@ impl WalRegistryStore {
                     if let Some(frames) = val.get("suspended_frames").and_then(|f| f.as_array()) {
                         for f_val in frames {
                             if let Some(frame) = SuspendedExecutionFrame::from_json(f_val) {
-                                guard.suspended_frames.insert(frame.execution_id.clone(), frame);
+                                guard
+                                    .suspended_frames
+                                    .insert(frame.execution_id.clone(), frame);
                             }
                         }
                     }
@@ -118,12 +118,17 @@ impl WalRegistryStore {
                                         }
                                     } else if op == "SAVE_SUSPENDED_FRAME" {
                                         if let Some(f_val) = entry.get("data") {
-                                            if let Some(frame) = SuspendedExecutionFrame::from_json(f_val) {
-                                                guard.suspended_frames.insert(frame.execution_id.clone(), frame);
+                                            if let Some(frame) =
+                                                SuspendedExecutionFrame::from_json(f_val)
+                                            {
+                                                guard
+                                                    .suspended_frames
+                                                    .insert(frame.execution_id.clone(), frame);
                                             }
                                         }
                                     } else if op == "DELETE_SUSPENDED_FRAME" {
-                                        if let Some(id) = entry.get("data").and_then(|d| d.as_str()) {
+                                        if let Some(id) = entry.get("data").and_then(|d| d.as_str())
+                                        {
                                             guard.suspended_frames.remove(id);
                                         }
                                     }
@@ -182,7 +187,7 @@ impl WalRegistryStore {
             .map(|f| f.to_json())
             .collect();
         let snapshot = json!({
-            "engine": "omni-rust-wal-v4.5",
+            "engine": concat!("omni-rust-wal-v", env!("CARGO_PKG_VERSION")),
             "servers": JsonValue::Array(servers_arr),
             "diffs": JsonValue::Array(diffs_arr),
             "suspended_frames": JsonValue::Array(frames_arr),
@@ -265,5 +270,71 @@ impl WalRegistryStore {
                 guard.wal_entries_since_compact = 0;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{generate_ulid, CompletedMutationRecord};
+    use std::io::Write;
+
+    #[test]
+    fn test_wal_suspend_resume_round_trip_and_checksum_integrity() {
+        let tmp_dir = std::env::temp_dir().join(format!("omni_wal_unit_{}", generate_ulid()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let db_path = tmp_dir.join("registry.db").to_string_lossy().to_string();
+
+        let frame = SuspendedExecutionFrame {
+            execution_id: "01JC0000000000000000000001".to_string(),
+            script_hash: "abc123def456".to_string(),
+            script_source: "async () => { return 42; }".to_string(),
+            instruction_ptr: 1,
+            target_var: Some("receipt".to_string()),
+            serialized_scope: json!({"rides_count": 4}),
+            pending_server: "accounting".to_string(),
+            pending_tool: "refund".to_string(),
+            pending_arguments: json!({"ride_id": "r_102"}),
+            pending_reason: "Approval required".to_string(),
+            policy_context_hash: "ctx_hash".to_string(),
+            caller_actor: "agent".to_string(),
+            logs: vec!["step 0 complete".to_string()],
+            completed_mutations: vec![CompletedMutationRecord {
+                server_name: "payments".to_string(),
+                tool_name: "reserve".to_string(),
+                input_args: json!({"id": "1"}),
+                output_val: json!({"ok": true}),
+                compensation_spec: None,
+            }],
+            created_at: 1700000000.0,
+        };
+
+        {
+            let store = WalRegistryStore::new(&db_path);
+            store.save_suspended_frame(&frame);
+            // Append a corrupted WAL line with invalid FNV-1a checksum to verify corruption resilience
+            let wal_file = format!("{}-wal", db_path);
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&wal_file) {
+                let _ = writeln!(
+                    f,
+                    "deadbeefdeadbeef|{{\"op\":\"DELETE_SUSPENDED_FRAME\",\"data\":\"01JC0000000000000000000001\"}}"
+                );
+            }
+        }
+
+        // Reopen from disk and verify valid frame survived and corrupted WAL line was ignored
+        let reopened = WalRegistryStore::new(&db_path);
+        let recovered = reopened
+            .get_suspended_frame("01JC0000000000000000000001")
+            .expect("Must recover suspended frame from WAL/snapshot");
+        assert_eq!(recovered, frame);
+
+        let deleted = reopened.delete_suspended_frame("01JC0000000000000000000001");
+        assert!(deleted.is_some());
+        assert!(reopened
+            .get_suspended_frame("01JC0000000000000000000001")
+            .is_none());
+        reopened.close();
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -1,4 +1,4 @@
-//! AutoCrawler - Cadence-powered distributed workflow engine for discovering APIs and native servers.
+//! AutoCrawler - In-process periodic discovery engine for scanning IDL definitions (Protobuf, Thrift, OpenAPI) and native MCPFx server heartbeats.
 
 use crate::control_plane::description_gen::ToolDescriptionGenerator;
 use crate::control_plane::idl_parser::{IDLParser, ServiceDefinition};
@@ -55,11 +55,7 @@ impl AutoCrawler {
             guard.run_count += 1;
             let now = now_epoch_secs();
             guard.last_run_timestamp = Some(now);
-            (
-                guard.run_count,
-                now,
-                guard.idl_registry_store.clone(),
-            )
+            (guard.run_count, now, guard.idl_registry_store.clone())
         };
 
         let mut discovered_servers = 0usize;
@@ -67,18 +63,17 @@ impl AutoCrawler {
 
         // 1. Discover IDL-Backed Services
         for (_svc_key, content) in idl_sources {
-            let parsed_services: Vec<ServiceDefinition> =
-                if content.contains("syntax = \"proto")
-                    || (content.contains("service ") && content.contains("rpc "))
-                {
-                    IDLParser::parse_protobuf(&content)
-                } else if content.contains("\"openapi\"") || content.contains("\"swagger\"") {
-                    IDLParser::parse_openapi(&content)
-                } else if content.contains("namespace ") || content.contains("service ") {
-                    IDLParser::parse_thrift(&content)
-                } else {
-                    Vec::new()
-                };
+            let parsed_services: Vec<ServiceDefinition> = if content.contains("syntax = \"proto")
+                || (content.contains("service ") && content.contains("rpc "))
+            {
+                IDLParser::parse_protobuf(&content)
+            } else if content.contains("\"openapi\"") || content.contains("\"swagger\"") {
+                IDLParser::parse_openapi(&content)
+            } else if content.contains("namespace ") || content.contains("service ") {
+                IDLParser::parse_thrift(&content)
+            } else {
+                Vec::new()
+            };
 
             for svc_def in parsed_services {
                 let virtual_server_name = svc_def.service_name.to_lowercase();

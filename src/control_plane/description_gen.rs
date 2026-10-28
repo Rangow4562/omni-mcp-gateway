@@ -94,4 +94,3 @@ fn split_camel_case(ident: &str) -> String {
     }
     words.join(" ")
 }
-

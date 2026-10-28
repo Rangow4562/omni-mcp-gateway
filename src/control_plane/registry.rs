@@ -110,7 +110,7 @@ impl MCPRegistry {
         guard
             .servers
             .values()
-            .filter(|s| filter_status.map_or(true, |st| s.status == st))
+            .filter(|s| filter_status.is_none_or(|st| s.status == st))
             .cloned()
             .collect()
     }
@@ -120,7 +120,7 @@ impl MCPRegistry {
         let mut out = Vec::new();
         for s in guard.servers.values() {
             for t in s.tools.values() {
-                if status.map_or(true, |st| t.status == st) {
+                if status.is_none_or(|st| t.status == st) {
                     out.push((s.clone(), t.clone()));
                 }
             }
@@ -142,10 +142,9 @@ impl MCPRegistry {
                 .servers
                 .get(server_name)
                 .ok_or_else(|| format!("Server '{}' not found", server_name))?;
-            let tool = server
-                .tools
-                .get(tool_name)
-                .ok_or_else(|| format!("Tool '{}' not found on server '{}'", tool_name, server_name))?;
+            let tool = server.tools.get(tool_name).ok_or_else(|| {
+                format!("Tool '{}' not found on server '{}'", tool_name, server_name)
+            })?;
             (Self::snapshot_server(server), tool.clone())
         };
 
@@ -476,7 +475,7 @@ impl MCPRegistry {
         guard
             .diffs
             .values()
-            .filter(|d| !d.approved && server_name.map_or(true, |sn| d.server_name == sn))
+            .filter(|d| !d.approved && server_name.is_none_or(|sn| d.server_name == sn))
             .cloned()
             .collect()
     }

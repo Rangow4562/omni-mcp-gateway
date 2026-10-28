@@ -11,12 +11,93 @@ pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
 
-// MCP & Enterprise Gateway Specific Error Codes
+// MCP & Enterprise Gateway Specific Error Codes (-320xx Authoritative Contract)
 pub const UNAUTHORIZED: i32 = -32001;
 pub const TOOL_DISABLED: i32 = -32002;
 pub const DOWNSTREAM_ERROR: i32 = -32003;
 pub const RATE_LIMITED: i32 = -32029;
 pub const CIRCUIT_OPEN: i32 = -32030;
+pub const APPROVAL_REQUIRED: i32 = -32031;
+pub const FUEL_EXHAUSTED: i32 = -32032;
+pub const OUTBOUND_BLOCKED: i32 = -32033;
+pub const SAGA_COMPENSATED: i32 = -32034;
+pub const SCHEMA_PREFLIGHT_FAILED: i32 = -32035;
+
+// Supported MCP Protocol Versions for Lifecycle Handshake Negotiation
+pub const LEGACY_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+pub const LATEST_MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
+    &[LEGACY_MCP_PROTOCOL_VERSION, LATEST_MCP_PROTOCOL_VERSION];
+
+/// Negotiates the MCP protocol version during `initialize`.
+/// Echoes the client's requested `protocolVersion` if it is in `SUPPORTED_MCP_PROTOCOL_VERSIONS`;
+/// otherwise responds with `LATEST_MCP_PROTOCOL_VERSION` (`"2025-03-26"`).
+pub fn negotiate_protocol_version(client_version: Option<&str>) -> &'static str {
+    if let Some(req_ver) = client_version {
+        for &supported in SUPPORTED_MCP_PROTOCOL_VERSIONS {
+            if req_ver.trim() == supported {
+                return supported;
+            }
+        }
+    }
+    LATEST_MCP_PROTOCOL_VERSION
+}
+
+/// Compiler-checked runtime feature status enum with wire-compatible string representations
+/// and authoritative `-320xx` JSON-RPC 2.0 error code mappings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureStatus {
+    Ok,
+    Error,
+    ApprovalRequired,
+    FuelExhausted,
+    OutboundBlocked,
+    SagaRolledBack,
+    CircuitOpen,
+    SchemaPreflightFailed,
+}
+
+impl FeatureStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FeatureStatus::Ok => "OK",
+            FeatureStatus::Error => "ERROR",
+            FeatureStatus::ApprovalRequired => "APPROVAL_REQUIRED",
+            FeatureStatus::FuelExhausted => "FUEL_EXHAUSTED",
+            FeatureStatus::OutboundBlocked => "OUTBOUND_BLOCKED",
+            FeatureStatus::SagaRolledBack => "SAGA_ROLLED_BACK",
+            FeatureStatus::CircuitOpen => "CIRCUIT_OPEN",
+            FeatureStatus::SchemaPreflightFailed => "SCHEMA_PREFLIGHT_FAILED",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "OK" => FeatureStatus::Ok,
+            "APPROVAL_REQUIRED" => FeatureStatus::ApprovalRequired,
+            "FUEL_EXHAUSTED" | "FuelExhausted" => FeatureStatus::FuelExhausted,
+            "OUTBOUND_BLOCKED" | "GlobalOutboundBlocked" => FeatureStatus::OutboundBlocked,
+            "SAGA_ROLLED_BACK" | "SAGA_COMPENSATED" => FeatureStatus::SagaRolledBack,
+            "CIRCUIT_OPEN" => FeatureStatus::CircuitOpen,
+            "SCHEMA_PREFLIGHT_FAILED" => FeatureStatus::SchemaPreflightFailed,
+            _ => FeatureStatus::Error,
+        }
+    }
+
+    pub fn error_code(&self) -> Option<i32> {
+        match self {
+            FeatureStatus::Ok => None,
+            FeatureStatus::Error => Some(INTERNAL_ERROR),
+            FeatureStatus::ApprovalRequired => Some(APPROVAL_REQUIRED),
+            FeatureStatus::FuelExhausted => Some(FUEL_EXHAUSTED),
+            FeatureStatus::OutboundBlocked => Some(OUTBOUND_BLOCKED),
+            FeatureStatus::SagaRolledBack => Some(SAGA_COMPENSATED),
+            FeatureStatus::CircuitOpen => Some(CIRCUIT_OPEN),
+            FeatureStatus::SchemaPreflightFailed => Some(SCHEMA_PREFLIGHT_FAILED),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RPCError {
@@ -39,6 +120,19 @@ impl RPCError {
             code,
             message: message.into(),
             data: Some(data),
+        }
+    }
+
+    pub fn from_status(status: FeatureStatus, detail: impl Into<String>) -> Self {
+        let detail_str = detail.into();
+        let code = status.error_code().unwrap_or(INTERNAL_ERROR);
+        Self {
+            code,
+            message: format!("{}: {}", status.as_str(), detail_str),
+            data: Some(json!({
+                "status": status.as_str(),
+                "detail": detail_str,
+            })),
         }
     }
 

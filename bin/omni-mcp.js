@@ -21,6 +21,8 @@ function getPlatformBinaryName() {
 
   if (platform === 'win32' && arch === 'x64') {
     return 'omni-gateway-win32-x64.exe';
+  } else if (platform === 'win32' && arch === 'arm64') {
+    return 'omni-gateway-win32-arm64.exe';
   } else if (platform === 'darwin' && arch === 'arm64') {
     return 'omni-gateway-darwin-arm64';
   } else if (platform === 'darwin' && arch === 'x64') {

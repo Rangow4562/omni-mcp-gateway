@@ -16,7 +16,8 @@ pub fn generate_trace_id() -> String {
         .unwrap_or(0);
     let count = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
     let part1 = (nanos ^ (count.wrapping_mul(0x9e3779b97f4a7c15))) as u64;
-    let part2 = ((nanos >> 64) ^ (count.wrapping_mul(0xbf58476d1ce4e5b9))) as u64 ^ 0xa5a5a5a5a5a5a5a5;
+    let part2 =
+        ((nanos >> 64) ^ (count.wrapping_mul(0xbf58476d1ce4e5b9))) as u64 ^ 0xa5a5a5a5a5a5a5a5;
     format!("{:016x}{:016x}", part1.max(1), part2.max(1))
 }
 
@@ -74,12 +75,12 @@ pub fn generate_ulid() -> String {
     // 16 chars of 80-bit randomness
     let mut r1 = entropy_hi;
     let mut r2 = entropy_lo;
-    for i in 10..18 {
-        out[i] = CROCKFORD[(r1 & 0x1F) as usize];
+    for slot in out.iter_mut().take(18).skip(10) {
+        *slot = CROCKFORD[(r1 & 0x1F) as usize];
         r1 >>= 5;
     }
-    for i in 18..26 {
-        out[i] = CROCKFORD[(r2 & 0x1F) as usize];
+    for slot in out.iter_mut().skip(18) {
+        *slot = CROCKFORD[(r2 & 0x1F) as usize];
         r2 >>= 5;
     }
     String::from_utf8(out.to_vec()).unwrap_or_else(|_| "01J00000000000000000000000".to_string())
@@ -153,6 +154,7 @@ impl ProtocolType {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "gRPC" | "grpc" | "GRPC" => ProtocolType::Grpc,
@@ -180,6 +182,7 @@ impl ToolStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_uppercase().as_str() {
             "ENABLED" => ToolStatus::Enabled,
@@ -205,6 +208,7 @@ impl ActorType {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "human" => Some(ActorType::Human),
@@ -343,7 +347,11 @@ impl MutationCompensationSpec {
     }
 
     pub fn from_json(v: &JsonValue) -> Option<Self> {
-        let forward_tool = v.get("forward_tool").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let forward_tool = v
+            .get("forward_tool")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let compensating_server = v
             .get("compensating_server")
             .and_then(|x| x.as_str())
@@ -390,7 +398,10 @@ impl CompletedMutationRecord {
     pub fn from_json(v: &JsonValue) -> Option<Self> {
         let server_name = v.get("server_name")?.as_str()?.to_string();
         let tool_name = v.get("tool_name")?.as_str()?.to_string();
-        let input_args = v.get("input_args").cloned().unwrap_or_else(JsonValue::object);
+        let input_args = v
+            .get("input_args")
+            .cloned()
+            .unwrap_or_else(JsonValue::object);
         let output_val = v.get("output_val").cloned().unwrap_or(JsonValue::Null);
         let compensation_spec = v.get("compensation_spec").and_then(|cs| {
             if cs.is_null() {
@@ -458,8 +469,16 @@ pub struct SuspendedExecutionFrame {
 
 impl SuspendedExecutionFrame {
     pub fn to_json(&self) -> JsonValue {
-        let logs_arr: Vec<JsonValue> = self.logs.iter().map(|s| JsonValue::from(s.as_str())).collect();
-        let muts_arr: Vec<JsonValue> = self.completed_mutations.iter().map(|m| m.to_json()).collect();
+        let logs_arr: Vec<JsonValue> = self
+            .logs
+            .iter()
+            .map(|s| JsonValue::from(s.as_str()))
+            .collect();
+        let muts_arr: Vec<JsonValue> = self
+            .completed_mutations
+            .iter()
+            .map(|m| m.to_json())
+            .collect();
         json!({
             "execution_id": self.execution_id.clone(),
             "script_hash": self.script_hash.clone(),
@@ -484,25 +503,57 @@ impl SuspendedExecutionFrame {
         let script_hash = v.get("script_hash")?.as_str()?.to_string();
         let script_source = v.get("script_source")?.as_str()?.to_string();
         let instruction_ptr = v.get("instruction_ptr")?.as_u64()? as usize;
-        let target_var = v.get("target_var").and_then(|x| x.as_str()).map(String::from);
-        let serialized_scope = v.get("serialized_scope").cloned().unwrap_or_else(JsonValue::object);
+        let target_var = v
+            .get("target_var")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        let serialized_scope = v
+            .get("serialized_scope")
+            .cloned()
+            .unwrap_or_else(JsonValue::object);
         let pending_server = v.get("pending_server")?.as_str()?.to_string();
         let pending_tool = v.get("pending_tool")?.as_str()?.to_string();
-        let pending_arguments = v.get("pending_arguments").cloned().unwrap_or_else(JsonValue::object);
-        let pending_reason = v.get("pending_reason").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let policy_context_hash = v.get("policy_context_hash").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let caller_actor = v.get("caller_actor").and_then(|x| x.as_str()).unwrap_or("agent").to_string();
+        let pending_arguments = v
+            .get("pending_arguments")
+            .cloned()
+            .unwrap_or_else(JsonValue::object);
+        let pending_reason = v
+            .get("pending_reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let policy_context_hash = v
+            .get("policy_context_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let caller_actor = v
+            .get("caller_actor")
+            .and_then(|x| x.as_str())
+            .unwrap_or("agent")
+            .to_string();
         let logs = v
             .get("logs")
             .and_then(|a| a.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let completed_mutations = v
             .get("completed_mutations")
             .and_then(|a| a.as_array())
-            .map(|arr| arr.iter().filter_map(CompletedMutationRecord::from_json).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(CompletedMutationRecord::from_json)
+                    .collect()
+            })
             .unwrap_or_default();
-        let created_at = v.get("created_at").and_then(|x| x.as_f64()).unwrap_or_else(now_epoch_secs);
+        let created_at = v
+            .get("created_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or_else(now_epoch_secs);
 
         Some(Self {
             execution_id,
@@ -601,6 +652,12 @@ impl ToolRecord {
             "name": self.name.clone(),
             "description": self.description.clone(),
             "inputSchema": schema,
+            "annotations": {
+                "readOnlyHint": !self.is_mutation,
+                "destructiveHint": self.is_mutation,
+                "idempotentHint": self.idempotent_cacheable,
+                "openWorldHint": false,
+            },
         })
     }
 
@@ -683,9 +740,18 @@ impl ToolRecord {
             .get("idempotent_cacheable")
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
-        let canary_version = v.get("canary_version").and_then(|x| x.as_u64()).map(|u| u as u32);
-        let canary_weight_pct = v.get("canary_weight_pct").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
-        let fallback_tool = v.get("fallback_tool").and_then(|x| x.as_str()).map(String::from);
+        let canary_version = v
+            .get("canary_version")
+            .and_then(|x| x.as_u64())
+            .map(|u| u as u32);
+        let canary_weight_pct = v
+            .get("canary_weight_pct")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u8;
+        let fallback_tool = v
+            .get("fallback_tool")
+            .and_then(|x| x.as_str())
+            .map(String::from);
         let tags = v
             .get("tags")
             .and_then(|x| x.as_array())
@@ -695,7 +761,10 @@ impl ToolRecord {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let is_mutation = v.get("is_mutation").and_then(|x| x.as_bool()).unwrap_or(false);
+        let is_mutation = v
+            .get("is_mutation")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         let compensation_spec = v.get("compensation_spec").and_then(|cs| {
             if cs.is_null() {
                 None
@@ -960,7 +1029,10 @@ impl ServerRecord {
             .unwrap_or_default();
 
         let heartbeat_timestamp = v.get("heartbeat_timestamp").and_then(|x| x.as_f64());
-        let is_native = v.get("is_native").and_then(|x| x.as_bool()).unwrap_or(false);
+        let is_native = v
+            .get("is_native")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         let is_third_party = v
             .get("is_third_party")
             .and_then(|x| x.as_bool())

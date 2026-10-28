@@ -31,9 +31,9 @@ jobs:
             binary_name: omni-gateway
             asset_name: omni-gateway-darwin
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            target: windows-universal
             binary_name: omni-gateway.exe
-            asset_name: omni-gateway-win32-x64.exe
+            asset_name: omni-gateway-win32
 
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +47,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target == 'macos-universal' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+          targets: ${{ matrix.target == 'macos-universal' && 'aarch64-apple-darwin,x86_64-apple-darwin' || (matrix.target == 'windows-universal' && 'x86_64-pc-windows-msvc,aarch64-pc-windows-msvc' || matrix.target) }}
 
       - name: Build Release Binary
         shell: bash
@@ -63,9 +63,11 @@ jobs:
             cp target/aarch64-apple-darwin/release/omni-gateway dist/omni-gateway-darwin-arm64
             cp target/x86_64-apple-darwin/release/omni-gateway dist/omni-gateway-darwin-x64
             chmod +x dist/omni-gateway-darwin-*
-          elif [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cargo build --release --target ${{ matrix.target }} --bin omni-gateway
-            cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
+          elif [ "${{ matrix.target }}" = "windows-universal" ]; then
+            cargo build --release --target x86_64-pc-windows-msvc --bin omni-gateway
+            cargo build --release --target aarch64-pc-windows-msvc --bin omni-gateway
+            cp target/x86_64-pc-windows-msvc/release/omni-gateway.exe dist/omni-gateway-win32-x64.exe
+            cp target/aarch64-pc-windows-msvc/release/omni-gateway.exe dist/omni-gateway-win32-arm64.exe
           else
             cargo build --release --target ${{ matrix.target }} --bin omni-gateway
             cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
@@ -104,6 +106,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: release-assets/*
+          body_path: RELEASE_v4.6.0.md
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -119,6 +122,7 @@ jobs:
         run: |
           # Copy all platform binaries into bin folder before packaging
           cp release-assets/omni-gateway-win32-x64.exe bin/ 2>/dev/null || true
+          cp release-assets/omni-gateway-win32-arm64.exe bin/ 2>/dev/null || true
           cp release-assets/omni-gateway-darwin-arm64 bin/ 2>/dev/null || true
           cp release-assets/omni-gateway-darwin-x64 bin/ 2>/dev/null || true
           cp release-assets/omni-gateway-linux-x64 bin/ 2>/dev/null || true

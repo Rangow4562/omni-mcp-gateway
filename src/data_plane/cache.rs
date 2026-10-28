@@ -94,4 +94,3 @@ impl InMemoryConfigCache {
         self.running.store(false, Ordering::SeqCst);
     }
 }
-
