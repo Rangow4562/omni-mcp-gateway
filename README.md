@@ -86,6 +86,9 @@ No Rust compiler, toolchain, or local build required — automatically resolves 
 # Start as stdio MCP server for agent harnesses (Claude, Cursor, Windsurf, Antigravity)
 npx -y @rangow2260/omni-mcp --stdio
 
+# Alternatively, run from GitHub Packages (@rangow4562 scope)
+# npx -y @rangow4562/omni-mcp --stdio
+
 # Launch the multi-threaded HTTP/1.1 Gateway server on port 8080
 npx -y @rangow2260/omni-mcp 8080
 
