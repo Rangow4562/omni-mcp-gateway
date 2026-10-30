@@ -18,6 +18,8 @@ ui/node_modules/
 .venv
 venv/
 .commandcode/
+*.visual-check.*
+docs/*.html
 
 # Data & Durable WAL Storage
 data/

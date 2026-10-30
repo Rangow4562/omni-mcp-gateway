@@ -1,0 +1,71 @@
+name: Publish to GitHub Packages
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-gpr:
+    name: Publish NPM to GitHub Packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@rangow4562'
+
+      - name: Download release assets from GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p bin
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --repo Rangow4562/omni-mcp-gateway --json tagName -q .tagName)
+          fi
+          echo "Downloading release assets for tag: $TAG"
+          gh release download "$TAG" --repo Rangow4562/omni-mcp-gateway --dir bin
+          chmod +x bin/omni-gateway-* || true
+          ls -la bin
+
+      - name: Publish @rangow4562/omni-mcp to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.name = "@rangow4562/omni-mcp";
+            pkg.publishConfig = {
+              registry: "https://npm.pkg.github.com"
+            };
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          cat package.json
+          npm publish --access public
+
+      - name: Publish @rangow4562/omni-mcp-gateway to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.name = "@rangow4562/omni-mcp-gateway";
+            pkg.publishConfig = {
+              registry: "https://npm.pkg.github.com"
+            };
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          cat package.json
+          npm publish --access public

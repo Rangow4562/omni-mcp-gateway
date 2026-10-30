@@ -5,7 +5,7 @@
     "title": "Omni MCP Gateway v4.7 — Protocol Parity & Real Wire",
     "locale": "en",
     "quality_profile": "showcase",
-    "viewBox": [1240, 640],
+    "viewBox": [1260, 560],
     "views": [
       {
         "id": "request-path",
@@ -23,23 +23,22 @@
         "id": "trust",
         "label": "Trust and containment",
         "focus": ["codemode", "audit", "controlplane"],
-        "note": "Inspect the sandbox boundary, the audit ledger, and the durable ledger state."
+        "note": "Inspect the sandbox boundary, the audit ledger, and the durable registry state."
       }
     ]
   },
   "components": [
-    { "id": "agents", "type": "external", "label": "Agent harness", "sublabel": "Claude, Cursor, shell", "pos": [40, 250], "size": [150, 72] },
-    { "id": "transport", "type": "backend", "label": "MCP transport", "sublabel": "stdio + Streamable HTTP", "pos": [250, 250], "size": [160, 72] },
-    { "id": "codemode", "type": "backend", "label": "Omni Code Mode", "sublabel": "~100 us AST sandbox", "pos": [470, 240], "size": [190, 92] },
-    { "id": "dataplane", "type": "backend", "label": "Data plane", "sublabel": "route, guard, project", "pos": [710, 240], "size": [190, 92] },
-    { "id": "downstream", "type": "external", "label": "Downstream services", "sublabel": "HTTP, gRPC, TChannel", "pos": [960, 168], "size": [180, 72] },
-    { "id": "mcpservers", "type": "external", "label": "Native MCP servers", "sublabel": "MCPFx heartbeat", "pos": [960, 336], "size": [180, 72] },
-    { "id": "crawler", "type": "backend", "label": "AutoCrawler", "sublabel": "OpenAPI, Protobuf, Thrift", "pos": [250, 470], "size": [160, 80] },
-    { "id": "controlplane", "type": "database", "label": "Control plane registry", "sublabel": "WAL + atomic snapshot", "pos": [470, 470], "size": [190, 80] },
-    { "id": "audit", "type": "security", "label": "Merkle audit ledger", "sublabel": "SHA-256 chained", "pos": [710, 470], "size": [190, 80] }
+    { "id": "agents", "type": "external", "label": "Agent harness", "sublabel": "Claude, Cursor, shell", "pos": [16, 120], "size": [144, 72] },
+    { "id": "transport", "type": "backend", "label": "MCP transport", "sublabel": "stdio + Streamable HTTP", "pos": [248, 120], "size": [164, 72] },
+    { "id": "codemode", "type": "backend", "label": "Omni Code Mode", "sublabel": "~100 us AST sandbox", "pos": [500, 110], "size": [176, 92] },
+    { "id": "dataplane", "type": "backend", "label": "Data plane", "sublabel": "route, guard, project", "pos": [764, 110], "size": [176, 92] },
+    { "id": "downstream", "type": "external", "label": "Downstream services", "sublabel": "HTTP, gRPC, TChannel", "pos": [1050, 40], "size": [164, 72] },
+    { "id": "mcpservers", "type": "external", "label": "Native MCP servers", "sublabel": "MCPFx heartbeat", "pos": [1050, 240], "size": [164, 72] },
+    { "id": "crawler", "type": "backend", "label": "AutoCrawler", "sublabel": "OpenAPI, Protobuf, Thrift", "pos": [1050, 420], "size": [164, 80] },
+    { "id": "controlplane", "type": "database", "label": "Control plane registry", "sublabel": "WAL + atomic snapshot", "pos": [764, 420], "size": [176, 80] },
+    { "id": "audit", "type": "security", "label": "Merkle audit ledger", "sublabel": "SHA-256 chained", "pos": [500, 420], "size": [176, 80] }
   ],
   "boundaries": [
-    { "kind": "region", "label": "omni-gateway: one std-only Rust process", "wraps": ["transport", "codemode", "dataplane", "crawler", "controlplane", "audit"], "pad": 24 },
     { "kind": "security-group", "label": "globalOutbound: null", "wraps": ["codemode"], "pad": 14 }
   ],
   "connections": [
@@ -50,7 +49,7 @@
     { "id": "dataplane-mcpservers", "from": "dataplane", "to": "mcpservers", "label": "MCP proxy" },
     { "id": "controlplane-dataplane", "from": "controlplane", "to": "dataplane", "label": "routing table" },
     { "id": "crawler-controlplane", "from": "crawler", "to": "controlplane", "label": "IDL discovery" },
-    { "id": "codemode-audit", "from": "codemode", "to": "audit", "label": "Merkle chain", "variant": "dashed" }
+    { "id": "codemode-audit", "from": "codemode", "to": "audit", "label": "Merkle chain", "variant": "dashed", "labelAt": [588, 315] }
   ],
   "cards": [
     { "dot": "cyan", "title": "Code Mode first", "items": ["Agents ship one procedural script instead of hundreds of schemas", "Static SSA analysis lifts independent calls into parallel waves", "Columnar pushdown filters 50k+ records without per-row objects"] },
