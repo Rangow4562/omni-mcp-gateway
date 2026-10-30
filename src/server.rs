@@ -70,6 +70,36 @@ pub struct ProductionGatewayContext {
     pub traces: Arc<RwLock<Vec<TraceSpan>>>,
 }
 
+fn is_origin_allowed(origin: &str, cors_config: &str, host: Option<&str>) -> bool {
+    if origin == "null" {
+        return true;
+    }
+    if cors_config != "*" {
+        let allowed: Vec<&str> = cors_config.split(',').map(|s| s.trim()).collect();
+        if allowed.contains(&origin) {
+            return true;
+        }
+    }
+    if origin.starts_with("http://localhost")
+        || origin.starts_with("https://localhost")
+        || origin.starts_with("http://127.0.0.1")
+        || origin.starts_with("https://127.0.0.1")
+        || origin.starts_with("http://[::1]")
+    {
+        return true;
+    }
+    if let Some(h) = host {
+        let h_lower = h.to_lowercase();
+        if h_lower.starts_with("localhost")
+            || h_lower.starts_with("127.0.0.1")
+            || h_lower.starts_with("[::1]")
+        {
+            return false;
+        }
+    }
+    cors_config == "*"
+}
+
 impl ProductionGatewayContext {
     pub fn new(config: Option<OmniConfig>) -> Self {
         let config = config.unwrap_or_else(get_config);
@@ -321,12 +351,31 @@ impl ProductionGatewayContext {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let path = raw_path.split('?').next().unwrap_or(raw_path);
 
+        if let Some(origin) = headers.get("origin") {
+            if !is_origin_allowed(
+                origin,
+                &self.config.cors_allowed_origins,
+                headers.get("host").map(|s| s.as_str()),
+            ) {
+                return (
+                    403,
+                    "application/json".to_string(),
+                    Vec::new(),
+                    json!({
+                        "error": "Forbidden: Untrusted Origin for localhost (DNS rebinding protection)"
+                    })
+                    .to_string_compact()
+                    .into_bytes(),
+                );
+            }
+        }
+
         if method.eq_ignore_ascii_case("OPTIONS") {
             return (200, "text/plain".to_string(), Vec::new(), Vec::new());
         }
 
         if method.eq_ignore_ascii_case("GET") {
-            return self.handle_get(path);
+            return self.handle_get(path, headers);
         }
 
         if method.eq_ignore_ascii_case("POST") {
@@ -336,7 +385,40 @@ impl ProductionGatewayContext {
         self.json_response(405, json!({"error": "Method not allowed"}))
     }
 
-    fn handle_get(&self, path: &str) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
+    fn is_authorized(&self, headers: &HashMap<String, String>) -> bool {
+        let auth_hdr = headers
+            .get("authorization")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let token = auth_hdr
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_hdr.strip_prefix("bearer "))
+            .map(|s| s.trim())
+            .unwrap_or("");
+        !token.is_empty() && token != "anonymous"
+    }
+
+    fn unauthorized_response(
+        &self,
+        endpoint: &str,
+    ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
+        (
+            401,
+            "application/json".to_string(),
+            vec![("WWW-Authenticate".to_string(), "Bearer".to_string())],
+            json!({
+                "error": format!("Unauthorized: Valid Bearer token required for {}", endpoint)
+            })
+            .to_string_compact()
+            .into_bytes(),
+        )
+    }
+
+    fn handle_get(
+        &self,
+        path: &str,
+        headers: &HashMap<String, String>,
+    ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
         match path {
             "/healthz" => self.json_response(
                 200,
@@ -546,9 +628,62 @@ impl ProductionGatewayContext {
                         ("Cache-Control".to_string(), "no-cache".to_string()),
                         ("Connection".to_string(), "keep-alive".to_string()),
                         ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+                        (
+                            "Deprecation".to_string(),
+                            "@deprecated: use Streamable HTTP on /omni/mcp".to_string(),
+                        ),
+                        ("Sunset".to_string(), "2026-12-31".to_string()),
                     ],
                     sse_body.as_bytes().to_vec(),
                 )
+            }
+            "/omni/mcp" => {
+                let supported: Vec<JsonValue> = crate::models::SUPPORTED_MCP_PROTOCOL_VERSIONS
+                    .iter()
+                    .map(|v| JsonValue::from(*v))
+                    .collect();
+                self.json_response(
+                    200,
+                    json!({
+                        "endpoint": "/omni/mcp",
+                        "protocol": "Streamable HTTP",
+                        "server": "uber-omni-mcp-gateway",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "supported_versions": JsonValue::Array(supported),
+                        "capabilities": {
+                            "tools": {"listChanged": true},
+                            "resources": {"subscribe": false, "listChanged": true},
+                            "prompts": {"listChanged": true},
+                            "extensions": {}
+                        }
+                    }),
+                )
+            }
+            _ if path.ends_with("/mcp") => {
+                let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+                if parts.len() == 2 && parts[1] == "mcp" {
+                    let service_name = parts[0];
+                    if let Some(srv) = self.registry.get_server(service_name) {
+                        return self.json_response(
+                            200,
+                            json!({
+                                "service": srv.name,
+                                "endpoint": path,
+                                "protocol": "Streamable HTTP",
+                                "status": srv.status.as_str(),
+                                "tools_count": srv.tools.len() as i64,
+                            }),
+                        );
+                    } else {
+                        return self.json_response(
+                            404,
+                            json!({
+                                "error": format!("Service '{}' not found", service_name)
+                            }),
+                        );
+                    }
+                }
+                self.serve_static_or_index(path)
             }
             "/api/traces" => {
                 let spans_guard = self.traces.read().unwrap();
@@ -562,6 +697,9 @@ impl ProductionGatewayContext {
                 )
             }
             "/api/audit" => {
+                if !self.is_authorized(headers) {
+                    return self.unauthorized_response("/api/audit");
+                }
                 let records = self.audit_store.list_records(Some(100));
                 let recs_json: Vec<JsonValue> = records.iter().map(|r| r.to_json()).collect();
                 let (verified, _) = self.audit_store.verify_chain();
@@ -576,6 +714,9 @@ impl ProductionGatewayContext {
                 )
             }
             "/api/audit/verify" => {
+                if !self.is_authorized(headers) {
+                    return self.unauthorized_response("/api/audit/verify");
+                }
                 let (verified, count_or_idx) = self.audit_store.verify_chain();
                 if verified {
                     self.json_response(
@@ -861,6 +1002,9 @@ impl ProductionGatewayContext {
                 self.json_response(200, json!({"success": ok}))
             }
             "/api/execute" => {
+                if !self.is_authorized(headers) {
+                    return self.unauthorized_response("/api/execute");
+                }
                 let srv = body
                     .get("server_name")
                     .and_then(|x| x.as_str())
@@ -1178,12 +1322,25 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
         let mut headers = HashMap::new();
         let mut content_length = 0usize;
         let mut keep_alive = true;
+        let mut header_lines = 0usize;
+        let mut total_header_bytes = 0usize;
+        let mut seen_content_length = false;
+        let mut seen_transfer_encoding = false;
+        let mut smuggling_detected = false;
 
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => return,
                 Ok(_) => {
+                    header_lines += 1;
+                    total_header_bytes += line.len();
+                    if header_lines > 100 || total_header_bytes > 64 * 1024 {
+                        let resp = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: application/json\r\nContent-Length: 52\r\nConnection: close\r\n\r\n{\"error\":\"Request Header Fields Too Large (Cap: 64KB)\"}";
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                        return;
+                    }
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         break;
@@ -1192,7 +1349,15 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
                         let key_lc = k.trim().to_lowercase();
                         let val_str = v.trim().to_string();
                         if key_lc == "content-length" {
+                            if seen_content_length
+                                && headers.get("content-length") != Some(&val_str)
+                            {
+                                smuggling_detected = true;
+                            }
+                            seen_content_length = true;
                             content_length = val_str.parse().unwrap_or(0);
+                        } else if key_lc == "transfer-encoding" {
+                            seen_transfer_encoding = true;
                         } else if key_lc == "connection" && val_str.eq_ignore_ascii_case("close") {
                             keep_alive = false;
                         }
@@ -1200,6 +1365,13 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
                     }
                 }
             }
+        }
+
+        if smuggling_detected || (seen_transfer_encoding && seen_content_length) {
+            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 68\r\nConnection: close\r\n\r\n{\"error\":\"Bad Request: Conflicting Content-Length / Transfer-Encoding\"}";
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            return;
         }
 
         let mut body_bytes = vec![0u8; content_length.min(ctx.config.max_body_size_bytes + 1)];

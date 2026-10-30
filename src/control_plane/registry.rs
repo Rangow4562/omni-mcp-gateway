@@ -110,7 +110,7 @@ impl MCPRegistry {
         guard
             .servers
             .values()
-            .filter(|s| filter_status.is_none_or(|st| s.status == st))
+            .filter(|s| filter_status.map_or(true, |st| s.status == st))
             .cloned()
             .collect()
     }
@@ -120,7 +120,7 @@ impl MCPRegistry {
         let mut out = Vec::new();
         for s in guard.servers.values() {
             for t in s.tools.values() {
-                if status.is_none_or(|st| t.status == st) {
+                if status.map_or(true, |st| t.status == st) {
                     out.push((s.clone(), t.clone()));
                 }
             }
@@ -475,7 +475,7 @@ impl MCPRegistry {
         guard
             .diffs
             .values()
-            .filter(|d| !d.approved && server_name.is_none_or(|sn| d.server_name == sn))
+            .filter(|d| !d.approved && server_name.map_or(true, |sn| d.server_name == sn))
             .cloned()
             .collect()
     }
@@ -517,13 +517,15 @@ impl MCPRegistry {
 
     pub fn list_suspended_frames(&self) -> Vec<SuspendedExecutionFrame> {
         if let Some(store) = &self.store {
-            let frames = store.list_suspended_frames();
-            if !frames.is_empty() {
-                return frames;
-            }
+            return store.list_suspended_frames();
         }
         let guard = self.inner.read().unwrap();
-        guard.suspended_frames.values().cloned().collect()
+        guard
+            .suspended_frames
+            .values()
+            .filter(|f| !f.is_consumed)
+            .cloned()
+            .collect()
     }
 
     fn snapshot_server(server: &ServerRecord) -> JsonValue {

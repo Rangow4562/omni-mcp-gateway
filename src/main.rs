@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `omni-gateway` Binary Entrypoint.
 //! Starts the multi-threaded HTTP/1.1 & JSON-RPC 2.0 Gateway Server or dispatches CLI subcommands.
 

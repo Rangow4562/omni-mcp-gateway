@@ -113,6 +113,45 @@ pub fn sha256_hex(input: &[u8]) -> String {
     s
 }
 
+/// Computes HMAC-SHA256 (RFC 2104) using the in-tree FIPS 180-4 SHA-256 implementation.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = sha256(key);
+        k[..32].copy_from_slice(&hashed);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+
+    let mut inner = Vec::with_capacity(64 + data.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(data);
+    let inner_hash = sha256(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 32);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer)
+}
+
+/// Computes HMAC-SHA256 and formats the resulting 32-byte digest as a lower-case hex string.
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    let digest = hmac_sha256(key, data);
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -338,5 +377,22 @@ impl MerkleAuditStore {
             .last()
             .map(|r| r.current_hash.clone())
             .unwrap_or_else(|| GENESIS_HASH.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hmac_sha256_rfc4231_test_case_2() {
+        // RFC 4231 Test Case 2: key = "Jefe", data = "what do ya want for nothing?"
+        let key = b"Jefe";
+        let data = b"what do ya want for nothing?";
+        let hmac = hmac_sha256_hex(key, data);
+        assert_eq!(
+            hmac,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
     }
 }

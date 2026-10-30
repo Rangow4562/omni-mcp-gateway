@@ -28,6 +28,17 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
 
 ---
 
+## 🤝 What's New in Version 4.7 ("Protocol Parity & Real Wire")
+
+- 🤝 **MCP Protocol Parity (`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`, `2026-07-28`) (M1)**: First-class protocol capability matrix supporting all 5 revisions. Implements stateless `server/discover`, `subscriptions/listen`, `_meta` protocol version and client capability negotiation, batch gating, W3C trace context bridging, and Streamable HTTP on `/omni/mcp` and `/<service>/mcp` with deprecated legacy `/sse`.
+- 🌐 **Live HTTP/1.1 Downstream Transport (`transport-http`) (M2)**: Feature-gated, pure standard library HTTP/1.1 downstream client with connection pooling, keep-alive, connect/read/write timeouts, and bounded retries with jitter feeding the per-service circuit breaker and Saga unwinder.
+- 📋 **Schema Preflight Validator (`-32035 SCHEMA_PREFLIGHT_FAILED`) (M3)**: Static AST input schema type-checker validating parameters against registered schemas before approval gates or execution, collecting all violations in a single pass for single-turn LLM correction.
+- 🔐 **Approval & Continuation Hardening + Persistent Saga Ledger (M4)**: Authenticated continuation frames via HMAC-SHA256, single-use approval binding (`-32038 APPROVAL_INVALID`), OS CSPRNG entropy mixing, and crash-safe WAL/snapshot persistence of in-flight Saga compensations.
+- 🧱 **Sandbox Resource Limits (M5)**: Comprehensive sandbox boundaries with memory limit tracking (`-32036 MEMORY_EXHAUSTED`), wall-clock execution timeouts (`-32037 TIMEOUT`), and panic containment (`catch_unwind`).
+- 🛡️ **HTTP Surface Hardening (H1)**: DNS rebinding protection via Origin validation for localhost, required Bearer authentication for `/api/execute` and `/api/audit*`, slowloris read timeouts, header line and size caps, and HTTP request smuggling protection.
+
+---
+
 ## 🛡️ What's New in Version 4.6 ("Honesty & Hardening")
 
 - 🧪 **Code Mode Test Fortress (M1)**: In-module `#[cfg(test)]` unit test suites across `codemode.rs`, `json.rs`, `wal_store.rs`, and `gateway.rs` verifying parser diagnostics, evaluator closures, fuel exhaustion (`-32032`), `globalOutbound: null` isolation (`-32033`), vectorized `PhysicalExpr` evaluation, `SuspendedExecutionFrame` round-trip resume identity, FNV-1a WAL corruption rejection, and Saga LIFO unwinding order.
@@ -102,33 +113,33 @@ npx -y @rangow2260/omni-mcp aifx mcp simulate --code "const res = await codemode
 #### 🍎 macOS (Apple Silicon & Intel)
 ```bash
 # Apple Silicon (ARM64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.6.0/omni-gateway-darwin-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.0/omni-gateway-darwin-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Intel (x64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.6.0/omni-gateway-darwin-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.0/omni-gateway-darwin-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🐧 Linux (x86_64 & ARM64)
 ```bash
 # Linux x64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.6.0/omni-gateway-linux-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.0/omni-gateway-linux-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Linux ARM64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.6.0/omni-gateway-linux-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.0/omni-gateway-linux-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🪟 Windows (PowerShell — x64 & ARM64)
 ```powershell
 # Windows x64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.6.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 
 # Windows ARM64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.6.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 ```
 
@@ -153,7 +164,7 @@ cargo build --release
 
 ---
 
-## REA Claim Audit & v3.0–v4.6 Capabilities
+## REA Claim Audit & v3.0–v4.7 Capabilities
 
 | Document Claim / Capability | Document Statement | Omni MCP Rust Implementation | Status |
 | :--- | :--- | :--- | :--- |
@@ -164,15 +175,15 @@ cargo build --release
 | **Disabled by Default** | Discovery doesn't imply exposure; tools require review & approval | Strict `ToolStatus::Disabled` state machine; requires explicit enablement | **Verified Principle** |
 | **Diffs & Rollback** | Tool edits trigger diffs requiring approval; supports rollback | Versioned `ConfigDiff` engine with approval gates and rollback | **Verified Feature** |
 | **Dynamic Routing** | Materializes virtual servers at `/<service-name>/mcp` without redeploy | Dynamic HTTP/1.1 dispatch table refreshed on background cadence | **Verified Data Plane** |
-| **Wire Translation** | Translates JSON-RPC to HTTP, gRPC, TChannel wire formats | `ProtocolTranslator` in-memory envelope framing for HTTP, gRPC, TChannel | **Verified Data Plane** |
-| **Muttley Delegation** | Downstream calls routed via Muttley service mesh sidecar | `MuttleyMeshClient` in-memory sidecar adapter with $p_{50}$/$p_{95}$/$p_{99}$ histograms | **Verified Integration** |
+| **Wire Translation** | Translates JSON-RPC to HTTP, gRPC, TChannel wire formats | `ProtocolTranslator` in-memory envelope framing for HTTP, gRPC, TChannel (no sockets are opened; byte-level framing only) | **Simulated (in-memory envelopes)** |
+| **Muttley Delegation** | Downstream calls routed via Muttley service mesh sidecar | `MuttleyMeshClient` in-memory sidecar adapter with $p_{50}$/$p_{95}$/$p_{99}$ histograms (no live downstream network I/O yet) | **Simulated (in-memory adapter)** |
 | **Security & ABAC** | Server/tool charter policies for humans, services, agents; PII redaction | `SecurityCharterEngine` + DFA `PIIRedactor` (with API key redaction) | **Verified Security Model** |
 | **Omni MCP Discovery** | Proxy enabling incremental discovery via standard tools | `OmniMCPServer` with Okapi BM25 ranking + `recommend_tools` + `explain_error` | **v4.6 Upgrade** |
 | **MCP Resources & Prompts**| Full resource catalog and diagnostic runbooks | `resources/list`, `resources/read`, `prompts/list`, `prompts/get` | **v3.0 Upgrade** |
 | **OpenTelemetry Tracing** | Distributed end-to-end W3C request tracing | `traceparent` context injection, in-memory collector, `/api/traces` | **v3.0 Upgrade** |
 | **Canary & Resilient Fallback**| Safe progressive rollouts and fault-tolerant fallbacks | Percentage weighted traffic routing + automatic fallback execution | **v3.0 Upgrade** |
 | **Cryptographic Audit** | Tamper-evident immutable ledger for enterprise compliance | Zero-dependency FIPS 180-4 SHA-256 Merkle chained audit store | **v3.0 Upgrade** |
-| **Streamable SSE** | Server-Sent Events streaming for tool execution | Native `/sse` endpoint with event dispatch | **v3.0 Upgrade** |
+| **Streamable SSE** | Server-Sent Events streaming for tool execution | Native `/sse` endpoint with event dispatch (**deprecated** legacy HTTP+SSE transport; Streamable HTTP on `/omni/mcp` is the supported transport) | **v3.0 Upgrade (deprecated)** |
 | **Response Projection** | GraphQL-like nested path array trimming response in runtime | `ResponseProjectionEngine` supporting nested keys, `items[].field`, and `*` | **Verified Token Optimization** |
 | **Code Mode (`aifx`)** | CLI for coding agents: `mcp list`, `mcp search`, `mcp call` | Native `omni` and `aifx` Rust binaries + `mcp bench` micro-benchmark | **Verified CLI Interface** |
 | **Resilience & Caching** | Enterprise fault tolerance and sub-millisecond tail latency | `CircuitBreakerRegistry` + `SemanticResponseCache` + Batch JSON-RPC | **Verified Data Plane** |
@@ -211,7 +222,10 @@ All gateway, discovery, and Code Mode error states map to compiler-checked const
 | `-32032` | `FUEL_EXHAUSTED` | `FUEL_EXHAUSTED` | Code Mode script exceeded deterministic instruction fuel limit (`max_operations`). |
 | `-32033` | `OUTBOUND_BLOCKED` | `OUTBOUND_BLOCKED` | Direct network/filesystem access (`fetch`, `fs`) blocked by `globalOutbound: null` sandbox. |
 | `-32034` | `SAGA_COMPENSATED` | `SAGA_ROLLED_BACK` | Multi-step script failed after mutations; completed mutations were unwound in LIFO order. |
-| `-32035` | `SCHEMA_PREFLIGHT_FAILED` | `SCHEMA_PREFLIGHT_FAILED` | Reserved for pre-execution input schema validation failures. |
+| `-32035` | `SCHEMA_PREFLIGHT_FAILED` | `SCHEMA_PREFLIGHT_FAILED` | Tool arguments failed AST static input schema preflight validation before approval or execution. |
+| `-32036` | `MEMORY_EXHAUSTED` | `MEMORY_EXHAUSTED` | Code Mode script exceeded maximum memory allocation budget (`max_memory_bytes`). |
+| `-32037` | `TIMEOUT` | `TIMEOUT` | Code Mode script exceeded wall-clock execution time limit (`max_execution_time_ms`). |
+| `-32038` | `APPROVAL_INVALID` | `APPROVAL_INVALID` | Continuation token verification failed, expired, replayed, or arguments were tampered. |
 
 ---
 
@@ -294,7 +308,7 @@ All gateway, discovery, and Code Mode error states map to compiler-checked const
 - **Liveness Probe**: `http://localhost:8080/healthz`
 - **Readiness Probe**: `http://localhost:8080/readyz`
 - **Prometheus Metrics**: `http://localhost:8080/metrics`
-- **Server-Sent Events (SSE)**: `http://localhost:8080/sse`
+- **Server-Sent Events (SSE, deprecated legacy endpoint)**: `http://localhost:8080/sse`
 - **OpenTelemetry Traces**: `http://localhost:8080/api/traces`
 - **Merkle Audit Trail**: `http://localhost:8080/api/audit`
 - **Cryptographic Audit Verification**: `http://localhost:8080/api/audit/verify`

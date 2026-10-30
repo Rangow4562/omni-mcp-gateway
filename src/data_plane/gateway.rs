@@ -17,10 +17,11 @@ use crate::json::JsonValue;
 use crate::logging::now_epoch_micros;
 use crate::models::{
     format_traceparent, generate_span_id, generate_trace_id, negotiate_protocol_version,
-    parse_traceparent, CompletedMutationRecord, FeatureStatus, RPCBatchOrSingle, RPCError,
-    RPCRequest, RPCResponse, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame,
-    ToolStatus, TraceSpan, CIRCUIT_OPEN, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
-    SAGA_COMPENSATED, TOOL_DISABLED, UNAUTHORIZED,
+    parse_traceparent, validate_tool_schema, CompletedMutationRecord, FeatureStatus,
+    RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse, SagaCompensationRecord, ServerRecord,
+    SuspendedExecutionFrame, ToolStatus, TraceSpan, APPROVAL_INVALID, CIRCUIT_OPEN, INTERNAL_ERROR,
+    INVALID_PARAMS, METHOD_NOT_FOUND, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED, TOOL_DISABLED,
+    UNAUTHORIZED,
 };
 use crate::storage::audit_log::sha256_hex;
 use crate::storage::MerkleAuditStore;
@@ -303,6 +304,31 @@ impl MCPProxyGateway {
             );
         }
 
+        // 1.5. Schema Preflight Validation (-32035 SCHEMA_PREFLIGHT_FAILED)
+        if !tool.input_schema.is_null() && tool.input_schema.get("properties").is_some() {
+            if let Err(violations) = validate_tool_schema(&tool.input_schema, &arguments) {
+                let violation_jsons: Vec<JsonValue> =
+                    violations.iter().map(|v| v.to_json()).collect();
+                return RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::with_data(
+                        SCHEMA_PREFLIGHT_FAILED,
+                        format!(
+                            "Schema preflight validation failed for tool '{}.{}': {} violations detected.",
+                            server.name,
+                            tool_name,
+                            violations.len()
+                        ),
+                        json!({
+                            "tool": tool_name,
+                            "server": server.name.clone(),
+                            "violations": JsonValue::Array(violation_jsons),
+                        }),
+                    ),
+                );
+            }
+        }
+
         // 2. Security Charter & ABAC Policy Check
         let (is_allowed, reason) =
             SecurityCharterEngine::evaluate_access(server, tool, caller_actor, user_token);
@@ -509,6 +535,7 @@ impl MCPProxyGateway {
                         "text": final_result.to_string_pretty()
                     }
                 ],
+                "structuredContent": final_result,
                 "isError": false,
                 "_metadata": meta
             }),
@@ -701,6 +728,13 @@ impl MCPProxyGateway {
             obj
         };
 
+        // Schema Preflight Validation before approval gate (-32035)
+        if !tool.input_schema.is_null() && tool.input_schema.get("properties").is_some() {
+            if let Err(violations) = validate_tool_schema(&tool.input_schema, &arg_obj) {
+                return Err(CodeModeError::SchemaPreflightFailed(violations));
+            }
+        }
+
         if require_mutation_approval && tool.is_mutation {
             return Err(CodeModeError::ApprovalRequired(PendingApproval {
                 server_name: server.name.clone(),
@@ -852,7 +886,9 @@ impl MCPProxyGateway {
                     );
                 }
 
+                let key = format!("saga_{}_{}", completed.server_name, completed.tool_name);
                 records.push(SagaCompensationRecord {
+                    idempotency_key: key,
                     forward_server: completed.server_name,
                     forward_tool: completed.tool_name,
                     compensating_server: target_srv,
@@ -872,7 +908,12 @@ impl MCPProxyGateway {
                         0,
                     );
                 }
+                let key = format!(
+                    "saga_uncomp_{}_{}",
+                    completed.server_name, completed.tool_name
+                );
                 records.push(SagaCompensationRecord {
+                    idempotency_key: key,
                     forward_server: completed.server_name.clone(),
                     forward_tool: completed.tool_name.clone(),
                     compensating_server: completed.server_name,
@@ -1122,14 +1163,14 @@ impl MCPProxyGateway {
             Some(f) => f,
             None => {
                 return CodeOutput {
-                    status: FeatureStatus::Error.as_str().to_string(),
-                    feature_status: FeatureStatus::Error,
-                    error_code: Some(INTERNAL_ERROR),
+                    status: FeatureStatus::ApprovalInvalid.as_str().to_string(),
+                    feature_status: FeatureStatus::ApprovalInvalid,
+                    error_code: Some(APPROVAL_INVALID),
                     result: JsonValue::Null,
                     logs: Vec::new(),
                     pending_approvals: Vec::new(),
                     error: Some(format!(
-                        "Suspended execution frame '{}' not found in WalRegistryStore",
+                        "Approval continuation frame '{}' not found or expired (-32038 APPROVAL_INVALID)",
                         execution_id
                     )),
                     boot_parse_us: 0,
@@ -1150,6 +1191,42 @@ impl MCPProxyGateway {
                 };
             }
         };
+
+        // Verify approval signature, expiry, and single-use semantics (-32038 APPROVAL_INVALID)
+        if let Err(reason) = frame.verify_approval(
+            "omni-secret-key",
+            approver,
+            Some(&frame.pending_arguments),
+            crate::logging::now_epoch_secs(),
+        ) {
+            return CodeOutput {
+                status: FeatureStatus::ApprovalInvalid.as_str().to_string(),
+                feature_status: FeatureStatus::ApprovalInvalid,
+                error_code: Some(APPROVAL_INVALID),
+                result: JsonValue::Null,
+                logs: frame.logs,
+                pending_approvals: Vec::new(),
+                error: Some(format!(
+                    "Approval verification failed (-32038 APPROVAL_INVALID): {}",
+                    reason
+                )),
+                boot_parse_us: 0,
+                eval_us: 0,
+                ops_consumed: 0,
+                peak_memory_bytes: 0,
+                tool_calls: 0,
+                intermediate_bytes_processed: 0,
+                output_bytes_returned: 0,
+                traceparent: codemode_traceparent,
+                execution_id: Some(execution_id.to_string()),
+                suspended_frame: None,
+                saga_compensations: Vec::new(),
+                vectorized_pushdowns: 0,
+                rows_scanned_vectorized: 0,
+                auto_parallel_waves: 0,
+                parallelized_tool_calls: 0,
+            };
+        }
 
         // Verify SHA-256 script integrity before resuming
         let actual_hash = sha256_hex(frame.script_source.as_bytes());
@@ -1195,8 +1272,11 @@ impl MCPProxyGateway {
             );
         }
 
-        // Remove the consumed frame so it cannot be replayed twice
-        let _ = self.cache.registry.delete_suspended_frame(execution_id);
+        // Mark the frame as consumed in WAL so replay is rejected with -32038 APPROVAL_INVALID
+        let mut consumed_frame = frame.clone();
+        consumed_frame.is_consumed = true;
+        consumed_frame.approver_identity = Some(approver.to_string());
+        self.cache.registry.save_suspended_frame(consumed_frame);
 
         let servers_snapshot = self.cache.list_servers();
         let mut initial_completed = frame.completed_mutations.clone();
@@ -1401,7 +1481,9 @@ impl MCPProxyGateway {
                     user_token,
                     "00-00000000000000000000000000000001-0000000000000001-01",
                 );
+                let key = format!("saga_dst_{}_{}", completed.server_name, completed.tool_name);
                 comps.pop().unwrap_or(SagaCompensationRecord {
+                    idempotency_key: key,
                     forward_server: completed.server_name.clone(),
                     forward_tool: completed.tool_name.clone(),
                     compensating_server: completed.server_name.clone(),
@@ -1537,6 +1619,65 @@ mod tests {
             readme.contains(&format!("v{}", major_minor)),
             "README.md must reference current major.minor version v{}",
             major_minor
+        );
+
+        // v2: every pinned release download URL in README must be the current version.
+        let needle = "/releases/download/v";
+        let mut seen = 0;
+        for (idx, _) in readme.match_indices(needle) {
+            let tail = &readme[idx + needle.len()..];
+            let ver: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            assert_eq!(
+                ver, cargo_ver,
+                "README.md download link pins {} but Cargo.toml is {}",
+                ver, cargo_ver
+            );
+            seen += 1;
+        }
+        assert!(seen > 0, "README.md must contain release download links");
+
+        // v2: Dockerfile image label.
+        let dockerfile =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Dockerfile"))
+                .expect("Must read Dockerfile");
+        assert!(
+            dockerfile.contains(&format!(
+                "org.opencontainers.image.version=\"{}\"",
+                cargo_ver
+            )),
+            "Dockerfile image version label must match Cargo.toml version {}",
+            cargo_ver
+        );
+
+        // v2: npm wrapper must single-source its version from package.json.
+        let wrapper =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/bin/omni-mcp.js"))
+                .expect("Must read bin/omni-mcp.js");
+        assert!(
+            wrapper.contains("require('../package.json').version"),
+            "npm wrapper must derive VERSION from package.json"
+        );
+
+        // v2: Cargo.lock root package entry.
+        let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock"))
+            .expect("Must read Cargo.lock")
+            .replace("\r\n", "\n");
+        assert!(
+            lock.contains(&format!("name = \"omni-mcp\"\nversion = \"{}\"", cargo_ver)),
+            "Cargo.lock root package version must match Cargo.toml"
+        );
+
+        // v2: docs/ must carry release notes for the current version.
+        let notes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join(format!("RELEASE_v{}.md", cargo_ver));
+        assert!(
+            notes.exists(),
+            "docs/RELEASE_v{}.md must exist for the current version",
+            cargo_ver
         );
     }
 }

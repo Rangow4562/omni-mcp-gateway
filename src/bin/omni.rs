@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `omni` CLI Binary Entrypoint (Code Mode & Benchmark CLI).
 
 use omni_mcp::extension::run_aifx_cli;

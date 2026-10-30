@@ -15,8 +15,9 @@
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
-    generate_ulid, FeatureStatus, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame,
-    ToolStatus, APPROVAL_REQUIRED, FUEL_EXHAUSTED, INTERNAL_ERROR, OUTBOUND_BLOCKED,
+    generate_ulid, FeatureStatus, SagaCompensationRecord, SchemaViolation, ServerRecord,
+    SuspendedExecutionFrame, ToolStatus, APPROVAL_REQUIRED, FUEL_EXHAUSTED, INTERNAL_ERROR,
+    MEMORY_EXHAUSTED, OUTBOUND_BLOCKED, SCHEMA_PREFLIGHT_FAILED, TIMEOUT,
 };
 use crate::storage::audit_log::sha256_hex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,6 +36,10 @@ pub struct SandboxLimits {
     pub max_memory_bytes: usize,
     /// Maximum downstream tool invocations per script execution. Default: 64.
     pub max_host_calls: usize,
+    /// Maximum wall-clock execution time in milliseconds before terminating (`Timeout`). Default: 10,000 ms.
+    pub max_execution_time_ms: u64,
+    /// Maximum concurrent tool calls in a single `ParallelWave`. Default: 8.
+    pub max_parallel_threads: usize,
 }
 
 impl Default for SandboxLimits {
@@ -45,6 +50,8 @@ impl Default for SandboxLimits {
             max_expr_depth: 20,
             max_memory_bytes: 16 * 1024 * 1024,
             max_host_calls: 64,
+            max_execution_time_ms: 10_000,
+            max_parallel_threads: 8,
         }
     }
 }
@@ -762,6 +769,8 @@ pub enum CodeModeError {
     CallDepthExceeded(usize),
     ExprDepthExceeded(usize),
     MemoryLimitExceeded(usize, usize),
+    Timeout(u64),
+    SchemaPreflightFailed(Vec<SchemaViolation>),
     MaxHostCallsExceeded(usize),
     GlobalOutboundBlocked(String),
     ApprovalRequired(PendingApproval),
@@ -772,6 +781,9 @@ impl CodeModeError {
     pub fn feature_status(&self) -> FeatureStatus {
         match self {
             Self::FuelExhausted(_) => FeatureStatus::FuelExhausted,
+            Self::MemoryLimitExceeded(_, _) => FeatureStatus::MemoryExhausted,
+            Self::Timeout(_) => FeatureStatus::Timeout,
+            Self::SchemaPreflightFailed(_) => FeatureStatus::SchemaPreflightFailed,
             Self::GlobalOutboundBlocked(_) => FeatureStatus::OutboundBlocked,
             Self::ApprovalRequired(_) => FeatureStatus::ApprovalRequired,
             _ => FeatureStatus::Error,
@@ -781,6 +793,10 @@ impl CodeModeError {
     pub fn error_code(&self) -> i32 {
         match self {
             Self::FuelExhausted(_) => FUEL_EXHAUSTED,
+            Self::MemoryLimitExceeded(_, _) => MEMORY_EXHAUSTED,
+            Self::Timeout(_) => TIMEOUT,
+            Self::SchemaPreflightFailed(_) => SCHEMA_PREFLIGHT_FAILED,
+            Self::CallDepthExceeded(_) | Self::ExprDepthExceeded(_) => FUEL_EXHAUSTED,
             Self::GlobalOutboundBlocked(_) => OUTBOUND_BLOCKED,
             Self::ApprovalRequired(_) => APPROVAL_REQUIRED,
             _ => INTERNAL_ERROR,
@@ -804,6 +820,15 @@ impl CodeModeError {
             Self::MemoryLimitExceeded(used, max) => format!(
                 "MemoryLimitExceeded: Script memory allocation ({} bytes) exceeded cap ({} bytes)",
                 used, max
+            ),
+            Self::Timeout(max_ms) => format!(
+                "Timeout: Script execution exceeded maximum wall-clock deadline ({} ms)",
+                max_ms
+            ),
+            Self::SchemaPreflightFailed(violations) => format!(
+                "SchemaPreflightFailed: {} argument violations detected (-32035 SCHEMA_PREFLIGHT_FAILED): {:?}",
+                violations.len(),
+                violations
             ),
             Self::MaxHostCallsExceeded(max) => format!(
                 "MaxHostCallsExceeded: Script exceeded maximum allowed downstream tool calls ({})",
@@ -2706,6 +2731,7 @@ impl CodeModeExecutor {
         let mut vm = VmState {
             env: BTreeMap::new(),
             limits: &self.limits,
+            start_time: t_eval,
             ops_consumed: 0,
             call_depth: 0,
             peak_memory_bytes: 0,
@@ -2721,7 +2747,24 @@ impl CodeModeExecutor {
             parallelized_tool_calls: 0,
         };
 
-        match vm.eval_block(&stmts, host) {
+        let eval_res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.eval_block(&stmts, host)));
+
+        let eval_block_res = match eval_res {
+            Ok(res) => res,
+            Err(panic_payload) => {
+                let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    format!("Panic: {}", s)
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    format!("Panic: {}", s)
+                } else {
+                    "Panic: script execution panicked".to_string()
+                };
+                Err(CodeModeError::RuntimeError(panic_msg))
+            }
+        };
+
+        match eval_block_res {
             Ok((val, _cf)) => {
                 let eval_us = t_eval.elapsed().as_micros() as u64;
                 let output_bytes = val.to_string_compact().len();
@@ -2757,7 +2800,11 @@ impl CodeModeExecutor {
                 for (k, v) in &vm.env {
                     scope_obj.insert(k.clone(), v.clone());
                 }
-                let frame = SuspendedExecutionFrame {
+                let pending_args_hash =
+                    sha256_hex(pending.arguments.to_string_compact().as_bytes());
+                let created_at = now_epoch_secs();
+                let expires_at = created_at + 3600.0;
+                let mut frame = SuspendedExecutionFrame {
                     execution_id: exec_ulid.clone(),
                     script_hash: sha256_hex(code.as_bytes()),
                     script_source: code.to_string(),
@@ -2772,8 +2819,14 @@ impl CodeModeExecutor {
                     caller_actor: "agent".to_string(),
                     logs: vm.logs.clone(),
                     completed_mutations: Vec::new(),
-                    created_at: now_epoch_secs(),
+                    created_at,
+                    pending_arguments_hash: pending_args_hash,
+                    expires_at,
+                    approver_identity: None,
+                    is_consumed: false,
+                    frame_hmac: String::new(),
                 };
+                frame.frame_hmac = frame.compute_hmac("omni-secret-key");
                 CodeOutput {
                     status: FeatureStatus::ApprovalRequired.as_str().to_string(),
                     feature_status: FeatureStatus::ApprovalRequired,
@@ -2958,6 +3011,7 @@ impl CodeModeExecutor {
         let mut vm = VmState {
             env,
             limits: &self.limits,
+            start_time: Instant::now(),
             ops_consumed: 1,
             call_depth: 0,
             peak_memory_bytes: 0,
@@ -2976,7 +3030,22 @@ impl CodeModeExecutor {
         let eval_res = if remaining_stmts.is_empty() {
             Ok((approved_mutation_output, ControlFlow::Return))
         } else {
-            vm.eval_block(remaining_stmts, host)
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                vm.eval_block(remaining_stmts, host)
+            }));
+            match res {
+                Ok(r) => r,
+                Err(panic_payload) => {
+                    let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        format!("Panic: {}", s)
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        format!("Panic: {}", s)
+                    } else {
+                        "Panic: script execution panicked".to_string()
+                    };
+                    Err(CodeModeError::RuntimeError(panic_msg))
+                }
+            }
         };
 
         match eval_res {
@@ -3042,6 +3111,7 @@ impl CodeModeExecutor {
 struct VmState<'a> {
     env: BTreeMap<String, JsonValue>,
     limits: &'a SandboxLimits,
+    start_time: Instant,
     ops_consumed: u64,
     call_depth: usize,
     peak_memory_bytes: usize,
@@ -3063,6 +3133,9 @@ impl<'a> VmState<'a> {
         self.ops_consumed += cost;
         if self.ops_consumed > self.limits.max_operations {
             return Err(CodeModeError::FuelExhausted(self.limits.max_operations));
+        }
+        if self.start_time.elapsed().as_millis() as u64 > self.limits.max_execution_time_ms {
+            return Err(CodeModeError::Timeout(self.limits.max_execution_time_ms));
         }
         Ok(())
     }
@@ -3160,31 +3233,34 @@ impl<'a> VmState<'a> {
                     }
                     self.burn_fuel((tasks.len() as u64) * 10)?;
 
-                    let mut batch_requests = Vec::with_capacity(tasks.len());
-                    for task in tasks {
-                        let mut evaluated_args = Vec::with_capacity(task.args.len());
-                        for a in &task.args {
-                            evaluated_args.push(self.eval_expr(a, host)?);
+                    let chunk_size = self.limits.max_parallel_threads.max(1);
+                    for chunk in tasks.chunks(chunk_size) {
+                        let mut batch_requests = Vec::with_capacity(chunk.len());
+                        for task in chunk {
+                            let mut evaluated_args = Vec::with_capacity(task.args.len());
+                            for a in &task.args {
+                                evaluated_args.push(self.eval_expr(a, host)?);
+                            }
+                            batch_requests.push((
+                                task.server_name.clone(),
+                                task.tool_name.clone(),
+                                evaluated_args,
+                            ));
                         }
-                        batch_requests.push((
-                            task.server_name.clone(),
-                            task.tool_name.clone(),
-                            evaluated_args,
-                        ));
-                    }
 
-                    let results = (host.invoke_parallel_batch)(batch_requests)?;
-                    self.auto_parallel_waves += 1;
-                    self.parallelized_tool_calls += tasks.len();
+                        let results = (host.invoke_parallel_batch)(batch_requests)?;
+                        self.auto_parallel_waves += 1;
+                        self.parallelized_tool_calls += chunk.len();
 
-                    for (task, resp) in tasks.iter().zip(results) {
-                        let resp_bytes = resp.to_string_compact().len();
-                        self.intermediate_bytes_processed += resp_bytes;
-                        self.check_memory(resp_bytes)?;
-                        if let Some(ref var_name) = task.target_var {
-                            self.env.insert(var_name.clone(), resp.clone());
+                        for (task, resp) in chunk.iter().zip(results) {
+                            let resp_bytes = resp.to_string_compact().len();
+                            self.intermediate_bytes_processed += resp_bytes;
+                            self.check_memory(resp_bytes)?;
+                            if let Some(ref var_name) = task.target_var {
+                                self.env.insert(var_name.clone(), resp.clone());
+                            }
+                            last_val = resp;
                         }
-                        last_val = resp;
                     }
                 }
                 Stmt::If {
@@ -4370,5 +4446,168 @@ mod tests {
         assert_eq!(spec.routing_mode, "ZERO_TURN_SPECULATIVE");
         assert!(spec.confidence_score >= 0.80);
         assert!(spec.typescript_declarations.contains("issue_refund"));
+    }
+
+    #[test]
+    fn test_sandbox_memory_exhaustion_returns_32036_error_contract() {
+        let limits = SandboxLimits {
+            max_memory_bytes: 200,
+            ..Default::default()
+        };
+        let script = r#"
+        async () => {
+            let big_str = "a very long string that will easily exceed the two hundred byte allocation limit configured for this sandbox execution test run";
+            let arr = [big_str, big_str, big_str, big_str];
+            return arr;
+        }
+        "#;
+        let out = run_noop_script(script, limits);
+        assert_eq!(out.error_code, Some(MEMORY_EXHAUSTED));
+        assert_eq!(out.feature_status, FeatureStatus::MemoryExhausted);
+        assert!(out.error.unwrap().contains("MemoryLimitExceeded"));
+    }
+
+    #[test]
+    fn test_sandbox_wallclock_timeout_returns_32037_error_contract() {
+        let limits = SandboxLimits {
+            max_execution_time_ms: 1,
+            max_operations: 1_000_000,
+            ..Default::default()
+        };
+        let script = r#"
+        async () => {
+            let mut sum = 0;
+            let mut i = 0;
+            while (i < 50000) {
+                sum = sum + i;
+                i = i + 1;
+            }
+            return sum;
+        }
+        "#;
+        let out = run_noop_script(script, limits);
+        assert_eq!(out.error_code, Some(TIMEOUT));
+        assert_eq!(out.feature_status, FeatureStatus::Timeout);
+        assert!(out.error.unwrap().contains("Timeout"));
+    }
+
+    #[test]
+    fn test_sandbox_panic_containment_does_not_abort_process() {
+        let limits = SandboxLimits::default();
+        let mut invoke_cb =
+            |_srv: &str, _tool: &str, _args: Vec<JsonValue>| -> Result<JsonValue, CodeModeError> {
+                panic!("intentional host callback panic to test sandbox containment");
+            };
+        let mut parallel_cb =
+            |_calls: Vec<(String, String, Vec<JsonValue>)>| -> Result<Vec<JsonValue>, CodeModeError> {
+                Ok(Vec::new())
+            };
+        let search_cb = |_q: &str| JsonValue::Array(Vec::new());
+        let describe_cb = |_s: &str, _t: Option<&str>| String::new();
+        let mut host = HostCallbacks {
+            invoke_tool: &mut invoke_cb,
+            invoke_parallel_batch: &mut parallel_cb,
+            search_catalog: &search_cb,
+            describe_types: &describe_cb,
+        };
+        let script = r#"
+        async () => {
+            const res = await codemode.orders.get_order({ id: "ord_1" });
+            return res;
+        }
+        "#;
+        let out = CodeModeExecutor::new(limits).execute(
+            script,
+            &mut host,
+            "00-00000000000000000000000000000001-0000000000000001-01",
+        );
+        assert_eq!(out.feature_status, FeatureStatus::Error);
+        assert_eq!(out.error_code, Some(INTERNAL_ERROR));
+        assert!(out.error.unwrap().contains("Panic:"));
+    }
+
+    #[test]
+    fn test_physical_expr_vectorized_vs_row_by_row_differential() {
+        // Generate diverse dataset of 100 rows
+        let mut raw_rows = Vec::new();
+        for i in 0..100 {
+            let score = ((i * 17) % 100) as f64;
+            let tier = if i % 3 == 0 {
+                "gold"
+            } else if i % 3 == 1 {
+                "silver"
+            } else {
+                "bronze"
+            };
+            let active = i % 2 == 0;
+            raw_rows.push(json!({
+                "id": format!("row_{}", i),
+                "score": score,
+                "tier": tier,
+                "active": active
+            }));
+        }
+
+        // Expected results evaluated row-by-row in Rust
+        let expected: Vec<JsonValue> = raw_rows
+            .iter()
+            .filter(|r| {
+                let score = r["score"].as_f64().unwrap();
+                let tier = r["tier"].as_str().unwrap();
+                let active = r["active"].as_bool().unwrap();
+                (score >= 50.0 && tier == "gold") || active
+            })
+            .cloned()
+            .collect();
+
+        // Vectorized pushdown evaluated via CodeMode
+        let script = format!(
+            r#"
+            async () => {{
+                const rows = {};
+                return rows.filter(r => (r.score >= 50.0 && r.tier == "gold") || r.active == true);
+            }}
+            "#,
+            JsonValue::Array(raw_rows).to_string_compact()
+        );
+
+        let out = run_noop_script(&script, SandboxLimits::default());
+        assert_eq!(out.status, "OK");
+        assert!(
+            out.vectorized_pushdowns > 0,
+            "Expected vectorized pushdown execution"
+        );
+        let actual = out.result.as_array().expect("Result must be an array");
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "Differential row count mismatch"
+        );
+        for (i, (act, exp)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                act["id"].as_str(),
+                exp["id"].as_str(),
+                "Row {} ID mismatch",
+                i
+            );
+            assert_eq!(
+                act["score"].as_f64(),
+                exp["score"].as_f64(),
+                "Row {} score mismatch",
+                i
+            );
+            assert_eq!(
+                act["tier"].as_str(),
+                exp["tier"].as_str(),
+                "Row {} tier mismatch",
+                i
+            );
+            assert_eq!(
+                act["active"].as_bool(),
+                exp["active"].as_bool(),
+                "Row {} active mismatch",
+                i
+            );
+        }
     }
 }

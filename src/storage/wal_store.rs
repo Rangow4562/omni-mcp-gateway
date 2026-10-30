@@ -2,7 +2,7 @@
 //! Provides ACID-like crash-safe persistence with FNV-1a checksum integrity and automatic WAL compaction.
 
 use crate::json::JsonValue;
-use crate::models::{ConfigDiff, ServerRecord, SuspendedExecutionFrame};
+use crate::models::{ConfigDiff, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -13,6 +13,7 @@ struct StoreState {
     servers: BTreeMap<String, ServerRecord>,
     diffs: BTreeMap<String, ConfigDiff>,
     suspended_frames: BTreeMap<String, SuspendedExecutionFrame>,
+    saga_compensations: BTreeMap<String, SagaCompensationRecord>,
     wal_entries_since_compact: usize,
 }
 
@@ -33,6 +34,7 @@ impl WalRegistryStore {
                 servers: BTreeMap::new(),
                 diffs: BTreeMap::new(),
                 suspended_frames: BTreeMap::new(),
+                saga_compensations: BTreeMap::new(),
                 wal_entries_since_compact: 0,
             }),
         };
@@ -85,6 +87,15 @@ impl WalRegistryStore {
                             }
                         }
                     }
+                    if let Some(comps) = val.get("saga_compensations").and_then(|c| c.as_array()) {
+                        for c_val in comps {
+                            if let Some(comp) = SagaCompensationRecord::from_json(c_val) {
+                                guard
+                                    .saga_compensations
+                                    .insert(comp.idempotency_key.clone(), comp);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -130,6 +141,24 @@ impl WalRegistryStore {
                                         if let Some(id) = entry.get("data").and_then(|d| d.as_str())
                                         {
                                             guard.suspended_frames.remove(id);
+                                        }
+                                    } else if op == "SAVE_SAGA_COMPENSATION" {
+                                        if let Some(c_val) = entry.get("data") {
+                                            if let Some(comp) =
+                                                SagaCompensationRecord::from_json(c_val)
+                                            {
+                                                guard
+                                                    .saga_compensations
+                                                    .insert(comp.idempotency_key.clone(), comp);
+                                            }
+                                        }
+                                    } else if op == "COMPLETE_SAGA_COMPENSATION" {
+                                        if let Some(key) = entry
+                                            .get("data")
+                                            .or_else(|| entry.get("key"))
+                                            .and_then(|k| k.as_str())
+                                        {
+                                            guard.saga_compensations.remove(key);
                                         }
                                     }
                                 }
@@ -186,11 +215,17 @@ impl WalRegistryStore {
             .values()
             .map(|f| f.to_json())
             .collect();
+        let comps_arr: Vec<JsonValue> = state
+            .saga_compensations
+            .values()
+            .map(|c| c.to_json())
+            .collect();
         let snapshot = json!({
             "engine": concat!("omni-rust-wal-v", env!("CARGO_PKG_VERSION")),
             "servers": JsonValue::Array(servers_arr),
             "diffs": JsonValue::Array(diffs_arr),
             "suspended_frames": JsonValue::Array(frames_arr),
+            "saga_compensations": JsonValue::Array(comps_arr),
         });
         let tmp_path = format!("{}.tmp", self.db_path);
         if fs::write(&tmp_path, snapshot.to_string_compact()).is_ok() {
@@ -260,7 +295,33 @@ impl WalRegistryStore {
 
     pub fn list_suspended_frames(&self) -> Vec<SuspendedExecutionFrame> {
         let guard = self.state.read().unwrap();
-        guard.suspended_frames.values().cloned().collect()
+        guard
+            .suspended_frames
+            .values()
+            .filter(|f| !f.is_consumed)
+            .cloned()
+            .collect()
+    }
+    pub fn save_saga_compensation(&self, comp: &SagaCompensationRecord) {
+        let key = comp.idempotency_key.clone();
+        let mut guard = self.state.write().unwrap();
+        guard.saga_compensations.insert(key, comp.clone());
+        self.append_wal_and_maybe_compact("SAVE_SAGA_COMPENSATION", comp.to_json(), &mut guard);
+    }
+
+    pub fn complete_saga_compensation(&self, idempotency_key: &str) {
+        let mut guard = self.state.write().unwrap();
+        guard.saga_compensations.remove(idempotency_key);
+        self.append_wal_and_maybe_compact(
+            "COMPLETE_SAGA_COMPENSATION",
+            JsonValue::from(idempotency_key),
+            &mut guard,
+        );
+    }
+
+    pub fn list_pending_saga_compensations(&self) -> Vec<SagaCompensationRecord> {
+        let guard = self.state.read().unwrap();
+        guard.saga_compensations.values().cloned().collect()
     }
 
     pub fn close(&self) {
@@ -307,6 +368,11 @@ mod tests {
                 compensation_spec: None,
             }],
             created_at: 1700000000.0,
+            pending_arguments_hash: "abc".to_string(),
+            expires_at: 1700003600.0,
+            approver_identity: None,
+            is_consumed: false,
+            frame_hmac: "hmac".to_string(),
         };
 
         {

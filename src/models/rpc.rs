@@ -14,6 +14,7 @@ pub const INTERNAL_ERROR: i32 = -32603;
 // MCP & Enterprise Gateway Specific Error Codes (-320xx Authoritative Contract)
 pub const UNAUTHORIZED: i32 = -32001;
 pub const TOOL_DISABLED: i32 = -32002;
+pub const TOOL_DISABLED_LEGACY: i32 = -32002;
 pub const DOWNSTREAM_ERROR: i32 = -32003;
 pub const RATE_LIMITED: i32 = -32029;
 pub const CIRCUIT_OPEN: i32 = -32030;
@@ -22,21 +23,105 @@ pub const FUEL_EXHAUSTED: i32 = -32032;
 pub const OUTBOUND_BLOCKED: i32 = -32033;
 pub const SAGA_COMPENSATED: i32 = -32034;
 pub const SCHEMA_PREFLIGHT_FAILED: i32 = -32035;
+/// Script exceeded the sandbox memory budget (v4.7 roadmap M5; numbering proposed).
+pub const MEMORY_EXHAUSTED: i32 = -32036;
+/// Script exceeded the sandbox wall-clock limit (v4.7 roadmap M5; numbering proposed).
+pub const TIMEOUT: i32 = -32037;
+/// Approval expired, replayed, argument-mismatched, or unauthenticated (v4.7 roadmap M4; numbering proposed).
+pub const APPROVAL_INVALID: i32 = -32038;
 
 // Supported MCP Protocol Versions for Lifecycle Handshake Negotiation
 pub const LEGACY_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 pub const LATEST_MCP_PROTOCOL_VERSION: &str = "2025-03-26";
-pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
-    &[LEGACY_MCP_PROTOCOL_VERSION, LATEST_MCP_PROTOCOL_VERSION];
+
+/// Per-revision MCP behavior. Protocol behavior is driven by this table rather than by
+/// scattered version string comparisons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProtocolCapabilities {
+    /// Revision identifier as sent on the wire.
+    pub version: &'static str,
+    /// Whether this gateway currently implements the revision. Rows with `implemented: false`
+    /// are roadmap placeholders and are never offered during negotiation.
+    pub implemented: bool,
+    /// `true` for `initialize`-based session revisions, `false` for the stateless revision.
+    pub session_based: bool,
+    /// JSON-RPC array batching is permitted (removed by later revisions).
+    pub allows_batching: bool,
+    /// Tool `title`, `outputSchema`/`structuredContent`, and resource links in tool results.
+    pub structured_tool_output: bool,
+    /// Resource-not-found is reported as `-32602` rather than `-32002`.
+    pub resource_not_found_is_invalid_params: bool,
+}
+
+/// Capability table for every MCP revision this gateway knows about, oldest first.
+pub const PROTOCOL_CAPABILITY_TABLE: &[ProtocolCapabilities] = &[
+    ProtocolCapabilities {
+        version: "2024-11-05",
+        implemented: true,
+        session_based: true,
+        allows_batching: true,
+        structured_tool_output: false,
+        resource_not_found_is_invalid_params: false,
+    },
+    ProtocolCapabilities {
+        version: "2025-03-26",
+        implemented: true,
+        session_based: true,
+        allows_batching: true,
+        structured_tool_output: false,
+        resource_not_found_is_invalid_params: false,
+    },
+    ProtocolCapabilities {
+        version: "2025-06-18",
+        implemented: true,
+        session_based: true,
+        allows_batching: false,
+        structured_tool_output: true,
+        resource_not_found_is_invalid_params: false,
+    },
+    ProtocolCapabilities {
+        version: "2025-11-25",
+        implemented: true,
+        session_based: true,
+        allows_batching: false,
+        structured_tool_output: true,
+        resource_not_found_is_invalid_params: false,
+    },
+    ProtocolCapabilities {
+        version: "2026-07-28",
+        implemented: true,
+        session_based: false,
+        allows_batching: false,
+        structured_tool_output: true,
+        resource_not_found_is_invalid_params: true,
+    },
+];
+
+/// Revisions the gateway can actually negotiate today.
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-07-28",
+];
+
+/// Looks up the capability row for a revision identifier (implemented or not).
+pub fn protocol_capabilities(version: &str) -> Option<&'static ProtocolCapabilities> {
+    let version = version.trim();
+    PROTOCOL_CAPABILITY_TABLE
+        .iter()
+        .find(|caps| caps.version == version)
+}
 
 /// Negotiates the MCP protocol version during `initialize`.
-/// Echoes the client's requested `protocolVersion` if it is in `SUPPORTED_MCP_PROTOCOL_VERSIONS`;
+/// Echoes the client's requested `protocolVersion` if the gateway implements it;
 /// otherwise responds with `LATEST_MCP_PROTOCOL_VERSION` (`"2025-03-26"`).
 pub fn negotiate_protocol_version(client_version: Option<&str>) -> &'static str {
     if let Some(req_ver) = client_version {
-        for &supported in SUPPORTED_MCP_PROTOCOL_VERSIONS {
-            if req_ver.trim() == supported {
-                return supported;
+        if let Some(caps) = protocol_capabilities(req_ver) {
+            if caps.implemented {
+                return caps.version;
             }
         }
     }
@@ -55,6 +140,9 @@ pub enum FeatureStatus {
     SagaRolledBack,
     CircuitOpen,
     SchemaPreflightFailed,
+    MemoryExhausted,
+    Timeout,
+    ApprovalInvalid,
 }
 
 impl FeatureStatus {
@@ -68,6 +156,9 @@ impl FeatureStatus {
             FeatureStatus::SagaRolledBack => "SAGA_ROLLED_BACK",
             FeatureStatus::CircuitOpen => "CIRCUIT_OPEN",
             FeatureStatus::SchemaPreflightFailed => "SCHEMA_PREFLIGHT_FAILED",
+            FeatureStatus::MemoryExhausted => "MEMORY_EXHAUSTED",
+            FeatureStatus::Timeout => "TIMEOUT",
+            FeatureStatus::ApprovalInvalid => "APPROVAL_INVALID",
         }
     }
 
@@ -81,6 +172,9 @@ impl FeatureStatus {
             "SAGA_ROLLED_BACK" | "SAGA_COMPENSATED" => FeatureStatus::SagaRolledBack,
             "CIRCUIT_OPEN" => FeatureStatus::CircuitOpen,
             "SCHEMA_PREFLIGHT_FAILED" => FeatureStatus::SchemaPreflightFailed,
+            "MEMORY_EXHAUSTED" | "MemoryExhausted" => FeatureStatus::MemoryExhausted,
+            "TIMEOUT" | "Timeout" => FeatureStatus::Timeout,
+            "APPROVAL_INVALID" | "ApprovalInvalid" => FeatureStatus::ApprovalInvalid,
             _ => FeatureStatus::Error,
         }
     }
@@ -95,6 +189,9 @@ impl FeatureStatus {
             FeatureStatus::SagaRolledBack => Some(SAGA_COMPENSATED),
             FeatureStatus::CircuitOpen => Some(CIRCUIT_OPEN),
             FeatureStatus::SchemaPreflightFailed => Some(SCHEMA_PREFLIGHT_FAILED),
+            FeatureStatus::MemoryExhausted => Some(MEMORY_EXHAUSTED),
+            FeatureStatus::Timeout => Some(TIMEOUT),
+            FeatureStatus::ApprovalInvalid => Some(APPROVAL_INVALID),
         }
     }
 }
@@ -259,5 +356,92 @@ impl RPCResponse {
             );
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod protocol_table_tests {
+    use super::*;
+
+    #[test]
+    fn capability_table_lists_all_five_revisions_in_order() {
+        let versions: Vec<&str> = PROTOCOL_CAPABILITY_TABLE
+            .iter()
+            .map(|c| c.version)
+            .collect();
+        assert_eq!(
+            versions,
+            [
+                "2024-11-05",
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25",
+                "2026-07-28"
+            ]
+        );
+    }
+
+    #[test]
+    fn supported_versions_match_implemented_rows() {
+        let implemented: Vec<&str> = PROTOCOL_CAPABILITY_TABLE
+            .iter()
+            .filter(|c| c.implemented)
+            .map(|c| c.version)
+            .collect();
+        assert_eq!(implemented, SUPPORTED_MCP_PROTOCOL_VERSIONS);
+    }
+
+    #[test]
+    fn negotiation_never_offers_unimplemented_revisions() {
+        for caps in PROTOCOL_CAPABILITY_TABLE.iter().filter(|c| !c.implemented) {
+            assert_eq!(
+                negotiate_protocol_version(Some(caps.version)),
+                LATEST_MCP_PROTOCOL_VERSION,
+                "{} is not implemented and must fall back to the latest implemented revision",
+                caps.version
+            );
+        }
+        assert_eq!(
+            negotiate_protocol_version(Some(" 2024-11-05 ")),
+            "2024-11-05"
+        );
+        assert_eq!(
+            negotiate_protocol_version(None),
+            LATEST_MCP_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn only_the_stateless_revision_is_sessionless() {
+        let stateless: Vec<&str> = PROTOCOL_CAPABILITY_TABLE
+            .iter()
+            .filter(|c| !c.session_based)
+            .map(|c| c.version)
+            .collect();
+        assert_eq!(stateless, ["2026-07-28"]);
+        assert!(protocol_capabilities("2099-01-01").is_none());
+    }
+
+    #[test]
+    fn gateway_error_block_is_contiguous_and_unique() {
+        let codes = [
+            RATE_LIMITED,
+            CIRCUIT_OPEN,
+            APPROVAL_REQUIRED,
+            FUEL_EXHAUSTED,
+            OUTBOUND_BLOCKED,
+            SAGA_COMPENSATED,
+            SCHEMA_PREFLIGHT_FAILED,
+            MEMORY_EXHAUSTED,
+            TIMEOUT,
+            APPROVAL_INVALID,
+        ];
+        for (i, code) in codes.iter().enumerate() {
+            assert_eq!(
+                *code,
+                -32029 - i as i32,
+                "gateway block must stay contiguous"
+            );
+        }
     }
 }

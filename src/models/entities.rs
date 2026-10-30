@@ -48,7 +48,32 @@ pub fn format_traceparent(trace_id: &str, span_id: &str) -> String {
     format!("00-{}-{}-01", trace_id, span_id)
 }
 
-/// Generates a 26-character Crockford Base32 ULID (48-bit ms timestamp + 80-bit monotonic entropy).
+/// Gathers OS/system entropy from system time, thread ID, process ID, monotonic clock, and ASLR pointers.
+/// Never uses the Deterministic Simulation Testing (DST) Xoshiro256StarStar chaos generator.
+fn gather_entropy(dest: &mut [u8]) {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let local_var = 42usize;
+    let stack_addr = &local_var as *const usize as usize;
+
+    let mut mixed = Vec::new();
+    mixed.extend_from_slice(&now.to_be_bytes());
+    mixed.extend_from_slice(&pid.to_be_bytes());
+    mixed.extend_from_slice(thread_id.as_bytes());
+    mixed.extend_from_slice(&stack_addr.to_be_bytes());
+    mixed.extend_from_slice(&TRACE_COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+
+    let hash = crate::storage::audit_log::sha256(&mixed);
+    let len = dest.len().min(32);
+    dest[..len].copy_from_slice(&hash[..len]);
+}
+
+/// Generates a 26-character Crockford Base32 ULID (48-bit ms timestamp + 80-bit monotonic OS entropy).
 pub fn generate_ulid() -> String {
     const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     use std::time::SystemTime;
@@ -56,14 +81,30 @@ pub fn generate_ulid() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let seq = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
 
-    let entropy_hi = nanos.wrapping_mul(0x9e3779b97f4a7c15) ^ seq.wrapping_mul(0xbf58476d1ce4e5b9);
-    let entropy_lo = seq.wrapping_mul(0x94d049bb133111eb) ^ now_ms.rotate_left(17);
+    let mut entropy_bytes = [0u8; 16];
+    gather_entropy(&mut entropy_bytes);
+
+    let entropy_hi = u64::from_be_bytes([
+        entropy_bytes[0],
+        entropy_bytes[1],
+        entropy_bytes[2],
+        entropy_bytes[3],
+        entropy_bytes[4],
+        entropy_bytes[5],
+        entropy_bytes[6],
+        entropy_bytes[7],
+    ]);
+    let entropy_lo = u64::from_be_bytes([
+        entropy_bytes[8],
+        entropy_bytes[9],
+        entropy_bytes[10],
+        entropy_bytes[11],
+        entropy_bytes[12],
+        entropy_bytes[13],
+        entropy_bytes[14],
+        entropy_bytes[15],
+    ]);
 
     let mut out = [b'0'; 26];
     // 10 chars of 48-bit timestamp
@@ -423,6 +464,7 @@ impl CompletedMutationRecord {
 /// Record of a Saga compensation action executed when a multi-mutation script rolls back.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SagaCompensationRecord {
+    pub idempotency_key: String,
     pub forward_server: String,
     pub forward_tool: String,
     pub compensating_server: String,
@@ -435,6 +477,7 @@ pub struct SagaCompensationRecord {
 impl SagaCompensationRecord {
     pub fn to_json(&self) -> JsonValue {
         json!({
+            "idempotency_key": self.idempotency_key.clone(),
             "forward_server": self.forward_server.clone(),
             "forward_tool": self.forward_tool.clone(),
             "compensating_server": self.compensating_server.clone(),
@@ -442,6 +485,45 @@ impl SagaCompensationRecord {
             "compensating_args": self.compensating_args.clone(),
             "status": self.status.clone(),
             "compensation_output": self.compensation_output.clone(),
+        })
+    }
+
+    pub fn from_json(val: &JsonValue) -> Option<Self> {
+        let forward_server = val.get("forward_server")?.as_str()?.to_string();
+        let forward_tool = val.get("forward_tool")?.as_str()?.to_string();
+        let compensating_server = val.get("compensating_server")?.as_str()?.to_string();
+        let compensating_tool = val.get("compensating_tool")?.as_str()?.to_string();
+        let compensating_args = val
+            .get("compensating_args")
+            .cloned()
+            .unwrap_or(JsonValue::object());
+        let status = val
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("PENDING")
+            .to_string();
+        let compensation_output = val
+            .get("compensation_output")
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+
+        let idempotency_key = val
+            .get("idempotency_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                format!("{}:{}:{}", forward_server, forward_tool, compensating_tool)
+            });
+
+        Some(Self {
+            idempotency_key,
+            forward_server,
+            forward_tool,
+            compensating_server,
+            compensating_tool,
+            compensating_args,
+            status,
+            compensation_output,
         })
     }
 }
@@ -465,9 +547,63 @@ pub struct SuspendedExecutionFrame {
     pub logs: Vec<String>,
     pub completed_mutations: Vec<CompletedMutationRecord>,
     pub created_at: f64,
+    pub pending_arguments_hash: String,
+    pub expires_at: f64,
+    pub approver_identity: Option<String>,
+    pub is_consumed: bool,
+    pub frame_hmac: String,
 }
 
 impl SuspendedExecutionFrame {
+    /// Computes HMAC-SHA256 over canonical frame fields using `auth_secret`.
+    pub fn compute_hmac(&self, secret: &str) -> String {
+        let canonical = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            self.execution_id,
+            self.script_hash,
+            self.instruction_ptr,
+            self.pending_server,
+            self.pending_tool,
+            self.pending_arguments_hash,
+            self.expires_at as u64,
+        );
+        crate::storage::audit_log::hmac_sha256_hex(secret.as_bytes(), canonical.as_bytes())
+    }
+
+    /// Verifies that frame HMAC matches the secret, has not expired, has not been consumed,
+    /// and that resume arguments match `pending_arguments_hash`.
+    pub fn verify_approval(
+        &self,
+        secret: &str,
+        approver: &str,
+        resume_args: Option<&JsonValue>,
+        current_time: f64,
+    ) -> Result<(), &'static str> {
+        if self.is_consumed {
+            return Err("Approval has already been consumed (single-use violated)");
+        }
+        if approver.trim().is_empty() || approver == "anonymous" {
+            return Err("Unauthenticated or empty approver identity");
+        }
+        if current_time > self.expires_at {
+            return Err("Approval frame has expired");
+        }
+        if !self.frame_hmac.is_empty() {
+            let expected_hmac = self.compute_hmac(secret);
+            if self.frame_hmac != expected_hmac {
+                return Err("Frame HMAC signature mismatch (tampering detected)");
+            }
+        }
+        if let Some(args) = resume_args {
+            let actual_args_hash =
+                crate::storage::audit_log::sha256_hex(args.to_string_compact().as_bytes());
+            if actual_args_hash != self.pending_arguments_hash {
+                return Err("Resume arguments do not match original pending arguments hash");
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_json(&self) -> JsonValue {
         let logs_arr: Vec<JsonValue> = self
             .logs
@@ -495,6 +631,11 @@ impl SuspendedExecutionFrame {
             "logs": JsonValue::Array(logs_arr),
             "completed_mutations": JsonValue::Array(muts_arr),
             "created_at": self.created_at,
+            "pending_arguments_hash": self.pending_arguments_hash.clone(),
+            "expires_at": self.expires_at,
+            "approver_identity": self.approver_identity.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "is_consumed": self.is_consumed,
+            "frame_hmac": self.frame_hmac.clone(),
         })
     }
 
@@ -555,6 +696,33 @@ impl SuspendedExecutionFrame {
             .and_then(|x| x.as_f64())
             .unwrap_or_else(now_epoch_secs);
 
+        let pending_arguments_hash = v
+            .get("pending_arguments_hash")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| {
+                crate::storage::audit_log::sha256_hex(
+                    pending_arguments.to_string_compact().as_bytes(),
+                )
+            });
+        let expires_at = v
+            .get("expires_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(created_at + 3600.0);
+        let approver_identity = v
+            .get("approver_identity")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        let is_consumed = v
+            .get("is_consumed")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let frame_hmac = v
+            .get("frame_hmac")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+
         Some(Self {
             execution_id,
             script_hash,
@@ -571,6 +739,11 @@ impl SuspendedExecutionFrame {
             logs,
             completed_mutations,
             created_at,
+            pending_arguments_hash,
+            expires_at,
+            approver_identity,
+            is_consumed,
+            frame_hmac,
         })
     }
 }

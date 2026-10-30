@@ -13,6 +13,7 @@ COPY src/ ./src/
 RUN cargo build --release
 
 FROM debian:bookworm-slim AS runner
+LABEL org.opencontainers.image.version="4.7.0"
 WORKDIR /app
 
 ENV OMNI_HOST=0.0.0.0 \

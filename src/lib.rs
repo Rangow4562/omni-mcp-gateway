@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Omni MCP (`omni_mcp`) - High-Performance Rust Enterprise MCP Management Platform & Autonomous Runtime Gateway.
 //!
 //! Architecture Layers:

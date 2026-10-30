@@ -1082,7 +1082,11 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
     assert!(prompt_get_resp.error.is_none());
 
     // 5. Test HTTP SSE and Tracing / Audit endpoints
-    let headers = HashMap::new();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer test_operator_token".to_string(),
+    );
     let (sse_status, sse_ctype, _sse_headers, sse_body) =
         ctx.handle_http("GET", "/sse", &headers, &[]);
     assert_eq!(sse_status, 200);
@@ -1786,5 +1790,329 @@ fn test_v4_6_protocol_version_negotiation_and_error_contract() {
     );
 
     ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_7_mcp_protocol_parity_five_versions() {
+    let dir = temp_test_path("omni_v47_protocol_parity");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+    let omni = &ctx.omni_mcp;
+
+    // 1. Handshake across all 5 revisions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, 2026-07-28
+    let versions = [
+        "2024-11-05",
+        "2025-03-26",
+        "2025-06-18",
+        "2025-11-25",
+        "2026-07-28",
+    ];
+    for ver in &versions {
+        let init_req = RPCRequest::new(
+            1i64,
+            "initialize",
+            json!({
+                "protocolVersion": *ver,
+                "clientInfo": {"name": "test-harness", "version": "1.0.0"}
+            }),
+        );
+        let resp = omni.handle_request(&init_req, "agent", None);
+        assert!(resp.error.is_none());
+        let res = resp.result.unwrap();
+        assert_eq!(res["protocolVersion"].as_str(), Some(*ver));
+    }
+
+    // 2. Discover RPC (2026-07-28 stateless requirement)
+    let discover_req = RPCRequest::new(2i64, "server/discover", JsonValue::object());
+    let discover_resp = omni.handle_request(&discover_req, "agent", None);
+    assert!(discover_resp.error.is_none());
+    let disc_res = discover_resp.result.unwrap();
+    let supp = disc_res["supportedVersions"].as_array().unwrap();
+    assert_eq!(supp.len(), 5);
+    assert!(disc_res["capabilities"]["extensions"].is_object());
+
+    // 3. Subscriptions/listen RPC
+    let sub_req = RPCRequest::new(3i64, "subscriptions/listen", JsonValue::object());
+    let sub_resp = omni.handle_request(&sub_req, "agent", None);
+    assert!(sub_resp.error.is_none());
+    assert_eq!(sub_resp.result.unwrap()["status"].as_str(), Some("ok"));
+
+    // 4. Mismatch on request _meta returns UnsupportedProtocolVersionError (-32602)
+    let bad_proto_req = RPCRequest::new(
+        4i64,
+        "tools/list",
+        json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "1999-01-01"
+            }
+        }),
+    );
+    let bad_proto_resp = omni.handle_request(&bad_proto_req, "agent", None);
+    assert!(bad_proto_resp.error.is_some());
+    assert_eq!(bad_proto_resp.error.unwrap().code, -32602);
+
+    // 5. Batching gating: 2026-07-28 rejects array batching with -32600
+    let batch_req = RPCBatchOrSingle::Batch(vec![RPCRequest::new(
+        10i64,
+        "ping",
+        json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+            }
+        }),
+    )]);
+    let batch_resp = omni.handle_batch_or_single(batch_req, "agent", None);
+    assert_eq!(batch_resp["error"]["code"].as_i64(), Some(-32600));
+
+    // 6. batch_invoke_tools gated for 2026-07-28
+    let batch_tool_req = RPCRequest::new(
+        11i64,
+        "tools/call",
+        json!({
+            "name": "batch_invoke_tools",
+            "arguments": {
+                "calls": []
+            },
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+            }
+        }),
+    );
+    let batch_tool_resp = omni.handle_request(&batch_tool_req, "agent", None);
+    assert!(batch_tool_resp.error.is_some());
+    assert_eq!(batch_tool_resp.error.unwrap().code, -32600);
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_7_schema_preflight_validator_32035() {
+    let dir = temp_test_path("omni_v47_preflight");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // Calling accounting.refund without required "reason" and with integer ride_id instead of string
+    let bad_call_req = RPCRequest::new(
+        1i64,
+        "tools/call",
+        json!({
+            "name": "refund",
+            "arguments": {
+                "ride_id": 12345
+            }
+        }),
+    );
+    let resp = ctx
+        .gateway
+        .handle_request("accounting", &bad_call_req, "agent", Some("tok"));
+    assert!(resp.error.is_some());
+    let err = resp.error.unwrap();
+    assert_eq!(err.code, -32035);
+    assert!(err.message.contains("Schema preflight validation failed"));
+    let violations = err.data.unwrap()["violations"].as_array().unwrap().clone();
+    assert!(
+        violations.len() >= 2,
+        "Expected both missing required and type mismatch violations"
+    );
+
+    // explain_error diagnoses SCHEMA_PREFLIGHT_FAILED
+    let explain_req = RPCRequest::new(
+        2i64,
+        "tools/call",
+        json!({
+            "name": "explain_error",
+            "arguments": {
+                "server_name": "accounting",
+                "tool_name": "refund",
+                "error_message": "-32035 SCHEMA_PREFLIGHT_FAILED"
+            }
+        }),
+    );
+    let explain_resp = ctx.omni_mcp.handle_request(&explain_req, "agent", None);
+    let explain_text = explain_resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let parsed = JsonValue::parse(&explain_text).unwrap();
+    assert_eq!(parsed["error_code"].as_i64(), Some(-32035));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_7_approval_hardening_hmac_and_single_use_32038() {
+    let dir = temp_test_path("omni_v47_approval_hmac");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let script = r#"
+    async () => {
+        const res = await codemode.accounting.refund({ ride_id: "ride_99", reason: "dispute" });
+        return { res };
+    }
+    "#;
+
+    // 1. Initial run suspends with APPROVAL_REQUIRED
+    let out = ctx
+        .gateway
+        .execute_codemode(script, None, true, "agent", Some("tok"), None);
+    assert_eq!(out.status, "APPROVAL_REQUIRED");
+    assert_eq!(out.error_code, Some(-32031));
+    let frame = out.suspended_frame.expect("Must have suspended frame");
+    assert!(!frame.frame_hmac.is_empty(), "Frame HMAC must be computed");
+    assert!(
+        !frame.pending_arguments_hash.is_empty(),
+        "Pending args hash must be computed"
+    );
+
+    let exec_id = frame.execution_id.clone();
+
+    // 2. Resume with valid approver identity succeeds
+    let resume_out =
+        ctx.gateway
+            .resume_codemode(&exec_id, "sec_auditor_alice", None, Some("tok"), None);
+    assert_eq!(resume_out.status, "OK");
+    assert_eq!(resume_out.error_code, None);
+
+    // 3. Replaying the consumed frame is rejected with -32038 APPROVAL_INVALID
+    let replay_out =
+        ctx.gateway
+            .resume_codemode(&exec_id, "sec_auditor_alice", None, Some("tok"), None);
+    assert_eq!(replay_out.status, "APPROVAL_INVALID");
+    assert_eq!(replay_out.error_code, Some(-32038));
+
+    // 4. explain_error diagnoses APPROVAL_INVALID
+    let explain_req = RPCRequest::new(
+        3i64,
+        "tools/call",
+        json!({
+            "name": "explain_error",
+            "arguments": {
+                "server_name": "accounting",
+                "tool_name": "refund",
+                "error_message": "-32038 APPROVAL_INVALID"
+            }
+        }),
+    );
+    let explain_resp = ctx.omni_mcp.handle_request(&explain_req, "agent", None);
+    let explain_text = explain_resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let parsed = JsonValue::parse(&explain_text).unwrap();
+    assert_eq!(parsed["error_code"].as_i64(), Some(-32038));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_7_http_surface_hardening() {
+    let dir = temp_test_path("omni_v47_http_hardening");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // 1. DNS rebinding protection: Untrusted Origin for localhost Host returns 403
+    let mut bad_origin_headers = HashMap::new();
+    bad_origin_headers.insert("host".to_string(), "localhost:8080".to_string());
+    bad_origin_headers.insert(
+        "origin".to_string(),
+        "http://malicious-site.com".to_string(),
+    );
+    let (status, _, _, _) = ctx.handle_http("GET", "/healthz", &bad_origin_headers, &[]);
+    assert_eq!(status, 403);
+
+    // 2. Auth required on /api/execute and /api/audit
+    let empty_headers = HashMap::new();
+    let (exec_status, _, _, _) = ctx.handle_http("POST", "/api/execute", &empty_headers, b"{}");
+    assert_eq!(exec_status, 401);
+
+    let (audit_status, _, _, _) = ctx.handle_http("GET", "/api/audit", &empty_headers, &[]);
+    assert_eq!(audit_status, 401);
+
+    // With auth token, succeeds
+    let mut auth_headers = HashMap::new();
+    auth_headers.insert(
+        "authorization".to_string(),
+        "Bearer operator_secret_token".to_string(),
+    );
+    let (audit_auth_status, _, _, _) = ctx.handle_http("GET", "/api/audit", &auth_headers, &[]);
+    assert_eq!(audit_auth_status, 200);
+
+    // 3. Streamable HTTP GET endpoints
+    let (omni_status, _, _, omni_body) = ctx.handle_http("GET", "/omni/mcp", &empty_headers, &[]);
+    assert_eq!(omni_status, 200);
+    let omni_json = JsonValue::parse(&String::from_utf8(omni_body).unwrap()).unwrap();
+    assert_eq!(omni_json["protocol"].as_str(), Some("Streamable HTTP"));
+
+    let (svc_status, _, _, svc_body) =
+        ctx.handle_http("GET", "/accounting/mcp", &empty_headers, &[]);
+    assert_eq!(svc_status, 200);
+    let svc_json = JsonValue::parse(&String::from_utf8(svc_body).unwrap()).unwrap();
+    assert_eq!(svc_json["service"].as_str(), Some("accounting"));
+
+    // 4. SSE endpoint returns Deprecation header
+    let (sse_status, _, sse_headers, _) = ctx.handle_http("GET", "/sse", &empty_headers, &[]);
+    assert_eq!(sse_status, 200);
+    let has_dep = sse_headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("deprecation") && v.contains("@deprecated"));
+    assert!(has_dep, "Expected Deprecation header on legacy /sse");
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v4_7_persistent_saga_ledger() {
+    let dir = temp_test_path("omni_v47_saga_ledger");
+    let _ = fs::create_dir_all(&dir);
+    let db_path = format!("{}/saga_test.db", dir);
+
+    let comp = omni_mcp::models::SagaCompensationRecord {
+        idempotency_key: "saga_idemp_key_101".to_string(),
+        forward_server: "payments".to_string(),
+        forward_tool: "charge".to_string(),
+        compensating_server: "payments".to_string(),
+        compensating_tool: "refund".to_string(),
+        compensating_args: json!({"charge_id": "ch_555"}),
+        status: "PENDING".to_string(),
+        compensation_output: JsonValue::Null,
+    };
+
+    {
+        let store = WalRegistryStore::new(&db_path);
+        store.save_saga_compensation(&comp);
+        let pending = store.list_pending_saga_compensations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].idempotency_key, "saga_idemp_key_101");
+        store.close();
+    }
+
+    // Reopen store from disk and verify recovery across restart
+    let reopened = WalRegistryStore::new(&db_path);
+    let pending_recovered = reopened.list_pending_saga_compensations();
+    assert_eq!(pending_recovered.len(), 1);
+    assert_eq!(pending_recovered[0], comp);
+
+    reopened.complete_saga_compensation("saga_idemp_key_101");
+    assert!(reopened.list_pending_saga_compensations().is_empty());
+
+    reopened.close();
     let _ = fs::remove_dir_all(&dir);
 }

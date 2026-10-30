@@ -1,6 +1,9 @@
 //! Protocol Translators - Converts MCP JSON-RPC payloads into in-memory HTTP, gRPC (Protobuf length-prefixed), and TChannel (Thrift) wire envelope frames.
+//! When the `transport-http` feature is enabled and a tool provides a live `http://` downstream endpoint,
+//! dispatches live network I/O via `HttpDownstreamClient`.
 
 use crate::control_plane::third_party::ThirdPartyAuthExchange;
+use crate::data_plane::downstream_http::HttpDownstreamClient;
 use crate::data_plane::muttley::MuttleyMeshClient;
 use crate::json::JsonValue;
 use crate::models::{ProtocolType, ToolRecord};
@@ -9,6 +12,7 @@ use std::collections::HashMap;
 #[derive(Clone, Default)]
 pub struct ProtocolTranslator {
     pub mesh_client: MuttleyMeshClient,
+    pub http_client: HttpDownstreamClient,
     pub auth_exchange: ThirdPartyAuthExchange,
 }
 
@@ -19,6 +23,7 @@ impl ProtocolTranslator {
     ) -> Self {
         Self {
             mesh_client: mesh_client.unwrap_or_default(),
+            http_client: HttpDownstreamClient::new(),
             auth_exchange: auth_exchange.unwrap_or_default(),
         }
     }
@@ -84,14 +89,23 @@ impl ProtocolTranslator {
             tool.downstream_method.as_str()
         };
 
-        let resp_bytes = self.mesh_client.execute_downstream(
-            server_name,
-            method_name,
-            protocol,
-            &wire_payload,
-            Some(headers),
-            5000,
-        )?;
+        let resp_bytes = if cfg!(feature = "transport-http")
+            && protocol == ProtocolType::Http
+            && !tool.downstream_endpoint.is_empty()
+            && tool.downstream_endpoint.starts_with("http://")
+        {
+            self.http_client
+                .post_json(&tool.downstream_endpoint, &wire_payload, Some(&headers))?
+        } else {
+            self.mesh_client.execute_downstream(
+                server_name,
+                method_name,
+                protocol,
+                &wire_payload,
+                Some(headers),
+                5000,
+            )?
+        };
 
         let resp_str = String::from_utf8(resp_bytes)
             .map_err(|e| format!("Invalid UTF-8 from downstream: {}", e))?;

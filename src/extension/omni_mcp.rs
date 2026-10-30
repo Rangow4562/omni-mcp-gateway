@@ -18,8 +18,9 @@ use crate::data_plane::gateway::MCPProxyGateway;
 use crate::json::JsonValue;
 use crate::models::{
     negotiate_protocol_version, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse, ToolStatus,
-    APPROVAL_REQUIRED, CIRCUIT_OPEN, FUEL_EXHAUSTED, INVALID_PARAMS, METHOD_NOT_FOUND,
-    OUTBOUND_BLOCKED, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED, TOOL_DISABLED, UNAUTHORIZED,
+    APPROVAL_INVALID, APPROVAL_REQUIRED, CIRCUIT_OPEN, FUEL_EXHAUSTED, INVALID_PARAMS,
+    MEMORY_EXHAUSTED, METHOD_NOT_FOUND, OUTBOUND_BLOCKED, SAGA_COMPENSATED,
+    SCHEMA_PREFLIGHT_FAILED, TIMEOUT, TOOL_DISABLED, UNAUTHORIZED,
 };
 
 #[derive(Clone)]
@@ -272,6 +273,26 @@ impl OmniMCPServer {
                 .handle_request(&req, caller_actor, user_token)
                 .to_json(),
             RPCBatchOrSingle::Batch(reqs) => {
+                for r in &reqs {
+                    if let Some(meta) = r.params.get("_meta") {
+                        if let Some(ver) = meta
+                            .get("io.modelcontextprotocol/protocolVersion")
+                            .and_then(|v| v.as_str())
+                        {
+                            if let Some(caps) = crate::models::protocol_capabilities(ver) {
+                                if !caps.allows_batching {
+                                    return RPCResponse::err(
+                                        r.id.clone(),
+                                        RPCError::new(
+                                            crate::models::INVALID_REQUEST,
+                                            format!("JSON-RPC array batching is removed and not supported in protocol version {}", ver),
+                                        ),
+                                    ).to_json();
+                                }
+                            }
+                        }
+                    }
+                }
                 let responses: Vec<JsonValue> = reqs
                     .iter()
                     .map(|r| self.handle_request(r, caller_actor, user_token).to_json())
@@ -287,7 +308,57 @@ impl OmniMCPServer {
         caller_actor: &str,
         user_token: Option<&str>,
     ) -> RPCResponse {
+        if let Some(meta) = request.params.get("_meta") {
+            if let Some(proto) = meta
+                .get("io.modelcontextprotocol/protocolVersion")
+                .and_then(|v| v.as_str())
+            {
+                if crate::models::protocol_capabilities(proto).is_none() {
+                    return RPCResponse::err(
+                        request.id.clone(),
+                        RPCError::new(
+                            crate::models::INVALID_PARAMS,
+                            format!(
+                                "UnsupportedProtocolVersionError: Unsupported MCP version '{}'",
+                                proto
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+
         match request.method.as_str() {
+            "server/discover" => {
+                let supported: Vec<JsonValue> = crate::models::SUPPORTED_MCP_PROTOCOL_VERSIONS
+                    .iter()
+                    .map(|v| JsonValue::from(*v))
+                    .collect();
+                RPCResponse::ok(
+                    request.id.clone(),
+                    json!({
+                        "supportedVersions": JsonValue::Array(supported),
+                        "capabilities": {
+                            "tools": {"listChanged": true},
+                            "resources": {"subscribe": false, "listChanged": true},
+                            "prompts": {"listChanged": true},
+                            "logging": {},
+                            "extensions": {}
+                        },
+                        "serverInfo": {
+                            "name": "uber-omni-mcp-gateway",
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "description": concat!(
+                                "Omni MCP Autonomous Mesh Gateway & Code Mode Runtime (Rust Engine v",
+                                env!("CARGO_PKG_VERSION"),
+                                ")"
+                            ),
+                            "runtime": "rust"
+                        }
+                    }),
+                )
+            }
+            "subscriptions/listen" => RPCResponse::ok(request.id.clone(), json!({"status": "ok"})),
             "initialize" => {
                 let client_ver = request
                     .params
@@ -563,12 +634,30 @@ impl OmniMCPServer {
             }
         }
 
+        let err_code = if let Some(meta) = request.params.get("_meta") {
+            if let Some(proto) = meta
+                .get("io.modelcontextprotocol/protocolVersion")
+                .and_then(|v| v.as_str())
+            {
+                if let Some(caps) = crate::models::protocol_capabilities(proto) {
+                    if caps.resource_not_found_is_invalid_params {
+                        crate::models::INVALID_PARAMS
+                    } else {
+                        METHOD_NOT_FOUND
+                    }
+                } else {
+                    METHOD_NOT_FOUND
+                }
+            } else {
+                METHOD_NOT_FOUND
+            }
+        } else {
+            METHOD_NOT_FOUND
+        };
+
         RPCResponse::err(
             request.id.clone(),
-            RPCError::new(
-                METHOD_NOT_FOUND,
-                format!("Resource not found for URI: {}", uri),
-            ),
+            RPCError::new(err_code, format!("Resource not found for URI: {}", uri)),
         )
     }
 
@@ -923,6 +1012,17 @@ impl OmniMCPServer {
             tool_args.insert("_projection", proj);
         }
 
+        let traceparent = args
+            .get("_meta")
+            .and_then(|m| m.get("traceparent"))
+            .or_else(|| {
+                request
+                    .params
+                    .get("_meta")
+                    .and_then(|m| m.get("traceparent"))
+            })
+            .and_then(|tp| tp.as_str());
+
         let call_req = RPCRequest::new(
             request.id.clone(),
             "tools/call",
@@ -931,8 +1031,13 @@ impl OmniMCPServer {
                 "arguments": tool_args,
             }),
         );
-        self.gateway
-            .handle_request(server_name, &call_req, caller_actor, user_token)
+        self.gateway.handle_request_with_trace(
+            server_name,
+            &call_req,
+            caller_actor,
+            user_token,
+            traceparent,
+        )
     }
 
     fn call_batch_invoke_tools(
@@ -942,6 +1047,27 @@ impl OmniMCPServer {
         caller_actor: &str,
         user_token: Option<&str>,
     ) -> RPCResponse {
+        if let Some(meta) = request.params.get("_meta").or_else(|| args.get("_meta")) {
+            if let Some(ver) = meta
+                .get("io.modelcontextprotocol/protocolVersion")
+                .and_then(|v| v.as_str())
+            {
+                if let Some(caps) = crate::models::protocol_capabilities(ver) {
+                    if !caps.allows_batching {
+                        return RPCResponse::err(
+                            request.id.clone(),
+                            RPCError::new(
+                                crate::models::INVALID_REQUEST,
+                                format!(
+                                    "Batch tool execution is removed and not supported in protocol version {}",
+                                    ver
+                                ),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         let calls = match args.get("calls").and_then(|c| c.as_array()) {
             Some(arr) => arr,
             None => {
@@ -1179,6 +1305,30 @@ impl OmniMCPServer {
                 "Tool invocation arguments failed schema preflight validation (-32035 SCHEMA_PREFLIGHT_FAILED)."
                     .to_string(),
                 "Call `get_tool_schema` or `codemode.describe()` to verify required parameter names and types."
+                    .to_string(),
+            )
+        } else if err_lower.contains("memory_exhausted") || err_lower.contains("-32036") {
+            (
+                MEMORY_EXHAUSTED,
+                "Code Mode script exceeded maximum memory allocation budget (-32036 MEMORY_EXHAUSTED)."
+                    .to_string(),
+                "Reduce array/object allocations, process items in smaller batches, or raise max_memory_bytes."
+                    .to_string(),
+            )
+        } else if err_lower.contains("timeout") || err_lower.contains("-32037") {
+            (
+                TIMEOUT,
+                "Code Mode script exceeded wall-clock execution time limit (-32037 TIMEOUT)."
+                    .to_string(),
+                "Optimize long-running loops, parallelize tool calls with ParallelWave, or raise max_execution_time_ms."
+                    .to_string(),
+            )
+        } else if err_lower.contains("approval_invalid") || err_lower.contains("-32038") {
+            (
+                APPROVAL_INVALID,
+                "Approval continuation token verification failed or expired (-32038 APPROVAL_INVALID)."
+                    .to_string(),
+                "Ensure HMAC-SHA256 signature is valid, approver is authenticated, arguments have not been altered, and token has not expired."
                     .to_string(),
             )
         } else if tool_status == "DISABLED" {

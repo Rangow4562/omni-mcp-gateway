@@ -1,7 +1,7 @@
 {
   "name": "@rangow2260/omni-mcp",
-  "version": "4.6.0",
-  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v4.6: Okapi BM25 ranking, authoritative -320xx error-code contract, MCP 2025-03-26 protocol version negotiation, resumable AST continuations, vectorized columnar predicate pushdown, SSA auto-parallelization, and declarative Saga rollbacks.",
+  "version": "4.7.0",
+  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v4.7: MCP protocol parity across 5 revisions (2024-11-05 to 2026-07-28), server/discover, live HTTP/1.1 downstream transport, schema preflight validation (-32035), HMAC-SHA256 authenticated continuations & single-use approvals (-32038), persistent Saga ledger, and sandbox resource limits.",
   "main": "bin/omni-mcp.js",
   "bin": {
     "omni-mcp": "bin/omni-mcp.js",

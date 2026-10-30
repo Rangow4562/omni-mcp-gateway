@@ -1,10 +1,20 @@
 [package]
 name = "omni-mcp"
-version = "4.6.0"
+version = "4.7.0"
+rust-version = "1.75.0"
 edition = "2021"
 authors = ["Omni MCP Engineering"]
 description = "High-performance Rust enterprise Model Context Protocol (MCP) & Omni Code Mode Gateway: AutoCrawler IDL discovery, TypeScript .d.ts type generation, sub-millisecond in-process Code Mode sandbox, wire envelope framing & protocol translation, Okapi BM25 ranking, circuit breaking, OTel W3C distributed tracing, and SHA-256 Merkle audit trail."
 readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/Rangow4562/omni-mcp-gateway"
+homepage = "https://github.com/Rangow4562/omni-mcp-gateway"
+keywords = ["mcp", "gateway", "model-context-protocol", "json-rpc", "llm"]
+categories = ["web-programming", "network-programming", "command-line-utilities"]
+
+[features]
+default = []
+transport-http = []
 
 [lib]
 name = "omni_mcp"
@@ -27,4 +37,3 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-

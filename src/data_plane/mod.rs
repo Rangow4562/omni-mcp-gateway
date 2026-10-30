@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod circuit_breaker;
 pub mod codemode;
+pub mod downstream_http;
 pub mod dst;
 pub mod gateway;
 pub mod muttley;
@@ -15,6 +16,7 @@ pub use codemode::{
     CodeModeError, CodeModeExecutor, CodeModeTypeGenerator, CodeOutput, HostCallbacks,
     PendingApproval, SandboxLimits, SpeculativeInjectionResult, TypeGenerationResult,
 };
+pub use downstream_http::HttpDownstreamClient;
 pub use dst::{
     DeterministicSimulator, FaultInjectionConfig, SeedRunOutcome, SimulationReport,
     Xoshiro256StarStar,
