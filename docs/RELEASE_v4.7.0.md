@@ -74,3 +74,4 @@ Omni MCP v4.7.0 delivers **Protocol Parity & Real Wire**, extending our enterpri
 | `-32036` | `MEMORY_EXHAUSTED` | Code Mode script exceeded memory allocation budget. |
 | `-32037` | `TIMEOUT` | Code Mode script exceeded wall-clock execution time limit. |
 | `-32038` | `APPROVAL_INVALID` | Continuation token verification failed, expired, replayed, or altered. |
+

@@ -2,7 +2,7 @@
   <img src="assets/omni-mcp-eink-banner.png" alt="Omni MCP Banner" width="100%" />
 </p>
 
-# Omni MCP (`omni-mcp` v4.6 — Autonomous Runtime & Enterprise MCP Gateway)
+# Omni MCP (`omni-mcp` v4.7 — Autonomous Runtime & Enterprise MCP Gateway)
 
 [![npm version](https://img.shields.io/npm/v/@rangow2260/omni-mcp.svg?style=flat-square&color=blue)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/@rangow2260/omni-mcp.svg?style=flat-square)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
@@ -20,7 +20,11 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
 - **Declarative Saga Compensation Rollbacks**: Ephemeral execution transaction logs unwind completed mutations in reverse (`LIFO`) order when a downstream step fails.
 - **Speculative 0-Turn Schema Pre-Injection**: True Okapi BM25 ($k_1 = 1.2, b = 0.75$) + stem routing injects the top-$K$ highest-confidence `.d.ts` declarations on Turn 1 based on natural-language user prompts.
 - **Deterministic Simulation Testing (`dst`) Engine**: 64-bit `Xoshiro256StarStar` seeded PRNG fault-injection suite validating agent scripts against network drops, circuit trips, latency spikes, and malformed payloads.
-- **Authoritative `-320xx` Error Contract & MCP Protocol Negotiation**: Compiler-checked `FeatureStatus` enum mapping every runtime guardrail (`-32030`..`-32035`) and negotiating MCP `2024-11-05` / `2025-03-26` lifecycles with tool annotations.
+- **Authoritative `-320xx` Error Contract & 5-Revision MCP Protocol Negotiation**: Compiler-checked `FeatureStatus` enum mapping every runtime guardrail (`-32030`..`-32038`) and negotiating all five official MCP revisions (`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`, `2026-07-28`) with stateless `server/discover` and Streamable HTTP.
+- **Live HTTP/1.1 Downstream Transport (`transport-http`)**: Feature-gated, pure standard library connection-pooled HTTP client with timeouts, keep-alive, and jittered exponential retries feeding per-service circuit breakers and Saga rollbacks.
+- **Schema Preflight Validator (`-32035 SCHEMA_PREFLIGHT_FAILED`)**: Static AST input schema type-checker detecting all violations in a single pass before execution or approval gates for single-turn LLM self-correction.
+- **HMAC-SHA256 Authenticated Continuations & Approval Hardening**: Tamper-proof continuation frames signed via HMAC-SHA256 with single-use binding (`-32038 APPROVAL_INVALID`), approver identity verification, and crash-safe WAL/snapshot Saga compensation ledger.
+- **Comprehensive Sandbox Resource Limits**: Strict execution guardrails bounding instruction fuel (`-32032`), string/array heap growth (`-32036 MEMORY_EXHAUSTED`), wall-clock time (`-32037 TIMEOUT`), and internal panic containment (`catch_unwind`).
 - **Dynamic TypeScript Declarations (`declare namespace codemode`)**: Automatically converts OpenAPI 3.1, Protobuf, and Thrift JSON Schemas into compact `.d.ts` declarations, compressing tool prompt token footprints by $65\%$ to $95\%$.
 - **Search & Execute Pattern**: Built-in `codemode.search(query)` and `codemode.describe(server, tool?)` allowing agents to discover and inspect typed definitions on demand without context bloat.
 - **Zero-Outbound Isolation & Approval Gates**: `globalOutbound: null` isolation blocks raw `fetch()` or filesystem calls, while human-in-the-loop approval gates intercept state-mutating operations (`is_mutation: true`).
@@ -175,15 +179,15 @@ cargo build --release
 | **Disabled by Default** | Discovery doesn't imply exposure; tools require review & approval | Strict `ToolStatus::Disabled` state machine; requires explicit enablement | **Verified Principle** |
 | **Diffs & Rollback** | Tool edits trigger diffs requiring approval; supports rollback | Versioned `ConfigDiff` engine with approval gates and rollback | **Verified Feature** |
 | **Dynamic Routing** | Materializes virtual servers at `/<service-name>/mcp` without redeploy | Dynamic HTTP/1.1 dispatch table refreshed on background cadence | **Verified Data Plane** |
-| **Wire Translation** | Translates JSON-RPC to HTTP, gRPC, TChannel wire formats | `ProtocolTranslator` in-memory envelope framing for HTTP, gRPC, TChannel (no sockets are opened; byte-level framing only) | **Simulated (in-memory envelopes)** |
-| **Muttley Delegation** | Downstream calls routed via Muttley service mesh sidecar | `MuttleyMeshClient` in-memory sidecar adapter with $p_{50}$/$p_{95}$/$p_{99}$ histograms (no live downstream network I/O yet) | **Simulated (in-memory adapter)** |
+| **Wire Translation** | Translates JSON-RPC to HTTP, gRPC, TChannel wire formats | `HttpDownstreamClient` pure-`std` live HTTP/1.1 transport (`transport-http`) + in-memory gRPC/TChannel envelope framing | **v4.7 Live HTTP + Simulated RPC** |
+| **Muttley Delegation** | Downstream calls routed via Muttley service mesh sidecar | `HttpDownstreamClient` for real HTTP endpoints + `MuttleyMeshClient` simulated mesh sidecar adapter | **v4.7 Live HTTP + Mesh Simulator** |
 | **Security & ABAC** | Server/tool charter policies for humans, services, agents; PII redaction | `SecurityCharterEngine` + DFA `PIIRedactor` (with API key redaction) | **Verified Security Model** |
 | **Omni MCP Discovery** | Proxy enabling incremental discovery via standard tools | `OmniMCPServer` with Okapi BM25 ranking + `recommend_tools` + `explain_error` | **v4.6 Upgrade** |
 | **MCP Resources & Prompts**| Full resource catalog and diagnostic runbooks | `resources/list`, `resources/read`, `prompts/list`, `prompts/get` | **v3.0 Upgrade** |
 | **OpenTelemetry Tracing** | Distributed end-to-end W3C request tracing | `traceparent` context injection, in-memory collector, `/api/traces` | **v3.0 Upgrade** |
 | **Canary & Resilient Fallback**| Safe progressive rollouts and fault-tolerant fallbacks | Percentage weighted traffic routing + automatic fallback execution | **v3.0 Upgrade** |
 | **Cryptographic Audit** | Tamper-evident immutable ledger for enterprise compliance | Zero-dependency FIPS 180-4 SHA-256 Merkle chained audit store | **v3.0 Upgrade** |
-| **Streamable SSE** | Server-Sent Events streaming for tool execution | Native `/sse` endpoint with event dispatch (**deprecated** legacy HTTP+SSE transport; Streamable HTTP on `/omni/mcp` is the supported transport) | **v3.0 Upgrade (deprecated)** |
+| **Streamable HTTP & SSE** | MCP transport over standard HTTP POST/GET and legacy SSE | Streamable HTTP on `/omni/mcp` and `/<service>/mcp` + deprecated legacy `/sse` | **v4.7 Upgrade** |
 | **Response Projection** | GraphQL-like nested path array trimming response in runtime | `ResponseProjectionEngine` supporting nested keys, `items[].field`, and `*` | **Verified Token Optimization** |
 | **Code Mode (`aifx`)** | CLI for coding agents: `mcp list`, `mcp search`, `mcp call` | Native `omni` and `aifx` Rust binaries + `mcp bench` micro-benchmark | **Verified CLI Interface** |
 | **Resilience & Caching** | Enterprise fault tolerance and sub-millisecond tail latency | `CircuitBreakerRegistry` + `SemanticResponseCache` + Batch JSON-RPC | **Verified Data Plane** |
@@ -191,14 +195,16 @@ cargo build --release
 | **In-Process Code Mode** | Sub-millisecond polyglot script execution without multi-turn loops | Pure-Rust AST interpreter ($< 50\ \mu\text{s}$ boot) with captured `CodeOutput` | **v4.0 Upgrade** |
 | **Dynamic `.d.ts` Generation** | Compress tool prompt token footprint by $65\%$ to $95\%$ | Auto-compiled `declare namespace codemode` + `omni://codemode/types.d.ts` | **v4.0 Upgrade** |
 | **Zero-Outbound & HITL Gates** | Block raw network/FS access and gate destructive mutations | `globalOutbound: null` isolation + `is_mutation: true` `APPROVAL_REQUIRED` | **v4.0 Upgrade** |
-| **Resumable Continuations** | Stateless suspend/resume of paused scripts across cluster nodes | Crockford Base32 ULID `SuspendedExecutionFrame` in FNV-1a checksummed WAL | **v4.5 Upgrade** |
+| **Resumable Continuations** | Stateless suspend/resume of paused scripts across cluster nodes | HMAC-SHA256 authenticated `SuspendedExecutionFrame` with single-use approval binding (`-32038`) | **v4.7 Upgrade** |
 | **Columnar Pushdown** | Vectorized closure filtering without per-row heap allocations | `ColumnarRecordBatch` contiguous arrays + compiled `PhysicalExpr` pipelines | **v4.5 Upgrade** |
 | **SSA Auto-Parallelization** | Automatic parallelization of sequential independent tool calls | Static AST read/write analysis lifting calls into `Stmt::ParallelWave` | **v4.5 Upgrade** |
-| **Declarative Saga Rollbacks** | Automatic reverse-order unwinding of partial multi-step mutations | `MutationCompensationSpec` LIFO unwind + Merkle cryptographic receipts | **v4.5 Upgrade** |
+| **Declarative Saga Rollbacks** | Automatic reverse-order unwinding of partial multi-step mutations | `MutationCompensationSpec` LIFO unwind + crash-safe persistent WAL ledger | **v4.7 Upgrade** |
 | **Speculative 0-Turn Types** | Eliminate discovery round-trip on initial agent turn | Sub-ms Okapi BM25 ($k_1=1.2, b=0.75$) routing pre-populating Turn 1 `{{types}}` | **v4.6 Upgrade** |
 | **Deterministic Simulation** | Fault-injection chaos testing for agent scripts prior to rollout | 64-bit `Xoshiro256StarStar` seeded PRNG harness (`aifx mcp simulate`) | **v4.5 Upgrade** |
-| **Error-Code Contract** | Machine-readable `-320xx` JSON-RPC 2.0 error & status surface | `FeatureStatus` enum + `-32030`..`-32035` structured `RPCError` payloads | **v4.6 Upgrade** |
-| **MCP Version Negotiation** | Multi-version MCP lifecycle handshake & tool capability hints | Negotiates `"2024-11-05"` / `"2025-03-26"` + `annotations` hints | **v4.6 Upgrade** |
+| **Error-Code Contract** | Machine-readable `-320xx` JSON-RPC 2.0 error & status surface | `FeatureStatus` enum + `-32030`..`-32038` structured `RPCError` payloads | **v4.7 Upgrade** |
+| **MCP Protocol Parity** | Multi-version MCP lifecycle handshake across all 5 revisions | Full parity for `2024-11-05` through `2026-07-28` + stateless `server/discover` | **v4.7 Upgrade** |
+| **Schema Preflight Validator** | Static AST validation against registered tool inputSchema | Single-pass AST type check (`-32035 SCHEMA_PREFLIGHT_FAILED`) before approval | **v4.7 Upgrade** |
+| **Sandbox Resource Limits** | Comprehensive memory, time, and panic safety boundaries | Memory caps (`-32036`), wall-clock timeouts (`-32037`), and panic containment | **v4.7 Upgrade** |
 
 ---
 
@@ -308,13 +314,13 @@ All gateway, discovery, and Code Mode error states map to compiler-checked const
 - **Liveness Probe**: `http://localhost:8080/healthz`
 - **Readiness Probe**: `http://localhost:8080/readyz`
 - **Prometheus Metrics**: `http://localhost:8080/metrics`
-- **Server-Sent Events (SSE, deprecated legacy endpoint)**: `http://localhost:8080/sse`
-- **OpenTelemetry Traces**: `http://localhost:8080/api/traces`
-- **Merkle Audit Trail**: `http://localhost:8080/api/audit`
-- **Cryptographic Audit Verification**: `http://localhost:8080/api/audit/verify`
-- **REST Interactive Tool Execution**: `http://localhost:8080/api/execute`
-- **Centralized Omni MCP Proxy**: `http://localhost:8080/omni/mcp`
+- **Streamable HTTP MCP Proxy (Primary Transport)**: `http://localhost:8080/omni/mcp` (POST for JSON-RPC 2.0 / GET for capabilities)
 - **Direct Virtual Service Endpoints**: `http://localhost:8080/<service-name>/mcp`
+- **Server-Sent Events (SSE, deprecated legacy transport)**: `http://localhost:8080/sse` (returns `Deprecation: @deprecated` header)
+- **OpenTelemetry Traces**: `http://localhost:8080/api/traces`
+- **Merkle Audit Trail**: `http://localhost:8080/api/audit` (Requires Bearer authorization)
+- **Cryptographic Audit Verification**: `http://localhost:8080/api/audit/verify` (Requires Bearer authorization)
+- **REST Interactive Tool Execution**: `http://localhost:8080/api/execute` (Requires Bearer authorization)
 
 ### Omni MCP Discovery & Autonomous Planning Tools
 
