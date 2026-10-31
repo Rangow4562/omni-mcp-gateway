@@ -51,3 +51,4 @@ Omni MCP v4.7.1 is a critical security hardening and trust-boundary reset releas
 - **Verified Package Downloads**: Updated `bin/omni-mcp.js` to download precompiled binaries to a temporary file, compute SHA-256, and verify against `SHA256SUMS` before caching.
 - **CLI Subcommand Support**: Added native `--version`, `-V`, `version`, `aifx ...`, and `mcp ...` subcommand execution to the binary entrypoints.
 - **Container Hardening**: Dockerfile updated with non-root user (`USER omni:omni`) and a `/healthz` container `HEALTHCHECK`.
+
