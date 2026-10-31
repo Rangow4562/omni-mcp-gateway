@@ -123,3 +123,4 @@ cargo test --locked
 ---
 
 **Full Changelog**: https://github.com/Rangow4562/omni-mcp-gateway/compare/v4.7.0...v4.7.1
+
