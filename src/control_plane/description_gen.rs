@@ -59,7 +59,7 @@ impl ToolDescriptionGenerator {
         }
 
         base.push_str(&format!(
-            " Routed over {} via Uber MCP Gateway.",
+            " Routed over {} via Omni MCP Gateway.",
             method.protocol.as_str()
         ));
         base

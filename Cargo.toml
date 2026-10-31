@@ -1,6 +1,6 @@
 [package]
 name = "omni-mcp"
-version = "4.7.0"
+version = "4.7.1"
 rust-version = "1.75.0"
 edition = "2021"
 authors = ["Omni MCP Engineering"]

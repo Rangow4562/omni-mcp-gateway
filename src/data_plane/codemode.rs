@@ -5,7 +5,7 @@
 //! 1. `CodeModeTypeGenerator`: Compiles registered OmniMCP tool JSON Schemas into compact TypeScript
 //!    declarations (`declare namespace codemode { ... }`) and supports `{{types}}` prompt injection.
 //! 2. `CodeModeExecutor`: Sub-millisecond in-process AST sandbox executing JavaScript/TypeScript
-//!    (`async () => { await codemode.srv.tool(...); }`) and Rust/Rhai scripts with:
+//!    (`async () => { await codemode.srv.tool(...); }`) and closure scripts (`|x| expr`) with:
 //!    - Zero outbound network/filesystem access (`globalOutbound: null` isolation)
 //!    - Console output capture (`console.log`, `console.warn`, `console.error` -> `CodeOutput.logs`)
 //!    - Built-in Search & Execute discovery (`codemode.search()`, `codemode.describe()`)
@@ -759,7 +759,7 @@ impl CodeModeTypeGenerator {
 }
 
 // ============================================================================
-// Polyglot AST Sandbox (Code Mode JS/TS + Rust/Rhai)
+// Polyglot AST Sandbox (Code Mode JS/TS + closure syntax)
 // ============================================================================
 
 #[derive(Clone, Debug)]
@@ -1318,13 +1318,13 @@ enum Expr {
     Unary(UnaryOp, Box<Expr>),
     Binary(Box<Expr>, BinOp, Box<Expr>),
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
-    /// Namespace or global call: e.g. `uber_rides::list_recent(...)` or `fetch(...)`
+    /// Namespace or global call: e.g. `rides_service::list_recent(...)` or `fetch(...)`
     NamespaceCall {
         namespace: Option<String>,
         func: String,
         args: Vec<Expr>,
     },
-    /// Method or chained call: e.g. `codemode.uber_rides.list_recent(...)` or `arr.filter(...)`
+    /// Method or chained call: e.g. `codemode.rides_service.list_recent(...)` or `arr.filter(...)`
     MethodCall {
         receiver: Box<Expr>,
         method: String,
@@ -1856,7 +1856,7 @@ impl Parser {
             return Err(CodeModeError::ExprDepthExceeded(self.max_expr_depth));
         }
 
-        // Rust/Rhai closure: `|x| expr` or `|a, b| expr`
+        // Closure: `|x| expr` or `|a, b| expr`
         if self.peek() == &Token::Pipe {
             self.advance();
             let mut params = Vec::new();
@@ -2826,7 +2826,7 @@ impl CodeModeExecutor {
                     is_consumed: false,
                     frame_hmac: String::new(),
                 };
-                frame.frame_hmac = frame.compute_hmac("omni-secret-key");
+                frame.frame_hmac = frame.compute_hmac(crate::models::continuation_key());
                 CodeOutput {
                     status: FeatureStatus::ApprovalRequired.as_str().to_string(),
                     feature_status: FeatureStatus::ApprovalRequired,
@@ -3549,7 +3549,7 @@ impl<'a> VmState<'a> {
             return self.dispatch_host_tool(&srv, &tl, rest, host);
         }
 
-        // 4. `service::tool(...)` Rust/Rhai style host call
+        // 4. `service::tool(...)` namespace style host call
         if let Some(srv) = namespace {
             return self.dispatch_host_tool(srv, func, evaluated_args, host);
         }

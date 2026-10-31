@@ -299,7 +299,12 @@ struct JsonParser<'a> {
     input: &'a str,
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
+
+/// Maximum nesting depth of arrays/objects accepted by the parser. Prevents
+/// stack-overflow denial of service from deeply nested untrusted input.
+pub const MAX_JSON_DEPTH: usize = 64;
 
 impl<'a> JsonParser<'a> {
     fn new(input: &'a str) -> Self {
@@ -307,6 +312,7 @@ impl<'a> JsonParser<'a> {
             input,
             bytes: input.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -329,8 +335,22 @@ impl<'a> JsonParser<'a> {
             Some(b'n') => self.parse_null(),
             Some(b't') | Some(b'f') => self.parse_bool(),
             Some(b'"') => self.parse_string().map(JsonValue::Str),
-            Some(b'[') => self.parse_array(),
-            Some(b'{') => self.parse_object(),
+            Some(b'[') | Some(b'{') => {
+                if self.depth >= MAX_JSON_DEPTH {
+                    return Err(format!(
+                        "JSON nesting exceeds maximum depth of {}",
+                        MAX_JSON_DEPTH
+                    ));
+                }
+                self.depth += 1;
+                let r = if self.peek() == Some(b'[') {
+                    self.parse_array()
+                } else {
+                    self.parse_object()
+                };
+                self.depth -= 1;
+                r
+            }
             Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
             Some(c) => Err(format!(
                 "Unexpected character '{}' at pos {}",

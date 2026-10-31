@@ -49,7 +49,7 @@ impl OmniConfig {
 
         Self {
             env: env::var("OMNI_ENV").unwrap_or_else(|_| "production".to_string()),
-            host: env::var("OMNI_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            host: env::var("OMNI_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: env::var("OMNI_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -71,9 +71,8 @@ impl OmniConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10 * 1024 * 1024),
             enable_pii_redaction: matches!(enable_pii.as_str(), "true" | "1" | "yes"),
-            cors_allowed_origins: env::var("OMNI_CORS_ORIGINS").unwrap_or_else(|_| "*".to_string()),
-            auth_secret: env::var("OMNI_AUTH_SECRET")
-                .unwrap_or_else(|_| "omni_enterprise_secret_key".to_string()),
+            cors_allowed_origins: env::var("OMNI_CORS_ORIGINS").unwrap_or_default(),
+            auth_secret: env::var("OMNI_AUTH_SECRET").unwrap_or_default(),
             worker_threads: env::var("OMNI_WORKER_THREADS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -95,6 +94,26 @@ impl OmniConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(15.0),
         }
+    }
+}
+
+/// Returns `true` when `host` (without port) is a loopback address or name.
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1"
+}
+
+impl OmniConfig {
+    /// Refuses insecure network exposure: binding to a non-loopback address
+    /// requires `OMNI_AUTH_SECRET` to be configured.
+    pub fn validate_bind(&self, host: &str) -> Result<(), String> {
+        if !is_loopback_host(host) && self.auth_secret.is_empty() {
+            return Err(format!(
+                "Refusing to bind to non-loopback address '{}' without OMNI_AUTH_SECRET configured",
+                host
+            ));
+        }
+        Ok(())
     }
 }
 

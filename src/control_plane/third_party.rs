@@ -40,7 +40,9 @@ impl ThirdPartyAuthExchange {
                 }
             }
         }
-        if internal_user_token.starts_with("uber_token_") || internal_user_token.starts_with("emp_")
+        if internal_user_token.starts_with("demo_token_")
+            || internal_user_token.starts_with("uber_token_")
+            || internal_user_token.starts_with("emp_")
         {
             return Some(format!(
                 "oauth_3p_{}_{:012x}",

@@ -1,4 +1,4 @@
-//! `aifx` & `omni` CLI - Uber's CLI for agentic operations and Code Mode tool execution.
+//! `aifx` & `omni` CLI - CLI for agentic operations and Code Mode tool execution.
 //! Commands:
 //! - `aifx mcp list [--format table|json]`
 //! - `aifx mcp search <query> [--format table|json]`
@@ -222,7 +222,7 @@ impl AifxCLI {
                 "driverdispatchservice",
                 &req,
                 "agent",
-                Some("uber_token_bench"),
+                Some("demo_token_bench"),
             );
         }
         let elapsed = t0.elapsed();
@@ -277,11 +277,12 @@ impl AifxCLI {
         execution_id: &str,
         approver: &str,
         token: Option<&str>,
+        digest: Option<&str>,
     ) -> String {
         self.cache.refresh_now();
         let out = self
             .gateway
-            .resume_codemode(execution_id, approver, None, token, None);
+            .resume_codemode(execution_id, approver, None, token, None, digest);
         out.to_json().to_string_pretty()
     }
 
@@ -310,7 +311,7 @@ impl AifxCLI {
         let n = iterations.max(100);
         let script = r#"
         async () => {
-            const rides = await codemode.uber_rides.list_recent({ user_id: "usr_456" });
+            const rides = await codemode.rides_service.list_recent({ user_id: "usr_456" });
             const cancelled = rides.filter(r => r.status === "cancelled" && r.amount > 20.0);
             let total = 0.0;
             for (const r of cancelled) {
@@ -328,7 +329,7 @@ impl AifxCLI {
                 None,
                 false,
                 "agent",
-                Some("uber_token_bench"),
+                Some("demo_token_bench"),
                 None,
             ));
         }
@@ -353,8 +354,19 @@ impl AifxCLI {
 }
 
 pub fn run_aifx_cli(args: &[String]) -> i32 {
+    let args = if !args.is_empty() && args[0] == "aifx" {
+        &args[1..]
+    } else {
+        args
+    };
+
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         print_help();
+        return 0;
+    }
+
+    if args[0] == "--version" || args[0] == "-V" || args[0] == "version" {
+        println!("omni-mcp v{}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
 
@@ -415,7 +427,7 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             let mut project: Option<&str> = None;
             let mut output: Option<&str> = None;
             let mut actor = "agent";
-            let mut token = "uber_token_default";
+            let mut token = "demo_token_default";
 
             let mut i = 4;
             while i < args.len() {
@@ -466,7 +478,7 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             let mut code = String::new();
             let mut require_approval = false;
             let mut actor = "agent";
-            let mut token = "uber_token_default";
+            let mut token = "demo_token_default";
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -535,7 +547,8 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
         "resume" => {
             let mut exec_id = "";
             let mut approver = "operator";
-            let mut token = "uber_token_default";
+            let mut token = "demo_token_default";
+            let mut digest: Option<&str> = None;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -551,6 +564,10 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
                         token = &args[i + 1];
                         i += 2;
                     }
+                    "--digest" if i + 1 < args.len() => {
+                        digest = Some(&args[i + 1]);
+                        i += 2;
+                    }
                     other if !other.starts_with('-') && exec_id.is_empty() => {
                         exec_id = other;
                         i += 1;
@@ -559,10 +576,15 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
                 }
             }
             if exec_id.is_empty() {
-                eprintln!("Usage: aifx mcp resume <execution_id> [--approver <name>]");
+                eprintln!(
+                    "Usage: aifx mcp resume <execution_id> [--approver <name>] [--digest <hash>]"
+                );
                 return 1;
             }
-            println!("{}", cli.resume_codemode(exec_id, approver, Some(token)));
+            println!(
+                "{}",
+                cli.resume_codemode(exec_id, approver, Some(token), digest)
+            );
             0
         }
         "simulate" | "dst" => {
@@ -570,7 +592,7 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             let mut seed = 42u64;
             let mut runs = 25usize;
             let mut actor = "agent";
-            let mut token = "uber_token_default";
+            let mut token = "demo_token_default";
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {

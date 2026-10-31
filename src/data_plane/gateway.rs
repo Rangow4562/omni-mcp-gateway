@@ -927,7 +927,7 @@ impl MCPProxyGateway {
         records
     }
 
-    /// Executes an Omni Code Mode JS/TS (`async () => { ... }`) or Rust/Rhai script inside
+    /// Executes an Omni Code Mode JS/TS (`async () => { ... }`) or closure script (`|x| expr`) inside
     /// the sub-millisecond in-process sandbox, routing all `codemode.<server>.<tool>()` calls
     /// through the governed OmniMCP Data Plane with SSA Auto-Parallelization, Vectorized Pushdown,
     /// Resumable Continuation Snapshots, and Declarative Saga Rollbacks.
@@ -1089,6 +1089,7 @@ impl MCPProxyGateway {
             if let Some(ref mut frame) = output.suspended_frame {
                 frame.caller_actor = caller_actor.to_string();
                 frame.completed_mutations = completed_vec.clone();
+                frame.frame_hmac = frame.compute_hmac(crate::models::continuation_key());
                 self.cache.registry.save_suspended_frame(frame.clone());
             }
         }
@@ -1147,6 +1148,7 @@ impl MCPProxyGateway {
         limits: Option<SandboxLimits>,
         user_token: Option<&str>,
         traceparent: Option<&str>,
+        approver_args_digest: Option<&str>,
     ) -> CodeOutput {
         let start_micros = now_epoch_micros();
         let (trace_id, parent_span_id) = if let Some(tp) = traceparent {
@@ -1194,7 +1196,7 @@ impl MCPProxyGateway {
 
         // Verify approval signature, expiry, and single-use semantics (-32038 APPROVAL_INVALID)
         if let Err(reason) = frame.verify_approval(
-            "omni-secret-key",
+            crate::models::continuation_key(),
             approver,
             Some(&frame.pending_arguments),
             crate::logging::now_epoch_secs(),
@@ -1226,6 +1228,46 @@ impl MCPProxyGateway {
                 auto_parallel_waves: 0,
                 parallelized_tool_calls: 0,
             };
+        }
+
+        // If approver argument digest is provided, verify it matches pending_arguments_hash
+        if let Some(digest) = approver_args_digest {
+            let digest_trim = digest.trim();
+            let digest_clean = digest_trim.to_ascii_lowercase();
+            if !digest_trim.is_empty()
+                && !crate::models::constant_time_eq(
+                    digest_clean.as_bytes(),
+                    frame.pending_arguments_hash.as_bytes(),
+                )
+            {
+                return CodeOutput {
+                    status: FeatureStatus::ApprovalInvalid.as_str().to_string(),
+                    feature_status: FeatureStatus::ApprovalInvalid,
+                    error_code: Some(APPROVAL_INVALID),
+                    result: JsonValue::Null,
+                    logs: frame.logs,
+                    pending_approvals: Vec::new(),
+                    error: Some(format!(
+                        "Approver argument digest mismatch (-32038 APPROVAL_INVALID): expected {}, got {}",
+                        frame.pending_arguments_hash, digest
+                    )),
+                    boot_parse_us: 0,
+                    eval_us: 0,
+                    ops_consumed: 0,
+                    peak_memory_bytes: 0,
+                    tool_calls: 0,
+                    intermediate_bytes_processed: 0,
+                    output_bytes_returned: 0,
+                    traceparent: codemode_traceparent,
+                    execution_id: Some(execution_id.to_string()),
+                    suspended_frame: None,
+                    saga_compensations: Vec::new(),
+                    vectorized_pushdowns: 0,
+                    rows_scanned_vectorized: 0,
+                    auto_parallel_waves: 0,
+                    parallelized_tool_calls: 0,
+                };
+            }
         }
 
         // Verify SHA-256 script integrity before resuming
@@ -1260,35 +1302,63 @@ impl MCPProxyGateway {
             };
         }
 
+        // Atomic CAS under write lock: verify frame is unconsumed, mark consumed and fsync BEFORE executing mutation
+        let consumed_frame = match self.cache.registry.consume_frame(execution_id, approver) {
+            Ok(f) => f,
+            Err(reason) => {
+                return CodeOutput {
+                    status: FeatureStatus::ApprovalInvalid.as_str().to_string(),
+                    feature_status: FeatureStatus::ApprovalInvalid,
+                    error_code: Some(APPROVAL_INVALID),
+                    result: JsonValue::Null,
+                    logs: frame.logs,
+                    pending_approvals: Vec::new(),
+                    error: Some(format!(
+                        "Approval consumption failed (-32038 APPROVAL_INVALID): {}",
+                        reason
+                    )),
+                    boot_parse_us: 0,
+                    eval_us: 0,
+                    ops_consumed: 0,
+                    peak_memory_bytes: 0,
+                    tool_calls: 0,
+                    intermediate_bytes_processed: 0,
+                    output_bytes_returned: 0,
+                    traceparent: codemode_traceparent,
+                    execution_id: Some(execution_id.to_string()),
+                    suspended_frame: None,
+                    saga_compensations: Vec::new(),
+                    vectorized_pushdowns: 0,
+                    rows_scanned_vectorized: 0,
+                    auto_parallel_waves: 0,
+                    parallelized_tool_calls: 0,
+                };
+            }
+        };
+
         // Record cryptographic approval event in Merkle Audit Store
         if let Some(store) = &self.audit_store {
             store.record_invocation(
                 approver,
-                &frame.pending_server,
-                &frame.pending_tool,
-                &frame.pending_arguments,
+                &consumed_frame.pending_server,
+                &consumed_frame.pending_tool,
+                &consumed_frame.pending_arguments,
                 AUDIT_STATUS_CONTINUATION_RESUMED,
                 0,
             );
         }
 
-        // Mark the frame as consumed in WAL so replay is rejected with -32038 APPROVAL_INVALID
-        let mut consumed_frame = frame.clone();
-        consumed_frame.is_consumed = true;
-        consumed_frame.approver_identity = Some(approver.to_string());
-        self.cache.registry.save_suspended_frame(consumed_frame);
-
         let servers_snapshot = self.cache.list_servers();
-        let mut initial_completed = frame.completed_mutations.clone();
+        let mut initial_completed = consumed_frame.completed_mutations.clone();
 
         // Execute the now-approved pending mutation
         let (approved_output, maybe_mut) = match self.invoke_codemode_single_tool(
             &servers_snapshot,
-            &frame.pending_server,
-            &frame.pending_tool,
-            vec![frame.pending_arguments.clone()],
+            &consumed_frame.pending_server,
+            &consumed_frame.pending_tool,
+            vec![consumed_frame.pending_arguments.clone()],
             false,
-            &frame.caller_actor,
+            &consumed_frame.caller_actor,
             user_token,
             &codemode_traceparent,
         ) {
@@ -1402,6 +1472,7 @@ impl MCPProxyGateway {
             if let Some(ref mut next_frame) = output.suspended_frame {
                 next_frame.caller_actor = frame.caller_actor.clone();
                 next_frame.completed_mutations = completed_vec.clone();
+                next_frame.frame_hmac = next_frame.compute_hmac(crate::models::continuation_key());
                 self.cache.registry.save_suspended_frame(next_frame.clone());
             }
         } else if output.status == FeatureStatus::Error.as_str() && !completed_vec.is_empty() {

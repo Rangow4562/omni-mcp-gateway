@@ -166,13 +166,13 @@ impl OmniMCPServer {
             }),
             json!({
                 "name": "codemode",
-                "description": "Omni Code Mode execution sandbox. Write a single JavaScript/TypeScript `async () => { ... }` or Rust/Rhai script to coordinate multi-step tool calls (`await codemode.<server>.<tool>(input)`), loops, filtering, and aggregations in < 1ms without bloating the LLM context window.\n\nAvailable TypeScript Declarations:\n{{types}}",
+                "description": "Omni Code Mode execution sandbox. Write a single JavaScript/TypeScript script (supporting closure syntax `|x| expr` and service host calls) to coordinate multi-step tool calls (`await codemode.<server>.<tool>(input)`), loops, filtering, and aggregations in < 1ms without bloating the LLM context window.\n\nAvailable TypeScript Declarations:\n{{types}}",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "code": {
                             "type": "string",
-                            "description": "JavaScript/TypeScript `async () => { ... }` or Rust/Rhai script using `codemode.<server>.<tool>(args)` or `codemode.search(query)`"
+                            "description": "JavaScript/TypeScript script (or closure syntax) using `codemode.<server>.<tool>(args)` or `codemode.search(query)`"
                         },
                         "require_mutation_approval": {
                             "type": "boolean",
@@ -346,7 +346,7 @@ impl OmniMCPServer {
                             "extensions": {}
                         },
                         "serverInfo": {
-                            "name": "uber-omni-mcp-gateway",
+                            "name": "omni-mcp-gateway",
                             "version": env!("CARGO_PKG_VERSION"),
                             "description": concat!(
                                 "Omni MCP Autonomous Mesh Gateway & Code Mode Runtime (Rust Engine v",
@@ -376,7 +376,7 @@ impl OmniMCPServer {
                             "logging": {}
                         },
                         "serverInfo": {
-                            "name": "uber-omni-mcp-gateway",
+                            "name": "omni-mcp-gateway",
                             "version": env!("CARGO_PKG_VERSION"),
                             "description": concat!(
                                 "Omni MCP Autonomous Mesh Gateway & Code Mode Runtime (Rust Engine v",
@@ -1512,9 +1512,14 @@ impl OmniMCPServer {
             .and_then(|x| x.as_str())
             .unwrap_or(caller_actor);
 
-        let output = self
-            .gateway
-            .resume_codemode(execution_id, approver, None, user_token, None);
+        let digest = args
+            .get("arguments_digest")
+            .or_else(|| args.get("pending_arguments_hash"))
+            .and_then(|x| x.as_str());
+
+        let output =
+            self.gateway
+                .resume_codemode(execution_id, approver, None, user_token, None, digest);
         let is_err = output.status == "ERROR";
         let payload = output.to_json();
 

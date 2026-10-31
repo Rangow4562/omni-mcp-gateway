@@ -50,7 +50,7 @@ export const TestConsole: React.FC<TestConsoleProps> = ({
         headers: {
           'Content-Type': 'application/json',
           'X-Caller-Actor': callerActor,
-          'Authorization': 'Bearer uber_emp_demo_token',
+          'Authorization': 'Bearer demo_token_operator',
         },
         body: JSON.stringify({
           jsonrpc: '2.0',

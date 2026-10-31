@@ -492,6 +492,33 @@ impl MCPRegistry {
         }
     }
 
+    /// Atomic CAS under write lock: checks that frame is not yet consumed, marks consumed with approver.
+    pub fn consume_frame(
+        &self,
+        execution_id: &str,
+        approver: &str,
+    ) -> Result<SuspendedExecutionFrame, &'static str> {
+        if let Some(store) = &self.store {
+            let res = store.consume_frame(execution_id, approver)?;
+            let mut guard = self.inner.write().unwrap();
+            guard
+                .suspended_frames
+                .insert(execution_id.to_string(), res.clone());
+            return Ok(res);
+        }
+        let mut guard = self.inner.write().unwrap();
+        let frame = match guard.suspended_frames.get_mut(execution_id) {
+            Some(f) => f,
+            None => return Err("Approval continuation frame not found or expired"),
+        };
+        if frame.is_consumed {
+            return Err("Approval has already been consumed (single-use violated)");
+        }
+        frame.is_consumed = true;
+        frame.approver_identity = Some(approver.to_string());
+        Ok(frame.clone())
+    }
+
     pub fn get_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
         if let Some(store) = &self.store {
             if let Some(f) = store.get_suspended_frame(execution_id) {

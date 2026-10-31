@@ -331,6 +331,8 @@ impl MerkleAuditStore {
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
                 let line = record.to_json().to_string_compact();
                 let _ = writeln!(f, "{}", line);
+                let _ = f.flush();
+                let _ = f.sync_all();
             }
         }
 

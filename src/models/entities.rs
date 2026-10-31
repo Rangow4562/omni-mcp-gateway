@@ -68,9 +68,49 @@ fn gather_entropy(dest: &mut [u8]) {
     mixed.extend_from_slice(&stack_addr.to_be_bytes());
     mixed.extend_from_slice(&TRACE_COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
 
+    // Mix in the OS CSPRNG when reachable through `std` (Unix `/dev/urandom`).
+    // On platforms without it (e.g. Windows, which has no std-only CSPRNG path
+    // under `forbid(unsafe_code)`) this falls back to the weaker clock/PID mix.
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let mut os_bytes = [0u8; 32];
+        if f.read_exact(&mut os_bytes).is_ok() {
+            mixed.extend_from_slice(&os_bytes);
+        }
+    }
+
     let hash = crate::storage::audit_log::sha256(&mixed);
     let len = dest.len().min(32);
     dest[..len].copy_from_slice(&hash[..len]);
+}
+
+/// Returns the HMAC key used to sign and verify continuation frames.
+///
+/// Uses `OMNI_AUTH_SECRET` when configured. Otherwise a random per-process key
+/// is generated, so no publicly known constant can be used to forge frames
+/// (frames signed in one process are then not resumable after a restart).
+pub fn continuation_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let secret = crate::config::get_config().auth_secret;
+        if !secret.is_empty() {
+            return secret;
+        }
+        let mut buf = [0u8; 32];
+        gather_entropy(&mut buf);
+        buf.iter().map(|b| format!("{:02x}", b)).collect()
+    })
+}
+
+/// Constant-time equality for secrets/signatures.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
 }
 
 /// Generates a 26-character Crockford Base32 ULID (48-bit ms timestamp + 80-bit monotonic OS entropy).
@@ -557,16 +597,28 @@ pub struct SuspendedExecutionFrame {
 impl SuspendedExecutionFrame {
     /// Computes HMAC-SHA256 over canonical frame fields using `auth_secret`.
     pub fn compute_hmac(&self, secret: &str) -> String {
-        let canonical = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            self.execution_id,
-            self.script_hash,
-            self.instruction_ptr,
-            self.pending_server,
-            self.pending_tool,
-            self.pending_arguments_hash,
-            self.expires_at as u64,
-        );
+        // Length-prefixed canonical encoding covering the entire frame so no
+        // field can be altered or shifted between fields without detection.
+        let fields: [String; 12] = [
+            self.execution_id.clone(),
+            self.script_hash.clone(),
+            self.script_source.clone(),
+            self.instruction_ptr.to_string(),
+            self.serialized_scope.to_string_compact(),
+            self.pending_server.clone(),
+            self.pending_tool.clone(),
+            self.pending_arguments.to_string_compact(),
+            self.pending_arguments_hash.clone(),
+            self.policy_context_hash.clone(),
+            self.caller_actor.clone(),
+            (self.expires_at as u64).to_string(),
+        ];
+        let mut canonical = String::new();
+        for f in &fields {
+            canonical.push_str(&f.len().to_string());
+            canonical.push(':');
+            canonical.push_str(f);
+        }
         crate::storage::audit_log::hmac_sha256_hex(secret.as_bytes(), canonical.as_bytes())
     }
 
@@ -585,14 +637,27 @@ impl SuspendedExecutionFrame {
         if approver.trim().is_empty() || approver == "anonymous" {
             return Err("Unauthenticated or empty approver identity");
         }
+        if approver == self.caller_actor {
+            return Err("Approval denied: Requester cannot approve their own mutation (separation of duties)");
+        }
         if current_time > self.expires_at {
             return Err("Approval frame has expired");
         }
-        if !self.frame_hmac.is_empty() {
-            let expected_hmac = self.compute_hmac(secret);
-            if self.frame_hmac != expected_hmac {
-                return Err("Frame HMAC signature mismatch (tampering detected)");
-            }
+        if self.frame_hmac.is_empty() {
+            return Err("Frame HMAC signature missing (unsigned frames are rejected)");
+        }
+        let expected_hmac = self.compute_hmac(secret);
+        if !constant_time_eq(self.frame_hmac.as_bytes(), expected_hmac.as_bytes()) {
+            return Err("Frame HMAC signature mismatch (tampering detected)");
+        }
+        let actual_pending_hash = crate::storage::audit_log::sha256_hex(
+            self.pending_arguments.to_string_compact().as_bytes(),
+        );
+        if !constant_time_eq(
+            actual_pending_hash.as_bytes(),
+            self.pending_arguments_hash.as_bytes(),
+        ) {
+            return Err("Pending arguments do not match their recorded hash");
         }
         if let Some(args) = resume_args {
             let actual_args_hash =

@@ -1,4 +1,4 @@
-//! Comprehensive Production Test Suite for Omni MCP Platform (Rust 2.0 Engine).
+//! Comprehensive Production Test Suite for Omni MCP Platform.
 //! Verifies all 13 REA architecture claims + advanced Rust resilience & performance capabilities.
 
 use omni_mcp::config::OmniConfig;
@@ -1393,10 +1393,14 @@ fn test_v4_5_resumable_ast_continuation_suspend_and_resume() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].execution_id, exec_id);
 
-    // Resume after human approval without re-running step 0 (`uber_rides.list_recent`)
-    let resumed_out =
-        ctx.gateway
-            .resume_codemode(&exec_id, "security_lead", None, Some("uber_token_1"), None);
+    let resumed_out = ctx.gateway.resume_codemode(
+        &exec_id,
+        "security_lead",
+        None,
+        Some("uber_token_1"),
+        None,
+        None,
+    );
     assert_eq!(
         resumed_out.status, "OK",
         "Resume error: {:?}",
@@ -1713,7 +1717,7 @@ fn test_v4_6_protocol_version_negotiation_and_error_contract() {
     let resp_2025 = ctx.omni_mcp.handle_request(&init_2025, "agent", None);
     assert_eq!(
         resp_2025.result.as_ref().unwrap()["protocolVersion"].as_str(),
-        Some(LATEST_MCP_PROTOCOL_VERSION)
+        Some("2025-03-26")
     );
 
     let init_unknown =
@@ -1723,6 +1727,20 @@ fn test_v4_6_protocol_version_negotiation_and_error_contract() {
             .handle_request("driverdispatchservice", &init_unknown, "agent", None);
     assert_eq!(
         resp_unknown.result.as_ref().unwrap()["protocolVersion"].as_str(),
+        Some(LATEST_MCP_PROTOCOL_VERSION)
+    );
+
+    // Assert that 2026-07-28 is not offered during negotiation when implemented: false, falling back to 2025-11-25
+    let init_2026 = RPCRequest::new(
+        31i64,
+        "initialize",
+        json!({"protocolVersion": "2026-07-28"}),
+    );
+    let resp_2026 = ctx
+        .gateway
+        .handle_request("driverdispatchservice", &init_2026, "agent", None);
+    assert_eq!(
+        resp_2026.result.as_ref().unwrap()["protocolVersion"].as_str(),
         Some(LATEST_MCP_PROTOCOL_VERSION)
     );
 
@@ -1803,15 +1821,9 @@ fn test_v4_7_mcp_protocol_parity_five_versions() {
     let ctx = ProductionGatewayContext::new(Some(cfg));
     let omni = &ctx.omni_mcp;
 
-    // 1. Handshake across all 5 revisions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, 2026-07-28
-    let versions = [
-        "2024-11-05",
-        "2025-03-26",
-        "2025-06-18",
-        "2025-11-25",
-        "2026-07-28",
-    ];
-    for ver in &versions {
+    // 1. Handshake across implemented revisions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25
+    let implemented_versions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+    for ver in &implemented_versions {
         let init_req = RPCRequest::new(
             1i64,
             "initialize",
@@ -1826,13 +1838,30 @@ fn test_v4_7_mcp_protocol_parity_five_versions() {
         assert_eq!(res["protocolVersion"].as_str(), Some(*ver));
     }
 
-    // 2. Discover RPC (2026-07-28 stateless requirement)
+    // Assert that 2026-07-28 is NOT offered during negotiation when implemented: false, falling back to LATEST_MCP_PROTOCOL_VERSION ("2025-11-25")
+    let init_2026 = RPCRequest::new(
+        10i64,
+        "initialize",
+        json!({
+            "protocolVersion": "2026-07-28",
+            "clientInfo": {"name": "test-harness", "version": "1.0.0"}
+        }),
+    );
+    let resp_2026 = omni.handle_request(&init_2026, "agent", None);
+    assert!(resp_2026.error.is_none());
+    assert_eq!(
+        resp_2026.result.unwrap()["protocolVersion"].as_str(),
+        Some(omni_mcp::models::LATEST_MCP_PROTOCOL_VERSION)
+    );
+
+    // 2. Discover RPC (advertising only implemented revisions)
     let discover_req = RPCRequest::new(2i64, "server/discover", JsonValue::object());
     let discover_resp = omni.handle_request(&discover_req, "agent", None);
     assert!(discover_resp.error.is_none());
     let disc_res = discover_resp.result.unwrap();
     let supp = disc_res["supportedVersions"].as_array().unwrap();
-    assert_eq!(supp.len(), 5);
+    assert_eq!(supp.len(), 4);
+    assert_eq!(supp[3].as_str(), Some("2025-11-25"));
     assert!(disc_res["capabilities"]["extensions"].is_object());
 
     // 3. Subscriptions/listen RPC
@@ -1982,14 +2011,14 @@ fn test_v4_7_approval_hardening_hmac_and_single_use_32038() {
     // 2. Resume with valid approver identity succeeds
     let resume_out =
         ctx.gateway
-            .resume_codemode(&exec_id, "sec_auditor_alice", None, Some("tok"), None);
+            .resume_codemode(&exec_id, "sec_auditor_alice", None, Some("tok"), None, None);
     assert_eq!(resume_out.status, "OK");
     assert_eq!(resume_out.error_code, None);
 
     // 3. Replaying the consumed frame is rejected with -32038 APPROVAL_INVALID
     let replay_out =
         ctx.gateway
-            .resume_codemode(&exec_id, "sec_auditor_alice", None, Some("tok"), None);
+            .resume_codemode(&exec_id, "sec_auditor_alice", None, Some("tok"), None, None);
     assert_eq!(replay_out.status, "APPROVAL_INVALID");
     assert_eq!(replay_out.error_code, Some(-32038));
 
@@ -2114,5 +2143,492 @@ fn test_v4_7_persistent_saga_ledger() {
     assert!(reopened.list_pending_saga_compensations().is_empty());
 
     reopened.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_0_auth_matrix_and_trust_boundary_reset() {
+    let dir = temp_test_path("omni_v50_trust_boundary");
+    let _ = fs::create_dir_all(&dir);
+
+    // 1. A11: validate_bind refuses non-loopback without auth_secret
+    let mut no_secret_cfg = OmniConfig {
+        data_dir: dir.clone(),
+        host: "0.0.0.0".to_string(),
+        auth_secret: String::new(),
+        ..Default::default()
+    };
+    assert!(no_secret_cfg.validate_bind("0.0.0.0").is_err());
+    assert!(no_secret_cfg.validate_bind("192.168.1.10").is_err());
+    assert!(no_secret_cfg.validate_bind("127.0.0.1").is_ok());
+    assert!(no_secret_cfg.validate_bind("localhost").is_ok());
+
+    no_secret_cfg.auth_secret = "enterprise_secret_k".to_string();
+    assert!(no_secret_cfg.validate_bind("0.0.0.0").is_ok());
+
+    // 2. A1 & A2: Central deny-by-default auth matrix
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        host: "127.0.0.1".to_string(),
+        auth_secret: "admin:admin_tok,operator:oper_tok,approver:appr_tok,agent:agent_tok"
+            .to_string(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let no_auth = HashMap::new();
+    let mut bad_auth = HashMap::new();
+    bad_auth.insert(
+        "authorization".to_string(),
+        "Bearer bogus_token".to_string(),
+    );
+
+    let mut agent_auth = HashMap::new();
+    agent_auth.insert("authorization".to_string(), "Bearer agent_tok".to_string());
+
+    let mut oper_auth = HashMap::new();
+    oper_auth.insert("authorization".to_string(), "Bearer oper_tok".to_string());
+
+    let mut appr_auth = HashMap::new();
+    appr_auth.insert("authorization".to_string(), "Bearer appr_tok".to_string());
+
+    let mut admin_auth = HashMap::new();
+    admin_auth.insert("authorization".to_string(), "Bearer admin_tok".to_string());
+
+    // (a) Route requiring Agent: /api/stats
+    assert_eq!(ctx.handle_http("GET", "/api/stats", &no_auth, &[]).0, 401);
+    assert_eq!(ctx.handle_http("GET", "/api/stats", &bad_auth, &[]).0, 401);
+    assert_eq!(
+        ctx.handle_http("GET", "/api/stats", &agent_auth, &[]).0,
+        200
+    );
+    assert_eq!(ctx.handle_http("GET", "/api/stats", &oper_auth, &[]).0, 200);
+    assert_eq!(
+        ctx.handle_http("GET", "/api/stats", &admin_auth, &[]).0,
+        200
+    );
+
+    // (b) Route requiring Operator: /api/audit
+    assert_eq!(ctx.handle_http("GET", "/api/audit", &no_auth, &[]).0, 401);
+    assert_eq!(ctx.handle_http("GET", "/api/audit", &bad_auth, &[]).0, 401);
+    assert_eq!(
+        ctx.handle_http("GET", "/api/audit", &agent_auth, &[]).0,
+        403
+    ); // Agent lacks Operator
+    assert_eq!(ctx.handle_http("GET", "/api/audit", &oper_auth, &[]).0, 200);
+    assert_eq!(
+        ctx.handle_http("GET", "/api/audit", &admin_auth, &[]).0,
+        200
+    );
+
+    // (c) Route requiring Approver: /api/codemode/suspended
+    assert_eq!(
+        ctx.handle_http("GET", "/api/codemode/suspended", &no_auth, &[])
+            .0,
+        401
+    );
+    assert_eq!(
+        ctx.handle_http("GET", "/api/codemode/suspended", &bad_auth, &[])
+            .0,
+        401
+    );
+    assert_eq!(
+        ctx.handle_http("GET", "/api/codemode/suspended", &agent_auth, &[])
+            .0,
+        403
+    );
+    assert_eq!(
+        ctx.handle_http("GET", "/api/codemode/suspended", &oper_auth, &[])
+            .0,
+        403
+    );
+    assert_eq!(
+        ctx.handle_http("GET", "/api/codemode/suspended", &appr_auth, &[])
+            .0,
+        200
+    );
+    assert_eq!(
+        ctx.handle_http("GET", "/api/codemode/suspended", &admin_auth, &[])
+            .0,
+        200
+    );
+
+    // (d) Route requiring Admin: /api/crawler/trigger
+    assert_eq!(
+        ctx.handle_http("POST", "/api/crawler/trigger", &no_auth, b"{}")
+            .0,
+        401
+    );
+    assert_eq!(
+        ctx.handle_http("POST", "/api/crawler/trigger", &bad_auth, b"{}")
+            .0,
+        401
+    );
+    assert_eq!(
+        ctx.handle_http("POST", "/api/crawler/trigger", &agent_auth, b"{}")
+            .0,
+        403
+    );
+    assert_eq!(
+        ctx.handle_http("POST", "/api/crawler/trigger", &oper_auth, b"{}")
+            .0,
+        403
+    );
+    assert_eq!(
+        ctx.handle_http("POST", "/api/crawler/trigger", &appr_auth, b"{}")
+            .0,
+        403
+    );
+    assert_eq!(
+        ctx.handle_http("POST", "/api/crawler/trigger", &admin_auth, b"{}")
+            .0,
+        200
+    );
+
+    // 3. A3: Human approval gate separation of duties
+    let mut frame = omni_mcp::models::SuspendedExecutionFrame {
+        execution_id: "01JTESTAPPROVAL000000000001".to_string(),
+        script_hash: "hash".to_string(),
+        script_source: "codemode.pay.charge()".to_string(),
+        instruction_ptr: 1,
+        target_var: None,
+        serialized_scope: json!({}),
+        pending_server: "payments".to_string(),
+        pending_tool: "charge".to_string(),
+        pending_arguments: json!({"amount": 100}),
+        pending_reason: "mutation gate".to_string(),
+        policy_context_hash: "pol".to_string(),
+        caller_actor: "agent_requester".to_string(),
+        logs: Vec::new(),
+        completed_mutations: Vec::new(),
+        created_at: 1000.0,
+        pending_arguments_hash: omni_mcp::storage::audit_log::sha256_hex(b"{\"amount\":100}"),
+        expires_at: 5000.0,
+        approver_identity: None,
+        is_consumed: false,
+        frame_hmac: String::new(),
+    };
+    frame.frame_hmac = frame.compute_hmac("test_secret");
+
+    // Requester cannot approve their own mutation
+    let self_approve_err = frame.verify_approval(
+        "test_secret",
+        "agent_requester",
+        Some(&json!({"amount": 100})),
+        1100.0,
+    );
+    assert!(self_approve_err.is_err());
+    assert!(self_approve_err
+        .unwrap_err()
+        .contains("Requester cannot approve their own mutation"));
+
+    // Distinct approver succeeds
+    let valid_approve = frame.verify_approval(
+        "test_secret",
+        "security_officer_bob",
+        Some(&json!({"amount": 100})),
+        1100.0,
+    );
+    assert!(valid_approve.is_ok());
+
+    // 4. A4: Missing or invalid frame HMAC rejected
+    let mut unverified_frame = frame.clone();
+    unverified_frame.frame_hmac = String::new();
+    assert!(unverified_frame
+        .verify_approval("test_secret", "bob", Some(&json!({"amount": 100})), 1100.0)
+        .is_err());
+
+    let mut tampered_frame = frame.clone();
+    tampered_frame.pending_tool = "refund_unauthorized".to_string();
+    assert!(tampered_frame
+        .verify_approval("test_secret", "bob", Some(&json!({"amount": 100})), 1100.0)
+        .is_err());
+
+    // 5. A10: Origin "null" and DNS-rebinding attacks are blocked
+    let mut null_origin_hdr = HashMap::new();
+    null_origin_hdr.insert("host".to_string(), "localhost:8080".to_string());
+    null_origin_hdr.insert("origin".to_string(), "null".to_string());
+    assert_eq!(
+        ctx.handle_http("GET", "/healthz", &null_origin_hdr, &[]).0,
+        403
+    );
+
+    let mut evil_origin_hdr = HashMap::new();
+    evil_origin_hdr.insert("host".to_string(), "localhost:8080".to_string());
+    evil_origin_hdr.insert(
+        "origin".to_string(),
+        "http://localhost.evil.com".to_string(),
+    );
+    assert_eq!(
+        ctx.handle_http("GET", "/healthz", &evil_origin_hdr, &[]).0,
+        403
+    );
+
+    let mut valid_local_origin_hdr = HashMap::new();
+    valid_local_origin_hdr.insert("host".to_string(), "localhost:8080".to_string());
+    valid_local_origin_hdr.insert("origin".to_string(), "http://localhost:3000".to_string());
+    assert_eq!(
+        ctx.handle_http("GET", "/healthz", &valid_local_origin_hdr, &[])
+            .0,
+        200
+    );
+
+    // 6. A7: JSON depth limit rejects deep nesting without stack overflow
+    let deep_nest = "[".repeat(70) + &"]".repeat(70);
+    let parse_err = JsonValue::parse(&deep_nest);
+    assert!(parse_err.is_err());
+    assert!(parse_err.unwrap_err().contains("maximum depth"));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_0_atomic_cas_concurrent_double_resume_and_digest() {
+    let dir = temp_test_path("omni_v50_cas_test");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = Arc::new(ProductionGatewayContext::new(Some(cfg)));
+
+    let script = r#"
+    async () => {
+        const res = await codemode.accounting.refund({
+            ride_id: "ride_cas_test_1",
+            reason: "Charge dispute"
+        });
+        return res;
+    }
+    "#;
+
+    // 1. Initial run suspends with APPROVAL_REQUIRED
+    let out = ctx
+        .gateway
+        .execute_codemode(script, None, true, "agent", Some("tok"), None);
+    assert_eq!(out.status, "APPROVAL_REQUIRED");
+    assert_eq!(out.error_code, Some(-32031));
+    let frame = out.suspended_frame.expect("Must have suspended frame");
+    let exec_id = frame.execution_id.clone();
+    let pending_hash = frame.pending_arguments_hash.clone();
+
+    // 2. Approver argument digest mismatch is rejected with -32038
+    let bad_digest_out = ctx.gateway.resume_codemode(
+        &exec_id,
+        "sec_auditor_alice",
+        None,
+        Some("tok"),
+        None,
+        Some("deadbeef1234567890abcdefdeadbeef1234567890abcdefdeadbeef12345678"),
+    );
+    assert_eq!(bad_digest_out.status, "APPROVAL_INVALID");
+    assert_eq!(bad_digest_out.error_code, Some(-32038));
+    assert!(bad_digest_out.error.unwrap().contains("digest mismatch"));
+
+    // 3. Concurrent double-resume test: spawn 2 threads racing to resume
+    let ctx1 = ctx.clone();
+    let exec1 = exec_id.clone();
+    let hash1 = pending_hash.clone();
+    let h1 = std::thread::spawn(move || {
+        // Uppercase digest normalization test
+        let upper_hash = hash1.to_uppercase();
+        ctx1.gateway.resume_codemode(
+            &exec1,
+            "sec_auditor_alice",
+            None,
+            Some("tok"),
+            None,
+            Some(&upper_hash),
+        )
+    });
+
+    let ctx2 = ctx.clone();
+    let exec2 = exec_id.clone();
+    let hash2 = pending_hash.clone();
+    let h2 = std::thread::spawn(move || {
+        ctx2.gateway.resume_codemode(
+            &exec2,
+            "sec_auditor_bob",
+            None,
+            Some("tok"),
+            None,
+            Some(&hash2),
+        )
+    });
+
+    let res1 = h1.join().expect("Thread 1 join");
+    let res2 = h2.join().expect("Thread 2 join");
+
+    let ok_count = (if res1.status == "OK" && res1.error_code.is_none() {
+        1
+    } else {
+        0
+    }) + (if res2.status == "OK" && res2.error_code.is_none() {
+        1
+    } else {
+        0
+    });
+    let rejected_count =
+        (if res1.status == "APPROVAL_INVALID" && res1.error_code == Some(-32038) {
+            1
+        } else {
+            0
+        }) + (if res2.status == "APPROVAL_INVALID" && res2.error_code == Some(-32038) {
+            1
+        } else {
+            0
+        });
+
+    assert_eq!(ok_count, 1, "Exactly one concurrent resume must succeed");
+    assert_eq!(
+        rejected_count, 1,
+        "Exactly one concurrent resume must be rejected by atomic CAS"
+    );
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_0_raw_socket_http_framing_and_worker_resilience() {
+    use std::io::{Read, Write};
+
+    struct MockStream {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl MockStream {
+        fn new(input_bytes: &[u8]) -> Self {
+            Self {
+                input: std::io::Cursor::new(input_bytes.to_vec()),
+                output: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.output.flush()
+        }
+    }
+
+    let dir = temp_test_path("omni_v50_raw_framing");
+    let _ = fs::create_dir_all(&dir);
+
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        auth_secret: "test_secret_for_framing_123".to_string(),
+        max_body_size_bytes: 1024,
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // Case 1: Transfer-Encoding without Content-Length rejected with 501
+    {
+        let mut mock = MockStream::new(
+            b"POST /api/execute HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        omni_mcp::server::handle_stream(&mut mock, &ctx);
+        let resp_str = String::from_utf8_lossy(&mock.output);
+        assert!(
+            resp_str.contains("HTTP/1.1 501 Not Implemented"),
+            "Expected 501, got: {}",
+            resp_str
+        );
+        assert!(resp_str.contains("Transfer-Encoding not supported"));
+        assert!(resp_str.contains("Connection: close"));
+    }
+
+    // Case 2: Malformed Content-Length (non-digit) rejected with 400
+    {
+        let mut mock = MockStream::new(
+            b"POST /api/execute HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 12abc\r\n\r\n",
+        );
+        omni_mcp::server::handle_stream(&mut mock, &ctx);
+        let resp_str = String::from_utf8_lossy(&mock.output);
+        assert!(
+            resp_str.contains("HTTP/1.1 400 Bad Request"),
+            "Expected 400, got: {}",
+            resp_str
+        );
+        assert!(resp_str.contains("Invalid Content-Length"));
+        assert!(resp_str.contains("Connection: close"));
+    }
+
+    // Case 3: Conflicting Content-Length and Transfer-Encoding rejected with 400
+    {
+        let mut mock = MockStream::new(
+            b"POST /api/execute HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+        );
+        omni_mcp::server::handle_stream(&mut mock, &ctx);
+        let resp_str = String::from_utf8_lossy(&mock.output);
+        assert!(
+            resp_str.contains("HTTP/1.1 400 Bad Request"),
+            "Expected 400, got: {}",
+            resp_str
+        );
+        assert!(resp_str.contains("Conflicting Content-Length / Transfer-Encoding"));
+        assert!(resp_str.contains("Connection: close"));
+    }
+
+    // Case 4: Content-Length exceeds max_body_size_bytes rejected with 413 and connection closed
+    {
+        let mut mock = MockStream::new(
+            b"POST /api/execute HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5000\r\n\r\n",
+        );
+        omni_mcp::server::handle_stream(&mut mock, &ctx);
+        let resp_str = String::from_utf8_lossy(&mock.output);
+        assert!(
+            resp_str.contains("HTTP/1.1 413 Payload Too Large"),
+            "Expected 413, got: {}",
+            resp_str
+        );
+        assert!(resp_str.contains("Connection: close"));
+    }
+
+    // Case 5: Pipelined keep-alive requests on single persistent connection
+    {
+        let pipelined = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\nGET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        let mut mock = MockStream::new(pipelined);
+        omni_mcp::server::handle_stream(&mut mock, &ctx);
+        let resp_str = String::from_utf8_lossy(&mock.output);
+        let ok_count = resp_str.matches("HTTP/1.1 200 OK").count();
+        assert_eq!(
+            ok_count, 2,
+            "Expected 2 responses for pipelined keep-alive requests on single BufReader, got: {}",
+            resp_str
+        );
+    }
+
+    // Case 6: Line length cap (A9: reject lines exceeding 8192 bytes)
+    {
+        let mut huge_line = vec![b'A'; 9000];
+        huge_line.extend_from_slice(b"\r\n\r\n");
+        let mut mock = MockStream::new(&huge_line);
+        omni_mcp::server::handle_stream(&mut mock, &ctx);
+        // Connection closed cleanly by server due to line cap error
+        assert!(mock.output.is_empty() || String::from_utf8_lossy(&mock.output).contains("431"));
+    }
+
+    // Case 7: Panic containment with catch_unwind
+    {
+        let panic_safe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut mock = MockStream::new(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            omni_mcp::server::handle_stream(&mut mock, &ctx);
+        }));
+        assert!(panic_safe.is_ok());
+    }
+
+    ctx.store.close();
     let _ = fs::remove_dir_all(&dir);
 }

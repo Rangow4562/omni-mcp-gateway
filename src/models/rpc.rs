@@ -32,7 +32,7 @@ pub const APPROVAL_INVALID: i32 = -32038;
 
 // Supported MCP Protocol Versions for Lifecycle Handshake Negotiation
 pub const LEGACY_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
-pub const LATEST_MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+pub const LATEST_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Per-revision MCP behavior. Protocol behavior is driven by this table rather than by
 /// scattered version string comparisons.
@@ -89,7 +89,7 @@ pub const PROTOCOL_CAPABILITY_TABLE: &[ProtocolCapabilities] = &[
     },
     ProtocolCapabilities {
         version: "2026-07-28",
-        implemented: true,
+        implemented: false,
         session_based: false,
         allows_batching: false,
         structured_tool_output: true,
@@ -98,13 +98,8 @@ pub const PROTOCOL_CAPABILITY_TABLE: &[ProtocolCapabilities] = &[
 ];
 
 /// Revisions the gateway can actually negotiate today.
-pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
-    "2024-11-05",
-    "2025-03-26",
-    "2025-06-18",
-    "2025-11-25",
-    "2026-07-28",
-];
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
+    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 
 /// Looks up the capability row for a revision identifier (implemented or not).
 pub fn protocol_capabilities(version: &str) -> Option<&'static ProtocolCapabilities> {
@@ -116,7 +111,7 @@ pub fn protocol_capabilities(version: &str) -> Option<&'static ProtocolCapabilit
 
 /// Negotiates the MCP protocol version during `initialize`.
 /// Echoes the client's requested `protocolVersion` if the gateway implements it;
-/// otherwise responds with `LATEST_MCP_PROTOCOL_VERSION` (`"2025-03-26"`).
+/// otherwise responds with `LATEST_MCP_PROTOCOL_VERSION` (`"2025-11-25"`).
 pub fn negotiate_protocol_version(client_version: Option<&str>) -> &'static str {
     if let Some(req_ver) = client_version {
         if let Some(caps) = protocol_capabilities(req_ver) {

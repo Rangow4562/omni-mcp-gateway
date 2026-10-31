@@ -13,6 +13,10 @@ fn main() {
 
     // Support stdio MCP server mode for harness agents and MCP plugins
     if let Some(first) = args.first() {
+        if first == "--version" || first == "-V" || first == "version" {
+            println!("omni-mcp v{}", env!("CARGO_PKG_VERSION"));
+            process::exit(0);
+        }
         if first == "--stdio" || first == "stdio" || first == "serve-stdio" {
             let mut server_name = None;
             let mut i = 1;
@@ -26,17 +30,22 @@ fn main() {
             }
             process::exit(omni_mcp::server::run_stdio_server(server_name));
         }
-        if first == "mcp" || first == "--help" || first == "-h" {
+        if first == "mcp" || first == "aifx" || first == "--help" || first == "-h" {
             process::exit(run_aifx_cli(&args));
         }
     }
 
     let cfg = get_config();
-    let host = cfg.host;
+    let host = cfg.host.clone();
     let port = args
         .first()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(cfg.port);
+
+    if let Err(err) = cfg.validate_bind(&host) {
+        eprintln!("[!] Configuration Error: {}", err);
+        process::exit(1);
+    }
 
     if let Err(err) = run_server(&host, port) {
         eprintln!("[!] Error running Omni MCP Gateway: {}", err);

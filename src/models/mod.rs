@@ -3,10 +3,10 @@ pub mod rpc;
 pub mod schema_validator;
 
 pub use entities::{
-    format_traceparent, generate_span_id, generate_trace_id, generate_ulid, parse_traceparent,
-    ActorType, CharterPolicy, CompletedMutationRecord, ConfigDiff, HistoryEntry,
-    MutationCompensationSpec, ProtocolType, SagaCompensationRecord, ServerRecord,
-    SuspendedExecutionFrame, ToolRecord, ToolStatus, TraceSpan,
+    constant_time_eq, continuation_key, format_traceparent, generate_span_id, generate_trace_id,
+    generate_ulid, parse_traceparent, ActorType, CharterPolicy, CompletedMutationRecord,
+    ConfigDiff, HistoryEntry, MutationCompensationSpec, ProtocolType, SagaCompensationRecord,
+    ServerRecord, SuspendedExecutionFrame, ToolRecord, ToolStatus, TraceSpan,
 };
 pub use rpc::{
     negotiate_protocol_version, protocol_capabilities, FeatureStatus, ProtocolCapabilities,

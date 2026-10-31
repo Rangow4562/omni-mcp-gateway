@@ -108,7 +108,10 @@ impl MuttleyMeshClient {
         protocol: ProtocolType,
     ) -> JsonValue {
         // Provide realistic multi-record arrays for Code Mode multi-step workflows
-        if (service_name == "uber_rides" || service_name == "uberridesservice")
+        if (service_name == "rides_service"
+            || service_name == "ridesservice"
+            || service_name == "uber_rides"
+            || service_name == "uberridesservice")
             && (method_name == "list_recent" || method_name == "ListRecentRides")
         {
             return json!([
@@ -149,7 +152,7 @@ impl MuttleyMeshClient {
                 "driver": {
                     "id": "drv_88492",
                     "name": "Jane Doe",
-                    "email": "driver.jane@uber-internal-partner.com",
+                    "email": "driver.jane@partner-fleet.com",
                     "phone": "+1-555-019-2834",
                     "rating": 4.96,
                     "vehicle": {

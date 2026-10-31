@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! `aifx` CLI Binary Entrypoint (Uber Code Mode CLI).
+//! `aifx` CLI Binary Entrypoint (Code Mode CLI).
 
 use omni_mcp::extension::run_aifx_cli;
 use std::env;

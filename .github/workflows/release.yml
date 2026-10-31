@@ -87,6 +87,8 @@ jobs:
     permissions:
       contents: write
       packages: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +101,9 @@ jobs:
         run: |
           mkdir -p release-assets
           find artifacts -type f -exec cp {} release-assets/ \;
+          cd release-assets
+          sha256sum omni-gateway-* > SHA256SUMS 2>/dev/null || shasum -a 256 omni-gateway-* > SHA256SUMS || true
+          cd ..
           ls -la release-assets
 
       - name: Create or Update GitHub Release
@@ -106,7 +111,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: release-assets/*
-          body_path: docs/RELEASE_v4.7.0.md
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -118,7 +122,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Publish to NPM
-        if: env.NPM_TOKEN != ''
+        if: ${{ env.NPM_TOKEN != '' }}
         run: |
           # Copy all platform binaries into bin folder before packaging
           cp release-assets/omni-gateway-win32-x64.exe bin/ 2>/dev/null || true
@@ -130,7 +134,6 @@ jobs:
           npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Set up Node.js for GitHub Packages
         uses: actions/setup-node@v4

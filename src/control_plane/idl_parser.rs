@@ -54,7 +54,7 @@ impl IDLParser {
     /// Parses a Protobuf (.proto) string definition into ServiceDefinitions.
     pub fn parse_protobuf(content: &str) -> Vec<ServiceDefinition> {
         let mut services = Vec::new();
-        let mut package = "uber.service".to_string();
+        let mut package = "fleet.service".to_string();
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -189,7 +189,7 @@ impl IDLParser {
     /// Parses a Thrift (.thrift) string definition into ServiceDefinitions (TChannel protocol).
     pub fn parse_thrift(content: &str) -> Vec<ServiceDefinition> {
         let mut services = Vec::new();
-        let mut package = "uber.tchannel".to_string();
+        let mut package = "fleet.tchannel".to_string();
 
         for line in content.lines() {
             let trimmed = line.trim();

@@ -11,6 +11,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const https = require('https');
+const crypto = require('crypto');
 
 const VERSION = require('../package.json').version;
 const GITHUB_REPO = 'Rangow4562/omni-mcp-gateway';
@@ -35,24 +36,93 @@ function getPlatformBinaryName() {
   return null;
 }
 
-function downloadFile(url, dest) {
+function fetchBuffer(url) {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+        return fetchBuffer(res.headers.location).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+function downloadFileWithHash(url, tempDest) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return downloadFileWithHash(res.headers.location, tempDest).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) {
         return reject(new Error(`Failed to download binary: HTTP ${res.statusCode}`));
       }
-      const file = fs.createWriteStream(dest);
+      const hash = crypto.createHash('sha256');
+      const file = fs.createWriteStream(tempDest);
+      res.on('data', chunk => hash.update(chunk));
       res.pipe(file);
       file.on('finish', () => {
-        file.close(resolve);
+        file.close(() => {
+          resolve(hash.digest('hex'));
+        });
+      });
+      file.on('error', (err) => {
+        fs.unlink(tempDest, () => {});
+        reject(err);
       });
     }).on('error', (err) => {
-      fs.unlink(dest, () => reject(err));
+      fs.unlink(tempDest, () => {});
+      reject(err);
     });
   });
+}
+
+async function downloadAndVerify(url, cachedBinary, binaryFileName) {
+  const tempBinary = `${cachedBinary}.${Date.now()}.tmp`;
+  try {
+    const computedHash = await downloadFileWithHash(url, tempBinary);
+
+    // Optional verification against SHA256SUMS if published
+    const checksumsUrl = `https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}/SHA256SUMS`;
+    try {
+      const checksumsBuf = await fetchBuffer(checksumsUrl);
+      const checksumsText = checksumsBuf.toString('utf8');
+      const lines = checksumsText.split('\n');
+      for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          const expectedHash = parts[0].toLowerCase();
+          const filename = parts[1].replace(/^\*/, '');
+          if (filename === binaryFileName) {
+            if (computedHash.toLowerCase() !== expectedHash) {
+              throw new Error(`SHA-256 verification failed for ${binaryFileName}! Expected: ${expectedHash}, computed: ${computedHash}`);
+            }
+            process.stderr.write(`[omni-mcp] SHA-256 verified successfully (${computedHash.slice(0, 16)}...).\n`);
+            break;
+          }
+        }
+      }
+    } catch (csErr) {
+      if (csErr.message.includes('SHA-256 verification failed')) {
+        throw csErr;
+      }
+    }
+
+    if (fs.existsSync(cachedBinary)) {
+      try { fs.unlinkSync(cachedBinary); } catch (_) {}
+    }
+    fs.renameSync(tempBinary, cachedBinary);
+  } catch (err) {
+    if (fs.existsSync(tempBinary)) {
+      try { fs.unlinkSync(tempBinary); } catch (_) {}
+    }
+    throw err;
+  }
 }
 
 async function getBinaryPath() {
@@ -88,7 +158,7 @@ async function getBinaryPath() {
   fs.mkdirSync(cacheDir, { recursive: true });
 
   process.stderr.write(`[omni-mcp] Downloading native binary for ${process.platform}-${process.arch} from GitHub...\n`);
-  await downloadFile(downloadUrl, cachedBinary);
+  await downloadAndVerify(downloadUrl, cachedBinary, binaryFileName);
 
   if (process.platform !== 'win32') {
     fs.chmodSync(cachedBinary, 0o755);

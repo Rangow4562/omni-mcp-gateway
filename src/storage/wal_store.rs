@@ -195,6 +195,7 @@ impl WalRegistryStore {
         {
             let _ = f.write_all(wal_line.as_bytes());
             let _ = f.flush();
+            let _ = f.sync_all();
         }
 
         state.wal_entries_since_compact += 1;
@@ -228,10 +229,17 @@ impl WalRegistryStore {
             "saga_compensations": JsonValue::Array(comps_arr),
         });
         let tmp_path = format!("{}.tmp", self.db_path);
-        if fs::write(&tmp_path, snapshot.to_string_compact()).is_ok() {
-            let _ = fs::rename(&tmp_path, &self.db_path);
-            // Truncate WAL after atomic snapshot commit
-            let _ = File::create(self.wal_path());
+        if let Ok(mut f) = File::create(&tmp_path) {
+            let _ = f.write_all(snapshot.to_string_compact().as_bytes());
+            let _ = f.flush();
+            let _ = f.sync_all();
+            drop(f);
+            if fs::rename(&tmp_path, &self.db_path).is_ok() {
+                // Truncate WAL after atomic snapshot commit
+                if let Ok(wal_f) = File::create(self.wal_path()) {
+                    let _ = wal_f.sync_all();
+                }
+            }
         }
     }
 
@@ -273,6 +281,28 @@ impl WalRegistryStore {
             .suspended_frames
             .insert(frame.execution_id.clone(), frame.clone());
         self.append_wal_and_maybe_compact("SAVE_SUSPENDED_FRAME", frame.to_json(), &mut guard);
+    }
+
+    /// Atomic compare-and-swap under the write lock: checks that the frame exists and
+    /// `is_consumed == false`, marks it consumed with `approver`, persists to WAL and fsyncs.
+    pub fn consume_frame(
+        &self,
+        execution_id: &str,
+        approver: &str,
+    ) -> Result<SuspendedExecutionFrame, &'static str> {
+        let mut guard = self.state.write().unwrap();
+        let frame = match guard.suspended_frames.get_mut(execution_id) {
+            Some(f) => f,
+            None => return Err("Approval continuation frame not found or expired"),
+        };
+        if frame.is_consumed {
+            return Err("Approval has already been consumed (single-use violated)");
+        }
+        frame.is_consumed = true;
+        frame.approver_identity = Some(approver.to_string());
+        let consumed = frame.clone();
+        self.append_wal_and_maybe_compact("SAVE_SUSPENDED_FRAME", consumed.to_json(), &mut guard);
+        Ok(consumed)
     }
 
     pub fn get_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {

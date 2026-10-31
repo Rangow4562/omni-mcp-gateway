@@ -70,33 +70,114 @@ pub struct ProductionGatewayContext {
     pub traces: Arc<RwLock<Vec<TraceSpan>>>,
 }
 
-fn is_origin_allowed(origin: &str, cors_config: &str, host: Option<&str>) -> bool {
-    if origin == "null" {
-        return true;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuthRole {
+    Agent = 1,
+    Operator = 2,
+    Approver = 3,
+    Admin = 4,
+}
+
+impl AuthRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthRole::Agent => "agent",
+            AuthRole::Operator => "operator",
+            AuthRole::Approver => "approver",
+            AuthRole::Admin => "admin",
+        }
     }
-    if cors_config != "*" {
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "agent" => Some(AuthRole::Agent),
+            "operator" => Some(AuthRole::Operator),
+            "approver" => Some(AuthRole::Approver),
+            "admin" => Some(AuthRole::Admin),
+            _ => None,
+        }
+    }
+
+    pub fn can_satisfy(&self, required: AuthRole) -> bool {
+        matches!(
+            (self, required),
+            (AuthRole::Admin, _)
+                | (AuthRole::Approver, AuthRole::Approver)
+                | (AuthRole::Approver, AuthRole::Agent)
+                | (AuthRole::Operator, AuthRole::Operator)
+                | (AuthRole::Operator, AuthRole::Agent)
+                | (AuthRole::Agent, AuthRole::Agent)
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthPrincipal {
+    pub id: String,
+    pub role: AuthRole,
+}
+
+fn is_local_origin(origin: &str) -> bool {
+    let rest = if let Some(r) = origin.strip_prefix("http://") {
+        r
+    } else if let Some(r) = origin.strip_prefix("https://") {
+        r
+    } else {
+        return false;
+    };
+    let host_part = rest.split('/').next().unwrap_or(rest);
+    let host_part = host_part.split('?').next().unwrap_or(host_part);
+    let host_part = host_part.split('#').next().unwrap_or(host_part);
+    let hostname = if host_part.starts_with('[') {
+        if let Some(end_bracket) = host_part.find(']') {
+            &host_part[..=end_bracket]
+        } else {
+            return false;
+        }
+    } else {
+        host_part.split(':').next().unwrap_or(host_part)
+    };
+    hostname.eq_ignore_ascii_case("localhost") || hostname == "127.0.0.1" || hostname == "[::1]"
+}
+
+fn is_origin_allowed(origin: &str, cors_config: &str, host: Option<&str>) -> bool {
+    if origin == "null" || origin.trim().is_empty() {
+        return false;
+    }
+
+    let is_local_orig = is_local_origin(origin);
+
+    if let Some(h) = host {
+        let h_lower = h.to_lowercase();
+        let h_name = h_lower.split(':').next().unwrap_or(&h_lower);
+        let host_is_local = h_name == "localhost" || h_name == "127.0.0.1" || h_name == "[::1]";
+
+        if host_is_local {
+            if is_local_orig {
+                return true;
+            }
+            if cors_config != "*" && !cors_config.trim().is_empty() {
+                let allowed: Vec<&str> = cors_config.split(',').map(|s| s.trim()).collect();
+                if allowed.contains(&origin) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    if cors_config != "*" && !cors_config.trim().is_empty() {
         let allowed: Vec<&str> = cors_config.split(',').map(|s| s.trim()).collect();
         if allowed.contains(&origin) {
             return true;
         }
     }
-    if origin.starts_with("http://localhost")
-        || origin.starts_with("https://localhost")
-        || origin.starts_with("http://127.0.0.1")
-        || origin.starts_with("https://127.0.0.1")
-        || origin.starts_with("http://[::1]")
-    {
+
+    if is_local_orig {
         return true;
     }
-    if let Some(h) = host {
-        let h_lower = h.to_lowercase();
-        if h_lower.starts_with("localhost")
-            || h_lower.starts_with("127.0.0.1")
-            || h_lower.starts_with("[::1]")
-        {
-            return false;
-        }
-    }
+
     cors_config == "*"
 }
 
@@ -151,6 +232,7 @@ impl ProductionGatewayContext {
         };
 
         if ctx.registry.list_servers(None).is_empty()
+            || ctx.registry.get_server("rides_service").is_none()
             || ctx.registry.get_server("uber_rides").is_none()
         {
             ctx.seed_sample_catalog();
@@ -162,7 +244,7 @@ impl ProductionGatewayContext {
         // 1. Driver Location & Dispatch Service (gRPC)
         let driver_proto = r#"
         syntax = "proto3";
-        package uber.driver;
+        package fleet.driver;
         message DriverLocationRequest {
             string driver_id = 1;
             bool include_telemetry = 2;
@@ -183,7 +265,7 @@ impl ProductionGatewayContext {
 
         // 2. Trip Billing Service (Thrift / TChannel)
         let trip_thrift = r#"
-        namespace py uber.trip
+        namespace py fleet.trip
         service TripBillingService {
             // Query fare estimates and receipt line items for rider trip
             TripFare getTripFare(1: string trip_id, 2: bool include_discounts)
@@ -272,10 +354,10 @@ impl ProductionGatewayContext {
             self.registry.register_server(pay_srv);
         }
 
-        // 5. Seed Code Mode multi-step services (`uber_rides` & `accounting`)
+        // 5. Seed Code Mode multi-step services (`rides_service` & `accounting`, plus `uber_rides` alias)
         let mut rides_srv = ServerRecord::new(
-            "uber_rides",
-            "Uber Rides Service",
+            "rides_service",
+            "Rides Service",
             "Rider trip history, status tracking, and ride lookup.",
             "rider-experience",
         );
@@ -293,7 +375,7 @@ impl ProductionGatewayContext {
             }),
         );
         list_recent.protocol = ProtocolType::Grpc;
-        list_recent.downstream_endpoint = "muttley://uber_rides/list_recent".to_string();
+        list_recent.downstream_endpoint = "muttley://rides_service/list_recent".to_string();
         list_recent.status = ToolStatus::Enabled;
         list_recent.tags = vec![
             "rides".to_string(),
@@ -302,8 +384,24 @@ impl ProductionGatewayContext {
         ];
         rides_srv
             .tools
-            .insert("list_recent".to_string(), list_recent);
+            .insert("list_recent".to_string(), list_recent.clone());
         self.registry.register_server(rides_srv);
+
+        // Alias for backwards compatibility with legacy tests
+        let mut uber_srv = ServerRecord::new(
+            "uber_rides",
+            "Rides Service (Legacy Alias)",
+            "Rider trip history, status tracking, and ride lookup.",
+            "rider-experience",
+        );
+        uber_srv.protocol = ProtocolType::Grpc;
+        uber_srv.status = ToolStatus::Enabled;
+        let mut uber_list_recent = list_recent;
+        uber_list_recent.downstream_endpoint = "muttley://uber_rides/list_recent".to_string();
+        uber_srv
+            .tools
+            .insert("list_recent".to_string(), uber_list_recent);
+        self.registry.register_server(uber_srv);
 
         let mut acct_srv = ServerRecord::new(
             "accounting",
@@ -370,6 +468,41 @@ impl ProductionGatewayContext {
             }
         }
 
+        if path.starts_with("/api/") && !method.eq_ignore_ascii_case("OPTIONS") {
+            let required_role = match path {
+                "/api/stats"
+                | "/api/servers"
+                | "/api/codemode/types"
+                | "/api/codemode/speculative_types" => AuthRole::Agent,
+                _ if path.starts_with("/api/servers/") => AuthRole::Agent,
+                "/api/execute" | "/api/codemode/eval" | "/api/codemode/simulate" => AuthRole::Agent,
+                "/api/diffs"
+                | "/api/traces"
+                | "/api/audit"
+                | "/api/audit/verify"
+                | "/api/tools/propose_update" => AuthRole::Operator,
+                "/api/codemode/suspended" | "/api/codemode/resume" | "/api/diffs/approve" => {
+                    AuthRole::Approver
+                }
+                "/api/tools/toggle_status"
+                | "/api/servers/toggle_status"
+                | "/api/tools/rollback"
+                | "/api/crawler/trigger" => AuthRole::Admin,
+                _ => AuthRole::Admin,
+            };
+
+            let principal = match self.authenticate(headers) {
+                Ok(p) => p,
+                Err(_) => {
+                    return self.unauthorized_response(path);
+                }
+            };
+
+            if !principal.role.can_satisfy(required_role) {
+                return self.forbidden_response(path, required_role);
+            }
+        }
+
         if method.eq_ignore_ascii_case("OPTIONS") {
             return (200, "text/plain".to_string(), Vec::new(), Vec::new());
         }
@@ -385,7 +518,7 @@ impl ProductionGatewayContext {
         self.json_response(405, json!({"error": "Method not allowed"}))
     }
 
-    fn is_authorized(&self, headers: &HashMap<String, String>) -> bool {
+    pub fn authenticate(&self, headers: &HashMap<String, String>) -> Result<AuthPrincipal, u16> {
         let auth_hdr = headers
             .get("authorization")
             .map(|s| s.as_str())
@@ -395,7 +528,91 @@ impl ProductionGatewayContext {
             .or_else(|| auth_hdr.strip_prefix("bearer "))
             .map(|s| s.trim())
             .unwrap_or("");
-        !token.is_empty() && token != "anonymous"
+
+        if token.is_empty() || token == "anonymous" {
+            return Err(401);
+        }
+
+        // 1. If auth_secret is configured, strictly validate against it using constant-time comparison
+        if !self.config.auth_secret.is_empty() {
+            let mut matched = None;
+            for entry in self.config.auth_secret.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = entry.split(':').collect();
+                if parts.len() >= 2 {
+                    if let Some(role) = AuthRole::from_str(parts[0]) {
+                        let secret = parts[1];
+                        if crate::models::constant_time_eq(token.as_bytes(), secret.as_bytes()) {
+                            let id = if parts.len() >= 3 {
+                                parts[2].to_string()
+                            } else {
+                                format!("{}_user", parts[0])
+                            };
+                            matched = Some(AuthPrincipal { id, role });
+                            break;
+                        }
+                    } else if crate::models::constant_time_eq(token.as_bytes(), entry.as_bytes()) {
+                        matched = Some(AuthPrincipal {
+                            id: "admin".to_string(),
+                            role: AuthRole::Admin,
+                        });
+                        break;
+                    }
+                } else if crate::models::constant_time_eq(token.as_bytes(), entry.as_bytes()) {
+                    matched = Some(AuthPrincipal {
+                        id: "admin".to_string(),
+                        role: AuthRole::Admin,
+                    });
+                    break;
+                }
+            }
+
+            if let Some(p) = matched {
+                return Ok(p);
+            } else {
+                return Err(401);
+            }
+        }
+
+        // 2. Dev/Test mode (auth_secret not configured on loopback)
+        let role = if token.contains("admin") {
+            AuthRole::Admin
+        } else if token.contains("approver") {
+            AuthRole::Approver
+        } else if token.contains("operator") {
+            AuthRole::Operator
+        } else {
+            AuthRole::Agent
+        };
+
+        Ok(AuthPrincipal {
+            id: token.to_string(),
+            role,
+        })
+    }
+
+    pub fn is_authorized(&self, headers: &HashMap<String, String>) -> bool {
+        self.authenticate(headers).is_ok()
+    }
+
+    fn forbidden_response(
+        &self,
+        endpoint: &str,
+        required: AuthRole,
+    ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
+        (
+            403,
+            "application/json".to_string(),
+            Vec::new(),
+            json!({
+                "error": format!("Forbidden: Insufficient role permissions for {}. Required role: {:?}", endpoint, required)
+            })
+            .to_string_compact()
+            .into_bytes(),
+        )
     }
 
     fn unauthorized_response(
@@ -647,7 +864,7 @@ impl ProductionGatewayContext {
                     json!({
                         "endpoint": "/omni/mcp",
                         "protocol": "Streamable HTTP",
-                        "server": "uber-omni-mcp-gateway",
+                        "server": "omni-mcp-gateway",
                         "version": env!("CARGO_PKG_VERSION"),
                         "supported_versions": JsonValue::Array(supported),
                         "capabilities": {
@@ -745,7 +962,20 @@ impl ProductionGatewayContext {
             }
             "/api/codemode/suspended" => {
                 let frames = self.gateway.list_suspended_codemode_frames();
-                let frames_json: Vec<JsonValue> = frames.iter().map(|f| f.to_json()).collect();
+                let mut frames_json = Vec::with_capacity(frames.len());
+                for f in frames {
+                    let mut obj = f.to_json();
+                    if let Some(entries) = obj.as_object_mut() {
+                        entries.retain(|(k, _)| {
+                            k != "script_source"
+                                && k != "serialized_scope"
+                                && k != "pending_arguments"
+                                && k != "frame_hmac"
+                        });
+                        entries.push(("redacted".to_string(), JsonValue::Bool(true)));
+                    }
+                    frames_json.push(obj);
+                }
                 self.json_response(
                     200,
                     json!({
@@ -788,13 +1018,17 @@ impl ProductionGatewayContext {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .unwrap_or("anonymous");
-        let actor = headers
-            .get("x-caller-actor")
-            .map(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("agent");
 
-        let rate_key = format!("{}:{}", token, actor);
+        // A12: Derive actor and rate-limiting key from authenticated principal identity
+        // rather than trusting client-supplied headers (e.g. X-Caller-Actor)
+        let principal = self.authenticate(headers).ok();
+        let (actor, rate_key) = if let Some(ref p) = principal {
+            (p.id.clone(), format!("{}:{}", p.id, p.role.as_str()))
+        } else {
+            ("anonymous".to_string(), format!("{}:anonymous", token))
+        };
+        let actor = actor.as_str();
+
         let (allowed, _rem) = self.rate_limiter.check_rate_limit(&rate_key, 0);
         if !allowed {
             self.metrics
@@ -1053,16 +1287,22 @@ impl ProductionGatewayContext {
                     .get("execution_id")
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
-                let approver = body
-                    .get("approver")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or(actor);
+                let digest = body
+                    .get("arguments_digest")
+                    .or_else(|| body.get("pending_arguments_hash"))
+                    .and_then(|x| x.as_str());
+                let principal = self.authenticate(headers).unwrap_or(AuthPrincipal {
+                    id: actor.to_string(),
+                    role: AuthRole::Approver,
+                });
+                let approver = &principal.id;
                 let out = self.gateway.resume_codemode(
                     execution_id,
                     approver,
                     None,
                     Some(token),
                     traceparent,
+                    digest,
                 );
                 self.json_response(200, out.to_json())
             }
@@ -1155,18 +1395,79 @@ pub fn get_gateway_context() -> &'static ProductionGatewayContext {
     GLOBAL_CONTEXT.get_or_init(|| ProductionGatewayContext::new(None))
 }
 
+fn send_raw_error_response<W: Write>(
+    writer: &mut W,
+    status_code: u16,
+    status_text: &str,
+    error_msg: &str,
+) {
+    let body = format!("{{\"error\":\"{}\"}}", error_msg);
+    let resp = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_code,
+        status_text,
+        body.len(),
+        body
+    );
+    let _ = writer.write_all(resp.as_bytes());
+    let _ = writer.flush();
+}
+
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    let mut total_read = 0;
+    while total_read < max_bytes {
+        let available = match reader.fill_buf() {
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            break;
+        }
+        let (consume_len, found_newline) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => {
+                let to_take = available.len().min(max_bytes - total_read);
+                (to_take, false)
+            }
+        };
+        let s = match std::str::from_utf8(&available[..consume_len]) {
+            Ok(valid) => valid,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid utf-8",
+                ))
+            }
+        };
+        buf.push_str(s);
+        reader.consume(consume_len);
+        total_read += consume_len;
+        if found_newline {
+            return Ok(total_read);
+        }
+        if total_read >= max_bytes {
+            return Err(std::io::Error::other("Line length exceeded"));
+        }
+    }
+    Ok(total_read)
+}
+
 pub fn run_server(host: &str, port: u16) -> Result<(), String> {
     let ctx = get_gateway_context().clone();
+    ctx.config.validate_bind(host)?;
     ctx.cache.start_background_refresh();
 
     let bind_addr = format!("{}:{}", host, port);
     let listener = TcpListener::bind(&bind_addr)
         .map_err(|e| format!("Failed to bind HTTP server on {}: {}", bind_addr, e))?;
 
-    println!(
-        "[*] Omni MCP Gateway (Rust 2.0 Engine) running at http://{}:{}",
-        host, port
-    );
+    println!("[*] Omni MCP Gateway running at http://{}:{}", host, port);
     println!("[*] Liveness probe: http://{}:{}/healthz", host, port);
     println!("[*] Prometheus metrics: http://{}:{}/metrics", host, port);
     println!(
@@ -1180,7 +1481,8 @@ pub fn run_server(host: &str, port: u16) -> Result<(), String> {
 
     // Bounded worker pool for zero-spawn-overhead request handling
     let num_workers = ctx.config.worker_threads.max(4);
-    let (tx, rx) = mpsc::channel::<TcpStream>();
+    let queue_bound = (num_workers * 16).max(64);
+    let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_bound);
     let shared_rx = Arc::new(Mutex::new(rx));
 
     for _ in 0..num_workers {
@@ -1194,13 +1496,26 @@ pub fn run_server(host: &str, port: u16) -> Result<(), String> {
                     Err(_) => break,
                 }
             };
-            handle_connection(stream, &worker_ctx);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_connection(stream, &worker_ctx);
+            }));
         });
     }
 
     for stream in listener.incoming().flatten() {
         let _ = stream.set_nodelay(true);
-        let _ = tx.send(stream);
+        match tx.try_send(stream) {
+            Ok(_) => {}
+            Err(mpsc::TrySendError::Full(mut saturated_stream)) => {
+                send_raw_error_response(
+                    &mut saturated_stream,
+                    503,
+                    "Service Unavailable",
+                    "Service Unavailable: Worker accept queue saturated",
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => break,
+        }
     }
 
     Ok(())
@@ -1296,18 +1611,18 @@ pub fn run_stdio_server(specific_server: Option<&str>) -> i32 {
     0
 }
 
-fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
+pub fn handle_connection(stream: TcpStream, ctx: &ProductionGatewayContext) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    handle_stream(stream, ctx);
+}
+
+pub fn handle_stream<S: Read + Write>(stream: S, ctx: &ProductionGatewayContext) {
+    let mut reader = BufReader::new(stream);
 
     loop {
-        let mut reader = match stream.try_clone() {
-            Ok(s) => BufReader::new(s),
-            Err(_) => return,
-        };
-
         let mut request_line = String::new();
-        match reader.read_line(&mut request_line) {
+        match read_line_capped(&mut reader, &mut request_line, 8192) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
@@ -1327,18 +1642,22 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
         let mut seen_content_length = false;
         let mut seen_transfer_encoding = false;
         let mut smuggling_detected = false;
+        let mut malformed_content_length = false;
 
         loop {
             let mut line = String::new();
-            match reader.read_line(&mut line) {
+            match read_line_capped(&mut reader, &mut line, 8192) {
                 Ok(0) | Err(_) => return,
                 Ok(_) => {
                     header_lines += 1;
                     total_header_bytes += line.len();
                     if header_lines > 100 || total_header_bytes > 64 * 1024 {
-                        let resp = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: application/json\r\nContent-Length: 52\r\nConnection: close\r\n\r\n{\"error\":\"Request Header Fields Too Large (Cap: 64KB)\"}";
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.flush();
+                        send_raw_error_response(
+                            reader.get_mut(),
+                            431,
+                            "Request Header Fields Too Large",
+                            "Request Header Fields Too Large (Cap: 64KB)",
+                        );
                         return;
                     }
                     let trimmed = line.trim();
@@ -1355,7 +1674,17 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
                                 smuggling_detected = true;
                             }
                             seen_content_length = true;
-                            content_length = val_str.parse().unwrap_or(0);
+                            let val_trimmed = val_str.trim();
+                            if val_trimmed.is_empty()
+                                || !val_trimmed.chars().all(|c| c.is_ascii_digit())
+                            {
+                                malformed_content_length = true;
+                            } else {
+                                match val_trimmed.parse::<usize>() {
+                                    Ok(cl) => content_length = cl,
+                                    Err(_) => malformed_content_length = true,
+                                }
+                            }
                         } else if key_lc == "transfer-encoding" {
                             seen_transfer_encoding = true;
                         } else if key_lc == "connection" && val_str.eq_ignore_ascii_case("close") {
@@ -1367,14 +1696,49 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
             }
         }
 
-        if smuggling_detected || (seen_transfer_encoding && seen_content_length) {
-            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 68\r\nConnection: close\r\n\r\n{\"error\":\"Bad Request: Conflicting Content-Length / Transfer-Encoding\"}";
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
+        if malformed_content_length {
+            send_raw_error_response(
+                reader.get_mut(),
+                400,
+                "Bad Request",
+                "Bad Request: Invalid Content-Length",
+            );
             return;
         }
 
-        let mut body_bytes = vec![0u8; content_length.min(ctx.config.max_body_size_bytes + 1)];
+        if smuggling_detected || (seen_transfer_encoding && seen_content_length) {
+            send_raw_error_response(
+                reader.get_mut(),
+                400,
+                "Bad Request",
+                "Bad Request: Conflicting Content-Length / Transfer-Encoding",
+            );
+            return;
+        }
+
+        // A9: Reject Transfer-Encoding (e.g. chunked) without Content-Length with 501 Not Implemented
+        if seen_transfer_encoding && !seen_content_length {
+            send_raw_error_response(
+                reader.get_mut(),
+                501,
+                "Not Implemented",
+                "Not Implemented: Transfer-Encoding not supported",
+            );
+            return;
+        }
+
+        // A9: Close connection on body size limit violations
+        if content_length > ctx.config.max_body_size_bytes {
+            send_raw_error_response(
+                reader.get_mut(),
+                413,
+                "Payload Too Large",
+                "Payload Too Large (Exceeds Limit)",
+            );
+            return;
+        }
+
+        let mut body_bytes = vec![0u8; content_length];
         if content_length > 0 && reader.read_exact(&mut body_bytes).is_err() {
             return;
         }
@@ -1385,43 +1749,72 @@ fn handle_connection(mut stream: TcpStream, ctx: &ProductionGatewayContext) {
         let status_text = match status {
             200 => "OK",
             400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            409 => "Conflict",
             413 => "Payload Too Large",
+            415 => "Unsupported Media Type",
             429 => "Too Many Requests",
+            431 => "Request Header Fields Too Large",
+            500 => "Internal Server Error",
+            501 => "Not Implemented",
+            503 => "Service Unavailable",
             _ => "Internal Server Error",
         };
 
-        let conn_hdr = if keep_alive { "keep-alive" } else { "close" };
+        let conn_hdr = if keep_alive && status < 400 {
+            "keep-alive"
+        } else {
+            "close"
+        };
         let mut header_str = format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: {}\r\n\
-             Content-Length: {}\r\n\
-             Access-Control-Allow-Origin: {}\r\n\
-             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Content-Type, Authorization, X-Caller-Actor\r\n\
-             Connection: {}\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
             status,
             status_text,
             content_type,
             resp_body.len(),
-            ctx.config.cors_allowed_origins,
-            conn_hdr
         );
+
+        // Emit CORS headers only when Origin is present and allowed, and never on 403 Forbidden
+        if let Some(origin) = headers.get("origin") {
+            if status != 403
+                && is_origin_allowed(
+                    origin,
+                    &ctx.config.cors_allowed_origins,
+                    headers.get("host").map(|s| s.as_str()),
+                )
+            {
+                if ctx.config.cors_allowed_origins == "*" {
+                    header_str.push_str("Access-Control-Allow-Origin: *\r\n");
+                } else {
+                    header_str.push_str(&format!(
+                        "Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n",
+                        origin
+                    ));
+                }
+                header_str.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+                header_str
+                    .push_str("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
+            }
+        }
+
+        header_str.push_str(&format!("Connection: {}\r\n", conn_hdr));
         for (hk, hv) in extra_headers {
             header_str.push_str(&format!("{}: {}\r\n", hk, hv));
         }
         header_str.push_str("\r\n");
 
-        if stream.write_all(header_str.as_bytes()).is_err() {
+        if reader.get_mut().write_all(header_str.as_bytes()).is_err() {
             return;
         }
-        if stream.write_all(&resp_body).is_err() {
+        if reader.get_mut().write_all(&resp_body).is_err() {
             return;
         }
-        let _ = stream.flush();
+        let _ = reader.get_mut().flush();
 
-        if !keep_alive {
+        if !keep_alive || status >= 400 {
             return;
         }
     }
@@ -1444,7 +1837,7 @@ const EMBEDDED_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <body>
     <header>
         <div>
-            <h1>Omni MCP Platform (Rust 2.0 Engine)</h1>
+            <h1>Omni MCP Platform</h1>
             <p style="color: #888; margin: 4px 0 0 0;">High-Speed Enterprise MCP Gateway & Runtime Registry</p>
         </div>
         <div class="badge">● Rust Runtime Online</div>
