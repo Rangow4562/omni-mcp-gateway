@@ -1089,7 +1089,7 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
         "authorization".to_string(),
         "Bearer test_operator_token".to_string(),
     );
-    let (sse_status, sse_ctype, _sse_headers, _sse_body) =
+    let (sse_status, sse_ctype, _sse_headers, sse_body) =
         ctx.handle_http("GET", "/sse", &headers, &[]);
     #[cfg(feature = "legacy-sse")]
     {
@@ -1101,6 +1101,7 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
     }
     #[cfg(not(feature = "legacy-sse"))]
     {
+        let _ = sse_body;
         assert_eq!(sse_status, 410);
         assert!(sse_ctype.contains("application/json"));
     }
