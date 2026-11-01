@@ -124,7 +124,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Publish to NPM
-        if: ${{ secrets.NPM_TOKEN != '' || env.NPM_TOKEN != '' }}
+        if: env.NPM_TOKEN != ''
         run: |
           # Copy all platform binaries into bin folder before packaging
           cp release-assets/omni-gateway-win32-x64.exe bin/ 2>/dev/null || true
