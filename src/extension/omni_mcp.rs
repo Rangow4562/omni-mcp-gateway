@@ -18,9 +18,10 @@ use crate::data_plane::gateway::MCPProxyGateway;
 use crate::json::JsonValue;
 use crate::models::{
     negotiate_protocol_version, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse, ToolStatus,
-    APPROVAL_INVALID, APPROVAL_REQUIRED, CIRCUIT_OPEN, FUEL_EXHAUSTED, INVALID_PARAMS,
-    MEMORY_EXHAUSTED, METHOD_NOT_FOUND, OUTBOUND_BLOCKED, SAGA_COMPENSATED,
-    SCHEMA_PREFLIGHT_FAILED, TIMEOUT, TOOL_DISABLED, UNAUTHORIZED,
+    APPROVAL_INVALID, APPROVAL_REQUIRED, CIRCUIT_OPEN, FUEL_EXHAUSTED, INTERNAL_ERROR,
+    INVALID_PARAMS, MEMORY_EXHAUSTED, METHOD_NOT_FOUND, MISSING_REQUIRED_CLIENT_CAPABILITY,
+    OUTBOUND_BLOCKED, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED, TIMEOUT, TOOL_DISABLED,
+    UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
 };
 
 #[derive(Clone)]
@@ -308,16 +309,17 @@ impl OmniMCPServer {
         caller_actor: &str,
         user_token: Option<&str>,
     ) -> RPCResponse {
-        if let Some(meta) = request.params.get("_meta") {
+        let requested_proto = if let Some(meta) = request.params.get("_meta") {
             if let Some(proto) = meta
                 .get("io.modelcontextprotocol/protocolVersion")
+                .or_else(|| meta.get("protocolVersion"))
                 .and_then(|v| v.as_str())
             {
                 if crate::models::protocol_capabilities(proto).is_none() {
                     return RPCResponse::err(
                         request.id.clone(),
                         RPCError::new(
-                            crate::models::INVALID_PARAMS,
+                            UNSUPPORTED_PROTOCOL_VERSION,
                             format!(
                                 "UnsupportedProtocolVersionError: Unsupported MCP version '{}'",
                                 proto
@@ -325,7 +327,30 @@ impl OmniMCPServer {
                         ),
                     );
                 }
+                Some(proto)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        if requested_proto == Some("2026-07-28")
+            && matches!(
+                request.method.as_str(),
+                "ping" | "logging/setLevel" | "roots/list_changed"
+            )
+        {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(
+                    METHOD_NOT_FOUND,
+                    format!(
+                        "Method '{}' was removed in MCP 2026-07-28 stateless revision",
+                        request.method
+                    ),
+                ),
+            );
         }
 
         match request.method.as_str() {
@@ -343,7 +368,9 @@ impl OmniMCPServer {
                             "resources": {"subscribe": false, "listChanged": true},
                             "prompts": {"listChanged": true},
                             "logging": {},
-                            "extensions": {}
+                            "extensions": {
+                                "io.modelcontextprotocol/tasks": {"version": "2026-07-28"}
+                            }
                         },
                         "serverInfo": {
                             "name": "omni-mcp-gateway",
@@ -354,17 +381,42 @@ impl OmniMCPServer {
                                 ")"
                             ),
                             "runtime": "rust"
-                        }
+                        },
+                        "resultType": "complete"
                     }),
                 )
             }
-            "subscriptions/listen" => RPCResponse::ok(request.id.clone(), json!({"status": "ok"})),
+            "subscriptions/listen" => RPCResponse::ok(
+                request.id.clone(),
+                json!({"status": "ok", "resultType": "complete"}),
+            ),
             "initialize" => {
                 let client_ver = request
                     .params
                     .get("protocolVersion")
                     .and_then(|v| v.as_str());
                 let negotiated = negotiate_protocol_version(client_ver);
+
+                if let Some(client_caps) = request.params.get("clientCapabilities") {
+                    if let Some(req_arr) = client_caps.get("required").and_then(|a| a.as_array()) {
+                        for req_cap in req_arr {
+                            let cap_str = req_cap.as_str().unwrap_or("");
+                            if !["tools", "resources", "prompts"].contains(&cap_str) {
+                                return RPCResponse::err(
+                                    request.id.clone(),
+                                    RPCError::new(
+                                        MISSING_REQUIRED_CLIENT_CAPABILITY,
+                                        format!(
+                                            "MissingRequiredClientCapability: '{}' is required by client but unsupported by server",
+                                            cap_str
+                                        ),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+
                 RPCResponse::ok(
                     request.id.clone(),
                     json!({
@@ -373,7 +425,10 @@ impl OmniMCPServer {
                             "tools": {"listChanged": true},
                             "resources": {"subscribe": false, "listChanged": true},
                             "prompts": {"listChanged": true},
-                            "logging": {}
+                            "logging": {},
+                            "extensions": {
+                                "io.modelcontextprotocol/tasks": {"version": "2026-07-28"}
+                            }
                         },
                         "serverInfo": {
                             "name": "omni-mcp-gateway",
@@ -384,12 +439,13 @@ impl OmniMCPServer {
                                 ")"
                             ),
                             "runtime": "rust"
-                        }
+                        },
+                        "resultType": "complete"
                     }),
                 )
             }
             "notifications/initialized" | "ping" => {
-                RPCResponse::ok(request.id.clone(), JsonValue::object())
+                RPCResponse::ok(request.id.clone(), json!({"resultType": "complete"}))
             }
             "tools/list" => {
                 let intent_opt = request.params.get("intent").and_then(|x| x.as_str());
@@ -417,17 +473,35 @@ impl OmniMCPServer {
                         }
                     }
                 }
+                tools.sort_by(|a, b| {
+                    a.get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .cmp(b.get("name").and_then(|n| n.as_str()).unwrap_or(""))
+                });
                 RPCResponse::ok(
                     request.id.clone(),
                     json!({
-                        "tools": JsonValue::Array(tools)
+                        "tools": JsonValue::Array(tools),
+                        "resultType": "complete",
+                        "ttlMs": 300000i64,
+                        "cacheScope": "workspace",
+                        "_meta": {
+                            "serverInfo": {
+                                "name": "omni-mcp-gateway",
+                                "version": env!("CARGO_PKG_VERSION")
+                            }
+                        }
                     }),
                 )
             }
             "resources/list" => self.handle_resources_list(request),
+            "resources/templates/list" => self.handle_resources_templates_list(request),
             "resources/read" => self.handle_resources_read(request),
             "prompts/list" => self.handle_prompts_list(request),
             "prompts/get" => self.handle_prompts_get(request),
+            "tasks/get" => self.handle_tasks_get(request),
+            "tasks/update" => self.handle_tasks_update(request, caller_actor, user_token),
             "tools/call" => {
                 let tool_name = request
                     .params
@@ -512,13 +586,159 @@ impl OmniMCPServer {
                 "description": format!("Consolidated JSON schemas for all tools provided by {}", s.name)
             }));
         }
+        resources.sort_by(|a, b| {
+            a.get("uri")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .cmp(b.get("uri").and_then(|u| u.as_str()).unwrap_or(""))
+        });
 
         RPCResponse::ok(
             request.id.clone(),
             json!({
-                "resources": JsonValue::Array(resources)
+                "resources": JsonValue::Array(resources),
+                "resultType": "complete",
+                "ttlMs": 300000i64,
+                "cacheScope": "workspace"
             }),
         )
+    }
+
+    fn handle_resources_templates_list(&self, request: &RPCRequest) -> RPCResponse {
+        let templates = vec![
+            json!({
+                "uriTemplate": "omni://services/{server_name}/idl",
+                "name": "Service IDL Specification Template",
+                "mimeType": "text/plain",
+                "description": "Raw interface definition specification for a named microservice"
+            }),
+            json!({
+                "uriTemplate": "omni://services/{server_name}/schema",
+                "name": "Service Tool Schemas Template",
+                "mimeType": "application/json",
+                "description": "Consolidated JSON schemas for all tools provided by a named microservice"
+            }),
+        ];
+        RPCResponse::ok(
+            request.id.clone(),
+            json!({
+                "resourceTemplates": JsonValue::Array(templates),
+                "resultType": "complete",
+                "ttlMs": 300000i64,
+                "cacheScope": "workspace"
+            }),
+        )
+    }
+
+    fn handle_tasks_get(&self, request: &RPCRequest) -> RPCResponse {
+        let task_id = request
+            .params
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(frame) = self.gateway.get_suspended_codemode_frame(task_id) {
+            RPCResponse::ok(
+                request.id.clone(),
+                json!({
+                    "taskId": frame.execution_id.clone(),
+                    "status": if frame.is_consumed { "completed" } else { "suspended" },
+                    "toolName": frame.pending_tool.clone(),
+                    "serverName": frame.pending_server.clone(),
+                    "requiresApproval": !frame.is_consumed,
+                    "createdAtEpochMs": (frame.created_at * 1000.0) as i64,
+                    "resultType": "complete"
+                }),
+            )
+        } else {
+            RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(INVALID_PARAMS, format!("Task '{}' not found", task_id)),
+            )
+        }
+    }
+
+    fn handle_tasks_update(
+        &self,
+        request: &RPCRequest,
+        caller_actor: &str,
+        user_token: Option<&str>,
+    ) -> RPCResponse {
+        let task_id = request
+            .params
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let action = request
+            .params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("resume");
+        let approver = request
+            .params
+            .get("approver")
+            .and_then(|v| v.as_str())
+            .unwrap_or(caller_actor);
+        let digest = request.params.get("digest").and_then(|v| v.as_str());
+
+        if action == "resume" {
+            let out = self
+                .gateway
+                .resume_codemode(task_id, approver, None, user_token, None, digest);
+            if out.status == "OK" {
+                RPCResponse::ok(
+                    request.id.clone(),
+                    json!({
+                        "taskId": task_id,
+                        "status": "completed",
+                        "result": out.result.clone(),
+                        "resultType": "complete"
+                    }),
+                )
+            } else {
+                RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::new(
+                        out.error_code.unwrap_or(INTERNAL_ERROR),
+                        out.error
+                            .unwrap_or_else(|| "Failed to resume task".to_string()),
+                    ),
+                )
+            }
+        } else if action == "cancel" {
+            if self
+                .gateway
+                .delete_suspended_codemode_frame(task_id)
+                .is_some()
+            {
+                RPCResponse::ok(
+                    request.id.clone(),
+                    json!({
+                        "taskId": task_id,
+                        "status": "cancelled",
+                        "resultType": "complete"
+                    }),
+                )
+            } else {
+                RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::new(
+                        INVALID_PARAMS,
+                        format!("Task '{}' not found to cancel", task_id),
+                    ),
+                )
+            }
+        } else {
+            RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(
+                    INVALID_PARAMS,
+                    format!(
+                        "Unsupported task action '{}'; supported actions: resume, cancel",
+                        action
+                    ),
+                ),
+            )
+        }
     }
 
     fn handle_resources_read(&self, request: &RPCRequest) -> RPCResponse {
@@ -543,7 +763,10 @@ impl OmniMCPServer {
                             "mimeType": "application/typescript",
                             "text": ts.typescript_declarations
                         }
-                    ]
+                    ],
+                    "resultType": "complete",
+                    "ttlMs": 60000i64,
+                    "cacheScope": "workspace"
                 }),
             );
         }
@@ -578,7 +801,10 @@ impl OmniMCPServer {
                             "mimeType": "application/json",
                             "text": payload.to_string_pretty()
                         }
-                    ]
+                    ],
+                    "resultType": "complete",
+                    "ttlMs": 60000i64,
+                    "cacheScope": "workspace"
                 }),
             );
         }
@@ -604,7 +830,10 @@ impl OmniMCPServer {
                                 "mimeType": "text/plain",
                                 "text": idl_text
                             }
-                        ]
+                        ],
+                        "resultType": "complete",
+                        "ttlMs": 60000i64,
+                        "cacheScope": "workspace"
                     }),
                 );
             }
@@ -628,7 +857,10 @@ impl OmniMCPServer {
                                 "mimeType": "application/json",
                                 "text": tools_schema.to_string_pretty()
                             }
-                        ]
+                        ],
+                        "resultType": "complete",
+                        "ttlMs": 60000i64,
+                        "cacheScope": "workspace"
                     }),
                 );
             }
@@ -637,6 +869,7 @@ impl OmniMCPServer {
         let err_code = if let Some(meta) = request.params.get("_meta") {
             if let Some(proto) = meta
                 .get("io.modelcontextprotocol/protocolVersion")
+                .or_else(|| meta.get("protocolVersion"))
                 .and_then(|v| v.as_str())
             {
                 if let Some(caps) = crate::models::protocol_capabilities(proto) {
@@ -662,7 +895,7 @@ impl OmniMCPServer {
     }
 
     fn handle_prompts_list(&self, request: &RPCRequest) -> RPCResponse {
-        let prompts = vec![
+        let mut prompts = vec![
             json!({
                 "name": "incident-investigation",
                 "description": "Diagnostic workflow for identifying failing downstream microservices and evaluating circuit breaker states.",
@@ -697,10 +930,20 @@ impl OmniMCPServer {
             }),
         ];
 
+        prompts.sort_by(|a, b| {
+            a.get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .cmp(b.get("name").and_then(|n| n.as_str()).unwrap_or(""))
+        });
+
         RPCResponse::ok(
             request.id.clone(),
             json!({
-                "prompts": JsonValue::Array(prompts)
+                "prompts": JsonValue::Array(prompts),
+                "resultType": "complete",
+                "ttlMs": 300000i64,
+                "cacheScope": "workspace"
             }),
         )
     }
@@ -774,7 +1017,8 @@ impl OmniMCPServer {
             request.id.clone(),
             json!({
                 "description": format!("Prompt instructions for {}", prompt_name),
-                "messages": JsonValue::Array(messages)
+                "messages": JsonValue::Array(messages),
+                "resultType": "complete"
             }),
         )
     }
@@ -843,7 +1087,8 @@ impl OmniMCPServer {
                         "type": "text",
                         "text": payload.to_string_pretty()
                     }
-                ]
+                ],
+                "resultType": "complete"
             }),
         )
     }
@@ -900,7 +1145,8 @@ impl OmniMCPServer {
                         "type": "text",
                         "text": payload.to_string_pretty()
                     }
-                ]
+                ],
+                "resultType": "complete"
             }),
         )
     }
@@ -971,7 +1217,8 @@ impl OmniMCPServer {
                         "type": "text",
                         "text": payload.to_string_pretty()
                     }
-                ]
+                ],
+                "resultType": "complete"
             }),
         )
     }
@@ -1050,6 +1297,7 @@ impl OmniMCPServer {
         if let Some(meta) = request.params.get("_meta").or_else(|| args.get("_meta")) {
             if let Some(ver) = meta
                 .get("io.modelcontextprotocol/protocolVersion")
+                .or_else(|| meta.get("protocolVersion"))
                 .and_then(|v| v.as_str())
             {
                 if let Some(caps) = crate::models::protocol_capabilities(ver) {
@@ -1100,7 +1348,8 @@ impl OmniMCPServer {
                         "type": "text",
                         "text": payload.to_string_pretty()
                     }
-                ]
+                ],
+                "resultType": "complete"
             }),
         )
     }
@@ -1196,7 +1445,8 @@ impl OmniMCPServer {
                         "type": "text",
                         "text": payload.to_string_pretty()
                     }
-                ]
+                ],
+                "resultType": "complete"
             }),
         )
     }
@@ -1385,7 +1635,8 @@ impl OmniMCPServer {
                         "type": "text",
                         "text": payload.to_string_pretty()
                     }
-                ]
+                ],
+                "resultType": "complete"
             }),
         )
     }
@@ -1427,7 +1678,16 @@ impl OmniMCPServer {
         );
 
         let is_err = output.status == "ERROR";
-        let payload = output.to_json();
+        let is_approval = output.status == "APPROVAL_REQUIRED";
+        let mut payload = output.to_json();
+        if is_approval {
+            payload.insert("resultType", "input_required");
+            if let Some(ref frame) = output.suspended_frame {
+                payload.insert("requestState", frame.execution_id.clone());
+            }
+        } else {
+            payload.insert("resultType", "complete");
+        }
 
         RPCResponse::ok(
             request.id.clone(),
@@ -1438,6 +1698,8 @@ impl OmniMCPServer {
                         "text": payload.to_string_pretty()
                     }
                 ],
+                "resultType": if is_approval { "input_required" } else { "complete" },
+                "requestState": if is_approval { output.suspended_frame.as_ref().map(|f| JsonValue::from(f.execution_id.as_str())).unwrap_or(JsonValue::Null) } else { JsonValue::Null },
                 "isError": is_err
             }),
         )
@@ -1462,7 +1724,8 @@ impl OmniMCPServer {
                             "type": "text",
                             "text": payload.to_string_pretty()
                         }
-                    ]
+                    ],
+                    "resultType": "complete"
                 }),
             );
         }
@@ -1482,7 +1745,8 @@ impl OmniMCPServer {
                         "type": "text",
                         "text": payload.to_string_pretty()
                     }
-                ]
+                ],
+                "resultType": "complete"
             }),
         )
     }
@@ -1532,6 +1796,7 @@ impl OmniMCPServer {
                         "text": payload.to_string_pretty()
                     }
                 ],
+                "resultType": "complete",
                 "isError": is_err
             }),
         )
@@ -1569,6 +1834,7 @@ impl OmniMCPServer {
                         "text": payload.to_string_pretty()
                     }
                 ],
+                "resultType": "complete",
                 "isError": false
             }),
         )

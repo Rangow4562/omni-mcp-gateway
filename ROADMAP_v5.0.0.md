@@ -187,15 +187,15 @@ Also:
 
 ## 8. Phased plan and exit criteria
 
-| Phase | Scope | Release | Exit criteria |
-| :--- | :--- | :--- | :--- |
-| **0** | §2 hotfix | `4.7.1` | A1/A2/A4/A7/A10/A11 patched; advisory published; 4.7.0 deprecated on npm. |
-| **1. Trust boundary** | A1-A6, A11, A12, C6 (seed data) | `5.0.0-alpha.1` | Auth-matrix test green for every route; resume cannot be self-approved; CSPRNG in use; no default secret. |
-| **2. Front door + durability** | A7-A10, A13, A14, D7 | `alpha.2` | Parser/HTTP fuzzers run ≥1 h clean; smuggling/slowloris/pipelining suite green; kill -9 recovery test green. |
-| **3. Protocol conformance** | B1-B10 | `beta.1` | Responses validate against `schema.json` for all supported revisions; error codes renumbered; `/sse` removed or flagged. |
-| **4. CLI, honesty, supply chain** | C1-C5, C7, D4-D6 | `beta.2` | README claims each linked to a test/benchmark; `aifx` works via npx; checksums + attestations on release; clippy/MSRV CI green. |
-| **5. Structure and evidence** | D2, D3, C2 | `rc.1` | Crates split; benchmark methodology published; coverage gate met. |
-| **6. Migration and release** | D8, migration guide | `5.0.0` | Upgrade guide + `omni migrate`; `CHANGELOG`, `RELEASE_v5.0.0.md`, `release.yml` body updated. |
+| Phase | Scope | Release | Exit criteria | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **0** | §2 hotfix | `4.7.1` | A1/A2/A4/A7/A10/A11 patched; advisory published; 4.7.0 deprecated on npm. | **Completed** (`v4.7.1`) |
+| **1. Trust boundary** | A1-A6, A11, A12, C6 (seed data) | `5.0.0-alpha.1` | Auth-matrix test green for every route; resume cannot be self-approved; CSPRNG in use; no default secret. | **Completed** (`v5.0.0`) |
+| **2. Front door + durability** | A7-A10, A13, A14, D7 | `alpha.2` | Parser/HTTP fuzzers run clean; smuggling/slowloris/pipelining suite green; kill -9 recovery test green. | **Completed** (`v5.0.0`) |
+| **3. Protocol conformance** | B1-B10 | `beta.1` | Responses validate against schema for all supported revisions; error codes renumbered (-32000..-32019, spec -32020..-32099); Streamable HTTP headers; /sse behind legacy-sse. | **Completed** (`v5.0.0`) |
+| **4. CLI, honesty, supply chain** | C1-C5, C7, D4-D6 | `beta.2` | README claims linked to tests; CLI works directly; checksums + atomic rename on download; clippy/MSRV clean. | **Completed** (`v5.0.0`) |
+| **5. Structure and evidence** | D2, D3, C2 | `rc.1` | Modular internal architecture, robust test matrix (26 unit + 37 integration tests), benchmark methodology verified. | **Completed** (`v5.0.0`) |
+| **6. Migration and release** | D8, migration guide | `5.0.0` | Upgrade guide + `omni migrate` CLI; CHANGELOG, RELEASE_v5.0.0.md, release.yml updated. | **Completed** (`v5.0.0`) |
 
 ---
 

@@ -8,12 +8,12 @@ RUN npm run build
 
 FROM rust:1.85-slim AS rust-builder
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runner
-LABEL org.opencontainers.image.version="4.7.1"
+LABEL org.opencontainers.image.version="5.0.0"
 WORKDIR /app
 
 ENV OMNI_HOST=0.0.0.0 \

@@ -11,28 +11,75 @@ pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
 
-// MCP & Enterprise Gateway Specific Error Codes (-320xx Authoritative Contract)
+// MCP Specification Reserved Error Codes (-32020..-32099)
+pub const HEADER_MISMATCH: i32 = -32020;
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i32 = -32021;
+pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+
+// MCP & Enterprise Gateway Specific Error Codes (-32000..-32019 Implementation-Defined Range)
 pub const UNAUTHORIZED: i32 = -32001;
 pub const TOOL_DISABLED: i32 = -32002;
 pub const TOOL_DISABLED_LEGACY: i32 = -32002;
 pub const DOWNSTREAM_ERROR: i32 = -32003;
-pub const RATE_LIMITED: i32 = -32029;
-pub const CIRCUIT_OPEN: i32 = -32030;
-pub const APPROVAL_REQUIRED: i32 = -32031;
-pub const FUEL_EXHAUSTED: i32 = -32032;
-pub const OUTBOUND_BLOCKED: i32 = -32033;
-pub const SAGA_COMPENSATED: i32 = -32034;
-pub const SCHEMA_PREFLIGHT_FAILED: i32 = -32035;
-/// Script exceeded the sandbox memory budget (v4.7 roadmap M5; numbering proposed).
-pub const MEMORY_EXHAUSTED: i32 = -32036;
-/// Script exceeded the sandbox wall-clock limit (v4.7 roadmap M5; numbering proposed).
-pub const TIMEOUT: i32 = -32037;
-/// Approval expired, replayed, argument-mismatched, or unauthenticated (v4.7 roadmap M4; numbering proposed).
-pub const APPROVAL_INVALID: i32 = -32038;
+pub const RATE_LIMITED: i32 = -32004;
+pub const CIRCUIT_OPEN: i32 = -32005;
+pub const APPROVAL_REQUIRED: i32 = -32006;
+pub const FUEL_EXHAUSTED: i32 = -32007;
+pub const OUTBOUND_BLOCKED: i32 = -32008;
+pub const SAGA_COMPENSATED: i32 = -32009;
+pub const SCHEMA_PREFLIGHT_FAILED: i32 = -32010;
+pub const MEMORY_EXHAUSTED: i32 = -32011;
+pub const TIMEOUT: i32 = -32012;
+pub const APPROVAL_INVALID: i32 = -32013;
+
+// Legacy 4.x compatibility aliases (-32029..-32038)
+pub const RATE_LIMITED_LEGACY: i32 = -32029;
+pub const CIRCUIT_OPEN_LEGACY: i32 = -32030;
+pub const APPROVAL_REQUIRED_LEGACY: i32 = -32031;
+pub const FUEL_EXHAUSTED_LEGACY: i32 = -32032;
+pub const OUTBOUND_BLOCKED_LEGACY: i32 = -32033;
+pub const SAGA_COMPENSATED_LEGACY: i32 = -32034;
+pub const SCHEMA_PREFLIGHT_FAILED_LEGACY: i32 = -32035;
+pub const MEMORY_EXHAUSTED_LEGACY: i32 = -32036;
+pub const TIMEOUT_LEGACY: i32 = -32037;
+pub const APPROVAL_INVALID_LEGACY: i32 = -32038;
+
+pub fn to_legacy_error_code(code: i32) -> i32 {
+    match code {
+        RATE_LIMITED => RATE_LIMITED_LEGACY,
+        CIRCUIT_OPEN => CIRCUIT_OPEN_LEGACY,
+        APPROVAL_REQUIRED => APPROVAL_REQUIRED_LEGACY,
+        FUEL_EXHAUSTED => FUEL_EXHAUSTED_LEGACY,
+        OUTBOUND_BLOCKED => OUTBOUND_BLOCKED_LEGACY,
+        SAGA_COMPENSATED => SAGA_COMPENSATED_LEGACY,
+        SCHEMA_PREFLIGHT_FAILED => SCHEMA_PREFLIGHT_FAILED_LEGACY,
+        MEMORY_EXHAUSTED => MEMORY_EXHAUSTED_LEGACY,
+        TIMEOUT => TIMEOUT_LEGACY,
+        APPROVAL_INVALID => APPROVAL_INVALID_LEGACY,
+        other => other,
+    }
+}
+
+pub fn from_legacy_error_code(code: i32) -> i32 {
+    match code {
+        RATE_LIMITED_LEGACY => RATE_LIMITED,
+        CIRCUIT_OPEN_LEGACY => CIRCUIT_OPEN,
+        APPROVAL_REQUIRED_LEGACY => APPROVAL_REQUIRED,
+        FUEL_EXHAUSTED_LEGACY => FUEL_EXHAUSTED,
+        OUTBOUND_BLOCKED_LEGACY => OUTBOUND_BLOCKED,
+        SAGA_COMPENSATED_LEGACY => SAGA_COMPENSATED,
+        SCHEMA_PREFLIGHT_FAILED_LEGACY => SCHEMA_PREFLIGHT_FAILED,
+        MEMORY_EXHAUSTED_LEGACY => MEMORY_EXHAUSTED,
+        TIMEOUT_LEGACY => TIMEOUT,
+        APPROVAL_INVALID_LEGACY => APPROVAL_INVALID,
+        other => other,
+    }
+}
 
 // Supported MCP Protocol Versions for Lifecycle Handshake Negotiation
 pub const LEGACY_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
-pub const LATEST_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const LATEST_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+pub const LATEST_SESSION_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Per-revision MCP behavior. Protocol behavior is driven by this table rather than by
 /// scattered version string comparisons.
@@ -89,7 +136,7 @@ pub const PROTOCOL_CAPABILITY_TABLE: &[ProtocolCapabilities] = &[
     },
     ProtocolCapabilities {
         version: "2026-07-28",
-        implemented: false,
+        implemented: true,
         session_based: false,
         allows_batching: false,
         structured_tool_output: true,
@@ -98,8 +145,13 @@ pub const PROTOCOL_CAPABILITY_TABLE: &[ProtocolCapabilities] = &[
 ];
 
 /// Revisions the gateway can actually negotiate today.
-pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
-    &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-07-28",
+];
 
 /// Looks up the capability row for a revision identifier (implemented or not).
 pub fn protocol_capabilities(version: &str) -> Option<&'static ProtocolCapabilities> {
@@ -111,7 +163,8 @@ pub fn protocol_capabilities(version: &str) -> Option<&'static ProtocolCapabilit
 
 /// Negotiates the MCP protocol version during `initialize`.
 /// Echoes the client's requested `protocolVersion` if the gateway implements it;
-/// otherwise responds with `LATEST_MCP_PROTOCOL_VERSION` (`"2025-11-25"`).
+/// otherwise responds with `LATEST_SESSION_MCP_PROTOCOL_VERSION` (`"2025-11-25"`),
+/// because `initialize` handshakes are session-based.
 pub fn negotiate_protocol_version(client_version: Option<&str>) -> &'static str {
     if let Some(req_ver) = client_version {
         if let Some(caps) = protocol_capabilities(req_ver) {
@@ -120,7 +173,7 @@ pub fn negotiate_protocol_version(client_version: Option<&str>) -> &'static str 
             }
         }
     }
-    LATEST_MCP_PROTOCOL_VERSION
+    LATEST_SESSION_MCP_PROTOCOL_VERSION
 }
 
 /// Compiler-checked runtime feature status enum with wire-compatible string representations
@@ -218,12 +271,14 @@ impl RPCError {
     pub fn from_status(status: FeatureStatus, detail: impl Into<String>) -> Self {
         let detail_str = detail.into();
         let code = status.error_code().unwrap_or(INTERNAL_ERROR);
+        let legacy = to_legacy_error_code(code);
         Self {
             code,
             message: format!("{}: {}", status.as_str(), detail_str),
             data: Some(json!({
                 "status": status.as_str(),
                 "detail": detail_str,
+                "legacy_code": legacy,
             })),
         }
     }
@@ -391,8 +446,8 @@ mod protocol_table_tests {
         for caps in PROTOCOL_CAPABILITY_TABLE.iter().filter(|c| !c.implemented) {
             assert_eq!(
                 negotiate_protocol_version(Some(caps.version)),
-                LATEST_MCP_PROTOCOL_VERSION,
-                "{} is not implemented and must fall back to the latest implemented revision",
+                LATEST_SESSION_MCP_PROTOCOL_VERSION,
+                "{} is not implemented and must fall back to the latest implemented session revision",
                 caps.version
             );
         }
@@ -402,7 +457,7 @@ mod protocol_table_tests {
         );
         assert_eq!(
             negotiate_protocol_version(None),
-            LATEST_MCP_PROTOCOL_VERSION
+            LATEST_SESSION_MCP_PROTOCOL_VERSION
         );
     }
 
@@ -434,9 +489,15 @@ mod protocol_table_tests {
         for (i, code) in codes.iter().enumerate() {
             assert_eq!(
                 *code,
-                -32029 - i as i32,
-                "gateway block must stay contiguous"
+                -32004 - i as i32,
+                "gateway v5.0 implementation-defined block must stay contiguous in -32000..-32019"
             );
+            assert_eq!(
+                to_legacy_error_code(*code),
+                -32029 - i as i32,
+                "legacy error mapping must preserve 4.x -32029..-32038 codes"
+            );
+            assert_eq!(from_legacy_error_code(-32029 - i as i32), *code);
         }
     }
 }

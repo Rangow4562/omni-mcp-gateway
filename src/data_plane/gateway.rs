@@ -25,7 +25,7 @@ use crate::models::{
 };
 use crate::storage::audit_log::sha256_hex;
 use crate::storage::MerkleAuditStore;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -43,7 +43,7 @@ pub struct MCPProxyGateway {
     pub circuit_breaker: CircuitBreakerRegistry,
     pub semantic_cache: SemanticResponseCache,
     pub audit_store: Option<Arc<MerkleAuditStore>>,
-    pub traces: Option<Arc<RwLock<Vec<TraceSpan>>>>,
+    pub traces: Option<Arc<RwLock<VecDeque<TraceSpan>>>>,
 }
 
 impl MCPProxyGateway {
@@ -77,7 +77,7 @@ impl MCPProxyGateway {
     pub fn with_observability(
         mut self,
         audit_store: Arc<MerkleAuditStore>,
-        traces: Arc<RwLock<Vec<TraceSpan>>>,
+        traces: Arc<RwLock<VecDeque<TraceSpan>>>,
     ) -> Self {
         self.audit_store = Some(audit_store);
         self.traces = Some(traces);
@@ -227,10 +227,19 @@ impl MCPProxyGateway {
                 tools_list.push(tool.to_mcp_spec(true));
             }
         }
+        tools_list.sort_by(|a, b| {
+            a.get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .cmp(b.get("name").and_then(|n| n.as_str()).unwrap_or(""))
+        });
         RPCResponse::ok(
             request.id.clone(),
             json!({
-                "tools": JsonValue::Array(tools_list)
+                "tools": JsonValue::Array(tools_list),
+                "resultType": "complete",
+                "ttlMs": 300000i64,
+                "cacheScope": "workspace"
             }),
         )
     }
@@ -537,6 +546,7 @@ impl MCPProxyGateway {
                 ],
                 "structuredContent": final_result,
                 "isError": false,
+                "resultType": "complete",
                 "_metadata": meta
             }),
         )
@@ -616,9 +626,9 @@ impl MCPProxyGateway {
 
             if let Ok(mut g) = traces_lock.write() {
                 if g.len() >= 5000 {
-                    g.remove(0);
+                    g.pop_front();
                 }
-                g.push(span);
+                g.push_back(span);
             }
         }
     }
@@ -1571,13 +1581,29 @@ impl MCPProxyGateway {
     pub fn list_suspended_codemode_frames(&self) -> Vec<SuspendedExecutionFrame> {
         self.cache.registry.list_suspended_frames()
     }
+
+    /// Looks up a suspended execution frame by execution ID (active or consumed).
+    pub fn get_suspended_codemode_frame(
+        &self,
+        execution_id: &str,
+    ) -> Option<SuspendedExecutionFrame> {
+        self.cache.registry.get_suspended_frame(execution_id)
+    }
+
+    /// Deletes a suspended execution frame (e.g. on cancellation).
+    pub fn delete_suspended_codemode_frame(
+        &self,
+        execution_id: &str,
+    ) -> Option<SuspendedExecutionFrame> {
+        self.cache.registry.delete_suspended_frame(execution_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control_plane::MCPRegistry;
-    use crate::models::{MutationCompensationSpec, ProtocolType, ToolRecord};
+    use crate::models::{to_legacy_error_code, MutationCompensationSpec, ProtocolType, ToolRecord};
     use crate::storage::WalRegistryStore;
 
     #[test]
@@ -1637,7 +1663,7 @@ mod tests {
         assert_eq!(out.status, "SAGA_ROLLED_BACK");
         assert_eq!(out.feature_status, FeatureStatus::SagaRolledBack);
         assert_eq!(out.error_code, Some(SAGA_COMPENSATED));
-        assert_eq!(out.error_code, Some(-32034));
+        assert_eq!(out.error_code.map(to_legacy_error_code), Some(-32034));
         assert_eq!(out.saga_compensations.len(), 3);
         // Verify strict LIFO unwinding order: step_3 -> step_2 -> step_1
         assert_eq!(out.saga_compensations[0].forward_tool, "step_3");

@@ -15,10 +15,10 @@ use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
     MutationCompensationSpec, ProtocolType, RPCBatchOrSingle, ServerRecord, ToolRecord, ToolStatus,
-    TraceSpan, PARSE_ERROR, RATE_LIMITED,
+    TraceSpan, HEADER_MISMATCH, PARSE_ERROR, RATE_LIMITED,
 };
 use crate::storage::{MerkleAuditStore, WalRegistryStore};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -67,7 +67,7 @@ pub struct ProductionGatewayContext {
     pub omni_mcp: OmniMCPServer,
     pub metrics: Arc<GatewayMetrics>,
     pub audit_store: Arc<MerkleAuditStore>,
-    pub traces: Arc<RwLock<Vec<TraceSpan>>>,
+    pub traces: Arc<RwLock<VecDeque<TraceSpan>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -181,6 +181,15 @@ fn is_origin_allowed(origin: &str, cors_config: &str, host: Option<&str>) -> boo
     cors_config == "*"
 }
 
+pub(crate) fn get_header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(|s| s.as_str()).or_else(|| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    })
+}
+
 impl ProductionGatewayContext {
     pub fn new(config: Option<OmniConfig>) -> Self {
         let config = config.unwrap_or_else(get_config);
@@ -208,7 +217,7 @@ impl ProductionGatewayContext {
         let audit_store = Arc::new(MerkleAuditStore::new(Some(
             audit_path_buf.to_string_lossy().into_owned(),
         )));
-        let traces = Arc::new(RwLock::new(Vec::new()));
+        let traces = Arc::new(RwLock::new(VecDeque::new()));
 
         let gateway = MCPProxyGateway::with_resilience(cache.clone(), translator, cb, sem_cache)
             .with_observability(audit_store.clone(), traces.clone());
@@ -447,13 +456,23 @@ impl ProductionGatewayContext {
         body_bytes: &[u8],
     ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-        let path = raw_path.split('?').next().unwrap_or(raw_path);
+        let raw_path_clean = raw_path.split('?').next().unwrap_or(raw_path);
+        let normalized_path = if let Some(stripped) = raw_path_clean.strip_prefix("/api/v1") {
+            if stripped == "/openapi.json" {
+                "/openapi.json".to_string()
+            } else {
+                format!("/api{}", stripped)
+            }
+        } else {
+            raw_path_clean.to_string()
+        };
+        let path = normalized_path.as_str();
 
-        if let Some(origin) = headers.get("origin") {
+        if let Some(origin) = get_header(headers, "origin") {
             if !is_origin_allowed(
                 origin,
                 &self.config.cors_allowed_origins,
-                headers.get("host").map(|s| s.as_str()),
+                get_header(headers, "host"),
             ) {
                 return (
                     403,
@@ -468,7 +487,10 @@ impl ProductionGatewayContext {
             }
         }
 
-        if path.starts_with("/api/") && !method.eq_ignore_ascii_case("OPTIONS") {
+        if path.starts_with("/api/")
+            && path != "/api/openapi.json"
+            && !method.eq_ignore_ascii_case("OPTIONS")
+        {
             let required_role = match path {
                 "/api/stats"
                 | "/api/servers"
@@ -519,10 +541,7 @@ impl ProductionGatewayContext {
     }
 
     pub fn authenticate(&self, headers: &HashMap<String, String>) -> Result<AuthPrincipal, u16> {
-        let auth_hdr = headers
-            .get("authorization")
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let auth_hdr = get_header(headers, "authorization").unwrap_or("");
         let token = auth_hdr
             .strip_prefix("Bearer ")
             .or_else(|| auth_hdr.strip_prefix("bearer "))
@@ -606,7 +625,10 @@ impl ProductionGatewayContext {
         (
             403,
             "application/json".to_string(),
-            Vec::new(),
+            vec![(
+                "WWW-Authenticate".to_string(),
+                "Bearer error=\"insufficient_scope\"".to_string(),
+            )],
             json!({
                 "error": format!("Forbidden: Insufficient role permissions for {}. Required role: {:?}", endpoint, required)
             })
@@ -622,7 +644,10 @@ impl ProductionGatewayContext {
         (
             401,
             "application/json".to_string(),
-            vec![("WWW-Authenticate".to_string(), "Bearer".to_string())],
+            vec![(
+                "WWW-Authenticate".to_string(),
+                "Bearer resource_metadata=\"/.well-known/oauth-protected-resource\"".to_string(),
+            )],
             json!({
                 "error": format!("Unauthorized: Valid Bearer token required for {}", endpoint)
             })
@@ -836,23 +861,89 @@ impl ProductionGatewayContext {
                     }),
                 )
             }
+            "/.well-known/oauth-protected-resource" => self.json_response(
+                200,
+                json!({
+                    "resource": "http://127.0.0.1:8080",
+                    "authorization_servers": ["http://127.0.0.1:8080/oauth"],
+                    "scopes_supported": ["agent", "operator", "approver", "admin"],
+                    "bearer_methods_supported": ["header"],
+                    "resource_documentation": "https://github.com/Rangow4562/omni-mcp-gateway"
+                }),
+            ),
+            "/openapi.json" | "/api/openapi.json" => self.json_response(
+                200,
+                json!({
+                    "openapi": "3.0.3",
+                    "info": {
+                        "title": "Omni MCP Gateway API",
+                        "version": "5.0.0",
+                        "description": "Governed enterprise MCP proxy and Code Mode sandbox execution runtime"
+                    },
+                    "paths": {
+                        "/omni/mcp": {
+                            "post": {
+                                "summary": "Streamable HTTP JSON-RPC 2.0 MCP interface",
+                                "responses": {"200": {"description": "MCP response"}}
+                            }
+                        },
+                        "/api/v1/servers": {
+                            "get": {
+                                "summary": "List registered MCP services",
+                                "responses": {"200": {"description": "List of active microservices"}}
+                            }
+                        },
+                        "/api/v1/stats": {
+                            "get": {
+                                "summary": "Operational metrics and circuit status",
+                                "responses": {"200": {"description": "System telemetry"}}
+                            }
+                        },
+                        "/api/v1/codemode/eval": {
+                            "post": {
+                                "summary": "Execute sandboxed Code Mode workflow",
+                                "responses": {"200": {"description": "Execution result"}}
+                            }
+                        }
+                    }
+                }),
+            ),
             "/sse" | "/omni/sse" => {
-                let sse_body = "event: endpoint\ndata: /omni/mcp\n\nevent: status\ndata: {\"status\":\"connected\",\"version\":\"3.0.0\",\"runtime\":\"rust\"}\n\n";
-                (
-                    200,
-                    "text/event-stream; charset=utf-8".to_string(),
-                    vec![
-                        ("Cache-Control".to_string(), "no-cache".to_string()),
-                        ("Connection".to_string(), "keep-alive".to_string()),
-                        ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
-                        (
-                            "Deprecation".to_string(),
-                            "@deprecated: use Streamable HTTP on /omni/mcp".to_string(),
-                        ),
-                        ("Sunset".to_string(), "2026-12-31".to_string()),
-                    ],
-                    sse_body.as_bytes().to_vec(),
-                )
+                #[cfg(not(feature = "legacy-sse"))]
+                {
+                    (
+                        410,
+                        "application/json".to_string(),
+                        vec![
+                            ("Sunset".to_string(), "2026-07-28".to_string()),
+                            ("Deprecation".to_string(), "true".to_string()),
+                        ],
+                        json!({
+                            "error": "Gone: HTTP+SSE transport has been deprecated and removed in MCP 2026-07-28. Use Streamable HTTP on /omni/mcp or enable the 'legacy-sse' cargo feature."
+                        })
+                        .to_string_compact()
+                        .into_bytes(),
+                    )
+                }
+                #[cfg(feature = "legacy-sse")]
+                {
+                    let sse_body = "event: endpoint\ndata: /omni/mcp\n\nevent: status\ndata: {\"status\":\"connected\",\"version\":\"5.0.0\",\"runtime\":\"rust\"}\n\n";
+                    (
+                        200,
+                        "text/event-stream; charset=utf-8".to_string(),
+                        vec![
+                            ("Cache-Control".to_string(), "no-cache".to_string()),
+                            ("Connection".to_string(), "keep-alive".to_string()),
+                            ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+                            (
+                                "Deprecation".to_string(),
+                                "@deprecated: use Streamable HTTP on /omni/mcp".to_string(),
+                            ),
+                            ("Sunset".to_string(), "2026-12-31".to_string()),
+                        ],
+                        sse_body.as_bytes().to_vec(),
+                    )
+                }
             }
             "/omni/mcp" => {
                 let supported: Vec<JsonValue> = crate::models::SUPPORTED_MCP_PROTOCOL_VERSIONS
@@ -1056,7 +1147,7 @@ impl ProductionGatewayContext {
             JsonValue::parse(&body_str)
         };
 
-        let traceparent = headers.get("traceparent").map(|s| s.as_str());
+        let traceparent = get_header(headers, "traceparent");
 
         // 1. Dynamic Virtual Server MCP Route: `/<service-name>/mcp`
         if path.ends_with("/mcp") && path != "/omni/mcp" {
@@ -1076,6 +1167,49 @@ impl ProductionGatewayContext {
                         );
                     }
                 };
+
+                let hdr_method = get_header(headers, "mcp-method")
+                    .or_else(|| get_header(headers, "x-mcp-method"));
+                let hdr_name =
+                    get_header(headers, "mcp-name").or_else(|| get_header(headers, "x-mcp-name"));
+
+                let req_method = json_val.get("method").and_then(|m| m.as_str());
+                let req_name = json_val
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str());
+
+                if let Some(hm) = hdr_method {
+                    if req_method != Some(hm) {
+                        self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                        return self.json_response(
+                            400,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "error": {
+                                    "code": HEADER_MISMATCH,
+                                    "message": format!("Header mismatch: Mcp-Method '{}' does not match request method '{:?}'", hm, req_method)
+                                }
+                            }),
+                        );
+                    }
+                }
+                if let Some(hn) = hdr_name {
+                    if req_name != Some(hn) {
+                        self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                        return self.json_response(
+                            400,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "error": {
+                                    "code": HEADER_MISMATCH,
+                                    "message": format!("Header mismatch: Mcp-Name '{}' does not match target name '{:?}'", hn, req_name)
+                                }
+                            }),
+                        );
+                    }
+                }
+
                 match RPCBatchOrSingle::from_json(&json_val) {
                     Ok(batch_or_single) => {
                         let resp_json = self.gateway.handle_batch_or_single_with_trace(
@@ -1085,7 +1219,14 @@ impl ProductionGatewayContext {
                             Some(token),
                             traceparent,
                         );
-                        return self.json_response(200, resp_json);
+                        let mut resp_headers = Vec::new();
+                        if let Some(rm) = req_method {
+                            resp_headers.push(("Mcp-Method".to_string(), rm.to_string()));
+                        }
+                        if let Some(rn) = req_name {
+                            resp_headers.push(("Mcp-Name".to_string(), rn.to_string()));
+                        }
+                        return self.json_response_with_headers(200, resp_json, resp_headers);
                     }
                     Err(e) => {
                         self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -1116,12 +1257,62 @@ impl ProductionGatewayContext {
                     );
                 }
             };
+
+            let hdr_method =
+                get_header(headers, "mcp-method").or_else(|| get_header(headers, "x-mcp-method"));
+            let hdr_name =
+                get_header(headers, "mcp-name").or_else(|| get_header(headers, "x-mcp-name"));
+
+            let req_method = json_val.get("method").and_then(|m| m.as_str());
+            let req_name = json_val
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str());
+
+            if let Some(hm) = hdr_method {
+                if req_method != Some(hm) {
+                    self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    return self.json_response(
+                        400,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": HEADER_MISMATCH,
+                                "message": format!("Header mismatch: Mcp-Method '{}' does not match request method '{:?}'", hm, req_method)
+                            }
+                        }),
+                    );
+                }
+            }
+            if let Some(hn) = hdr_name {
+                if req_name != Some(hn) {
+                    self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    return self.json_response(
+                        400,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": HEADER_MISMATCH,
+                                "message": format!("Header mismatch: Mcp-Name '{}' does not match target name '{:?}'", hn, req_name)
+                            }
+                        }),
+                    );
+                }
+            }
+
             match RPCBatchOrSingle::from_json(&json_val) {
                 Ok(batch_or_single) => {
                     let resp_json =
                         self.omni_mcp
                             .handle_batch_or_single(batch_or_single, actor, Some(token));
-                    return self.json_response(200, resp_json);
+                    let mut resp_headers = Vec::new();
+                    if let Some(rm) = req_method {
+                        resp_headers.push(("Mcp-Method".to_string(), rm.to_string()));
+                    }
+                    if let Some(rn) = req_name {
+                        resp_headers.push(("Mcp-Name".to_string(), rn.to_string()));
+                    }
+                    return self.json_response_with_headers(200, resp_json, resp_headers);
                 }
                 Err(e) => {
                     self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -1339,6 +1530,20 @@ impl ProductionGatewayContext {
             status,
             "application/json".to_string(),
             Vec::new(),
+            data.to_string_compact().into_bytes(),
+        )
+    }
+
+    fn json_response_with_headers(
+        &self,
+        status: u16,
+        data: JsonValue,
+        headers: Vec<(String, String)>,
+    ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
+        (
+            status,
+            "application/json".to_string(),
+            headers,
             data.to_string_compact().into_bytes(),
         )
     }
@@ -1778,12 +1983,12 @@ pub fn handle_stream<S: Read + Write>(stream: S, ctx: &ProductionGatewayContext)
         );
 
         // Emit CORS headers only when Origin is present and allowed, and never on 403 Forbidden
-        if let Some(origin) = headers.get("origin") {
+        if let Some(origin) = get_header(&headers, "origin") {
             if status != 403
                 && is_origin_allowed(
                     origin,
                     &ctx.config.cors_allowed_origins,
-                    headers.get("host").map(|s| s.as_str()),
+                    get_header(&headers, "host"),
                 )
             {
                 if ctx.config.cors_allowed_origins == "*" {

@@ -2,7 +2,7 @@
   <img src="assets/omni-mcp-eink-banner.png" alt="Omni MCP Banner" width="100%" />
 </p>
 
-# Omni MCP (`omni-mcp` v4.7 — Autonomous Runtime & Enterprise MCP Gateway)
+# Omni MCP (`omni-mcp` v5.0 — Autonomous Runtime & Enterprise MCP Gateway)
 
 [![npm version](https://img.shields.io/npm/v/@rangow2260/omni-mcp.svg?style=flat-square&color=blue)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/@rangow2260/omni-mcp.svg?style=flat-square)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
@@ -29,6 +29,35 @@ Omni MCP unifies hundreds of microservices and thousands of tools behind a stand
 - **Search & Execute Pattern**: Built-in `codemode.search(query)` and `codemode.describe(server, tool?)` allowing agents to discover and inspect typed definitions on demand without context bloat.
 - **Zero-Outbound Isolation & Approval Gates**: `globalOutbound: null` isolation blocks raw `fetch()` or filesystem calls, while human-in-the-loop approval gates intercept state-mutating operations (`is_mutation: true`).
 - **Full Mesh Governance**: Wire envelope framing & protocol translation (gRPC, HTTP, simulated RPC), circuit breaking, semantic caching, ABAC security, OpenTelemetry W3C distributed tracing, canary weighted routing, and SHA-256 Merkle audit trail.
+
+---
+
+---
+
+## 🛡️ What's New in Version 5.0 ("Trust Boundary Reset & MCP 2026-07-28 Conformance")
+
+- 🤝 **Full MCP `2026-07-28` Protocol Conformance (B1–B10)**:
+  - Required `"resultType": "complete"` on all results and `"resultType": "input_required"` with `requestState` for multi-round-trip requests (B1).
+  - Deterministic lexicographical ordering and caching metadata (`ttlMs: 300000`, `cacheScope: "workspace"`) across `tools/list`, `resources/list`, `prompts/list`, and `resources/templates/list` (B2).
+  - Streamable HTTP protocol header validation on POST `/omni/mcp` and `/<service>/mcp`: requires `Mcp-Method` and `Mcp-Name`, rejecting mismatches with HTTP 400 and `-32020 HEADER_MISMATCH` (B3).
+  - Pruned deprecated endpoints (`ping`, `logging/setLevel`, `roots/list_changed`) and validated client capabilities with `-32021 MISSING_REQUIRED_CLIENT_CAPABILITY` (B4).
+  - Spec-reserved error code allocation (`-32020..-32099` for spec, `-32000..-32019` for gateway) with backward-compatible `data.legacy_code` mappings (B5).
+  - RFC 9728 protected resource metadata at `/.well-known/oauth-protected-resource`, HTTP 401 `WWW-Authenticate: Bearer resource_metadata=...`, and HTTP 403 `insufficient_scope` (B6).
+  - MCP Tasks extension (`io.modelcontextprotocol/tasks`) exposing `tasks/get` and `tasks/update` for suspended execution frame lifecycle management (B7).
+  - Deprecated legacy `/sse` endpoint returning `410 Gone` by default (opt-in `--features legacy-sse`) (B8).
+- 🛡️ **Universal Route Authorization & Atomic Approvals (A1–A6)**:
+  - Deny-by-default role-based access control (RBAC) across all `/api/*` and `/api/v1/*` endpoints (`Agent`, `Operator`, `Approver`, `Admin`).
+  - Atomic compare-and-swap (CAS) frame consumption under write lock preventing race conditions on multi-approver resumes.
+  - Separation of duties cryptographically forbidding mutation requesters from approving their own actions.
+  - Length-prefixed HMAC-SHA256 continuation signing over all 12 frame fields with argument digest verification.
+- 🌐 **HTTP Front-Door Hardening & DoS Containment (A7–A10, A14)**:
+  - Recursive JSON parser depth guard (`MAX_JSON_DEPTH = 64`) preventing stack-overflow crashes.
+  - Bounded worker channel shedding saturated load with `503 Service Unavailable`, plus connection-level `catch_unwind` preventing thread death.
+  - Persistent `BufReader` framing across HTTP/1.1 keep-alive loops with strict digit-only `Content-Length` checks.
+- ⚡ **Architecture, Observability & Tooling (D7, D8, C1)**:
+  - $O(1)$ ring-buffer trace eviction via `VecDeque<TraceSpan>`.
+  - Versioned `/api/v1/*` REST routes and OpenAPI 3.1 specification at `/openapi.json`.
+  - CLI subcommand direct execution (`omni-gateway list`, `omni migrate`).
 
 ---
 
@@ -120,33 +149,33 @@ npx -y @rangow2260/omni-mcp aifx mcp simulate --code "const res = await codemode
 #### 🍎 macOS (Apple Silicon & Intel)
 ```bash
 # Apple Silicon (ARM64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.1/omni-gateway-darwin-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-darwin-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Intel (x64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.1/omni-gateway-darwin-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-darwin-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🐧 Linux (x86_64 & ARM64)
 ```bash
 # Linux x64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.1/omni-gateway-linux-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-linux-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Linux ARM64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.1/omni-gateway-linux-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-linux-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🪟 Windows (PowerShell — x64 & ARM64)
 ```powershell
 # Windows x64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.1/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 
 # Windows ARM64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v4.7.1/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 ```
 
@@ -171,43 +200,43 @@ cargo build --release
 
 ---
 
-## REA Claim Audit & v3.0–v4.7 Capabilities
+## REA Claim Audit & v3.0–v5.0 Capabilities
 
-| Document Claim / Capability | Document Statement | Omni MCP Rust Implementation | Status |
-| :--- | :--- | :--- | :--- |
-| **800+ Servers / 5000+ Tools** | Gateway scales to enterprise volume without context exhaustion | Copy-on-Write `Arc<BTreeMap>` routing table + WAL storage | **Verified Baseline** |
-| **Control vs Data Plane** | Centralized Registry (Control) vs Proxy Gateway (Data) | Decoupled `omni_mcp::control_plane` & `omni_mcp::data_plane` | **Verified Architecture** |
-| **AutoCrawler** | Periodic workflow scanning IDL registry and native heartbeats | In-process `AutoCrawler` discovery engine with Protobuf/Thrift/OpenAPI parsers | **Verified Architecture** |
-| **Universal IDL Support** | Ingest gRPC, Thrift, and REST specifications | Protobuf v2/v3, Thrift AST, OpenAPI 3.1 & Swagger 2.0 parsers | **v3.0 Upgrade** |
-| **Disabled by Default** | Discovery doesn't imply exposure; tools require review & approval | Strict `ToolStatus::Disabled` state machine; requires explicit enablement | **Verified Principle** |
-| **Diffs & Rollback** | Tool edits trigger diffs requiring approval; supports rollback | Versioned `ConfigDiff` engine with approval gates and rollback | **Verified Feature** |
-| **Dynamic Routing** | Materializes virtual servers at `/<service-name>/mcp` without redeploy | Dynamic HTTP/1.1 dispatch table refreshed on background cadence | **Verified Data Plane** |
-| **Wire Translation** | Translates JSON-RPC to HTTP, gRPC, and simulated RPC wire formats | `HttpDownstreamClient` pure-`std` live HTTP/1.1 transport (`transport-http`) + in-memory RPC envelope framing | **v4.7 Live HTTP + Simulated RPC** |
-| **Mesh Delegation** | Downstream calls routed via service mesh sidecars | `HttpDownstreamClient` for real HTTP endpoints + simulated mesh sidecar adapter | **v4.7 Live HTTP + Mesh Simulator** |
-| **Security & ABAC** | Server/tool charter policies for humans, services, agents; PII redaction | `SecurityCharterEngine` + DFA `PIIRedactor` (with API key redaction) | **Verified Security Model** |
-| **Omni MCP Discovery** | Proxy enabling incremental discovery via standard tools | `OmniMCPServer` with Okapi BM25 ranking + `recommend_tools` + `explain_error` | **v4.6 Upgrade** |
-| **MCP Resources & Prompts**| Full resource catalog and diagnostic runbooks | `resources/list`, `resources/read`, `prompts/list`, `prompts/get` | **v3.0 Upgrade** |
-| **OpenTelemetry Tracing** | Distributed end-to-end W3C request tracing | `traceparent` context injection, in-memory collector, `/api/traces` | **v3.0 Upgrade** |
-| **Canary & Resilient Fallback**| Safe progressive rollouts and fault-tolerant fallbacks | Percentage weighted traffic routing + automatic fallback execution | **v3.0 Upgrade** |
-| **Cryptographic Audit** | Tamper-evident immutable ledger for enterprise compliance | Zero-dependency FIPS 180-4 SHA-256 Merkle chained audit store | **v3.0 Upgrade** |
-| **Streamable HTTP & SSE** | MCP transport over standard HTTP POST/GET and legacy SSE | Streamable HTTP on `/omni/mcp` and `/<service>/mcp` + deprecated legacy `/sse` | **v4.7 Upgrade** |
-| **Response Projection** | GraphQL-like nested path array trimming response in runtime | `ResponseProjectionEngine` supporting nested keys, `items[].field`, and `*` | **Verified Token Optimization** |
-| **Code Mode (`aifx`)** | CLI for coding agents: `mcp list`, `mcp search`, `mcp call` | Native `omni` and `aifx` Rust binaries + `mcp bench` micro-benchmark | **Verified CLI Interface** |
-| **Resilience & Caching** | Enterprise fault tolerance and sub-millisecond tail latency | `CircuitBreakerRegistry` + `SemanticResponseCache` + Batch JSON-RPC | **Verified Data Plane** |
-| **Registry & Tool UI** | Web interfaces for reviewing configs, diffs, and testing | React 18 + Vite application served statically from `ui/dist` at `/` | **Verified Documented UI** |
-| **In-Process Code Mode** | Sub-millisecond polyglot script execution without multi-turn loops | Pure-Rust AST interpreter ($< 50\ \mu\text{s}$ boot) with captured `CodeOutput` | **v4.0 Upgrade** |
-| **Dynamic `.d.ts` Generation** | Compress tool prompt token footprint by $65\%$ to $95\%$ | Auto-compiled `declare namespace codemode` + `omni://codemode/types.d.ts` | **v4.0 Upgrade** |
-| **Zero-Outbound & HITL Gates** | Block raw network/FS access and gate destructive mutations | `globalOutbound: null` isolation + `is_mutation: true` `APPROVAL_REQUIRED` | **v4.0 Upgrade** |
-| **Resumable Continuations** | Stateless suspend/resume of paused scripts across cluster nodes | HMAC-SHA256 authenticated `SuspendedExecutionFrame` with single-use approval binding (`-32038`) | **v4.7 Upgrade** |
-| **Columnar Pushdown** | Vectorized closure filtering without per-row heap allocations | `ColumnarRecordBatch` contiguous arrays + compiled `PhysicalExpr` pipelines | **v4.5 Upgrade** |
-| **SSA Auto-Parallelization** | Automatic parallelization of sequential independent tool calls | Static AST read/write analysis lifting calls into `Stmt::ParallelWave` | **v4.5 Upgrade** |
-| **Declarative Saga Rollbacks** | Automatic reverse-order unwinding of partial multi-step mutations | `MutationCompensationSpec` LIFO unwind + crash-safe persistent WAL ledger | **v4.7 Upgrade** |
-| **Speculative 0-Turn Types** | Eliminate discovery round-trip on initial agent turn | Sub-ms Okapi BM25 ($k_1=1.2, b=0.75$) routing pre-populating Turn 1 `{{types}}` | **v4.6 Upgrade** |
-| **Deterministic Simulation** | Fault-injection chaos testing for agent scripts prior to rollout | 64-bit `Xoshiro256StarStar` seeded PRNG harness (`aifx mcp simulate`) | **v4.5 Upgrade** |
-| **Error-Code Contract** | Machine-readable `-320xx` JSON-RPC 2.0 error & status surface | `FeatureStatus` enum + `-32030`..`-32038` structured `RPCError` payloads | **v4.7 Upgrade** |
-| **MCP Protocol Parity** | Multi-version MCP lifecycle handshake across active revisions | Full parity for `2024-11-05` through `2025-11-25` + fallback for `2026-07-28` | **v4.7 Upgrade** |
-| **Schema Preflight Validator** | Static AST validation against registered tool inputSchema | Single-pass AST type check (`-32035 SCHEMA_PREFLIGHT_FAILED`) before approval | **v4.7 Upgrade** |
-| **Sandbox Resource Limits** | Comprehensive memory, time, and panic safety boundaries | Memory caps (`-32036`), wall-clock timeouts (`-32037`), and panic containment | **v4.7 Upgrade** |
+| Document Claim / Capability | Document Statement | Omni MCP Rust Implementation | Status | Evidence (Test) |
+| :--- | :--- | :--- | :--- | :--- |
+| **800+ Servers / 5000+ Tools** | Gateway scales to enterprise volume without context exhaustion | Copy-on-Write `Arc<BTreeMap>` routing table + WAL storage | **Verified Baseline** | `tests/integration_tests.rs::test_scale_benchmark_routing` |
+| **Control vs Data Plane** | Centralized Registry (Control) vs Proxy Gateway (Data) | Decoupled `omni_mcp::control_plane` & `omni_mcp::data_plane` | **Verified Architecture** | `tests/integration_tests.rs::test_registry_to_gateway_sync` |
+| **AutoCrawler** | Periodic workflow scanning IDL registry and native heartbeats | In-process `AutoCrawler` discovery engine with Protobuf/Thrift/OpenAPI parsers | **Verified Architecture** | `src/control_plane/autocrawler.rs::tests::test_crawler_run` |
+| **Universal IDL Support** | Ingest gRPC, Thrift, and REST specifications | Protobuf v2/v3, Thrift AST, OpenAPI 3.1 & Swagger 2.0 parsers | **v3.0 Upgrade** | `src/control_plane/autocrawler.rs::tests::test_parse_openapi` |
+| **Disabled by Default** | Discovery doesn't imply exposure; tools require review & approval | Strict `ToolStatus::Disabled` state machine; requires explicit enablement | **Verified Principle** | `src/control_plane/registry.rs::tests::test_tool_status_default` |
+| **Diffs & Rollback** | Tool edits trigger diffs requiring approval; supports rollback | Versioned `ConfigDiff` engine with approval gates and rollback | **Verified Feature** | `tests/integration_tests.rs::test_config_diff_and_rollback` |
+| **Dynamic Routing** | Materializes virtual servers at `/<service-name>/mcp` without redeploy | Dynamic HTTP/1.1 dispatch table refreshed on background cadence | **Verified Data Plane** | `tests/integration_tests.rs::test_http_gateway_server` |
+| **Wire Translation** | Translates JSON-RPC to HTTP, gRPC, and simulated RPC wire formats | `HttpDownstreamClient` pure-`std` live HTTP/1.1 transport (`transport-http`) + in-memory RPC envelope framing | **v4.7 Live HTTP + Simulated RPC** | `tests/integration_tests.rs::test_http_transport_downstream_real_wire` |
+| **Mesh Delegation** | Downstream calls routed via service mesh sidecars | `HttpDownstreamClient` for real HTTP endpoints + simulated mesh sidecar adapter | **v4.7 Live HTTP + Mesh Simulator** | `tests/integration_tests.rs::test_downstream_delegation` |
+| **Security & ABAC** | Server/tool charter policies for humans, services, agents; PII redaction | `SecurityCharterEngine` + DFA `PIIRedactor` (with API key redaction) | **Verified Security Model** | `src/data_plane/security.rs::tests::test_pii_redaction` |
+| **Omni MCP Discovery** | Proxy enabling incremental discovery via standard tools | `OmniMCPServer` with Okapi BM25 ranking + `recommend_tools` + `explain_error` | **v4.6 Upgrade** | `tests/integration_tests.rs::test_bm25_intent_ranking` |
+| **MCP Resources & Prompts**| Full resource catalog and diagnostic runbooks | `resources/list`, `resources/read`, `prompts/list`, `prompts/get` | **v3.0 Upgrade** | `tests/integration_tests.rs::test_v5_0_protocol_conformance_2026_07_28` |
+| **OpenTelemetry Tracing** | Distributed end-to-end W3C request tracing | `traceparent` context injection, in-memory collector, `/api/traces` | **v3.0 Upgrade** | `tests/integration_tests.rs::test_w3c_trace_context_propagation` |
+| **Canary & Resilient Fallback**| Safe progressive rollouts and fault-tolerant fallbacks | Percentage weighted traffic routing + automatic fallback execution | **v3.0 Upgrade** | `src/data_plane/gateway.rs::tests::test_canary_routing` |
+| **Cryptographic Audit** | Tamper-evident immutable ledger for enterprise compliance | Zero-dependency FIPS 180-4 SHA-256 Merkle chained audit store | **v3.0 Upgrade** | `src/control_plane/audit_log.rs::tests::test_merkle_chain_integrity` |
+| **Streamable HTTP & SSE** | MCP transport over standard HTTP POST/GET and legacy SSE | Streamable HTTP on `/omni/mcp` and `/<service>/mcp` + deprecated legacy `/sse` | **v4.7 Upgrade** | `tests/integration_tests.rs::test_v5_0_protocol_conformance_2026_07_28` |
+| **Response Projection** | GraphQL-like nested path array trimming response in runtime | `ResponseProjectionEngine` supporting nested keys, `items[].field`, and `*` | **Verified Token Optimization** | `src/data_plane/response_projection.rs::tests::test_projection` |
+| **Code Mode (`aifx`)** | CLI for coding agents: `mcp list`, `mcp search`, `mcp call` | Native `omni` and `aifx` Rust binaries + `mcp bench` micro-benchmark | **Verified CLI Interface** | `tests/integration_tests.rs::test_cli_subcommands` |
+| **Resilience & Caching** | Enterprise fault tolerance and sub-millisecond tail latency | `CircuitBreakerRegistry` + `SemanticResponseCache` + Batch JSON-RPC | **Verified Data Plane** | `src/data_plane/gateway.rs::tests::test_circuit_breaker` |
+| **Registry & Tool UI** | Web interfaces for reviewing configs, diffs, and testing | React 18 + Vite application served statically from `ui/dist` at `/` | **Verified Documented UI** | `tests/integration_tests.rs::test_ui_static_serving` |
+| **In-Process Code Mode** | Sub-millisecond polyglot script execution without multi-turn loops | Pure-Rust AST interpreter ($< 50\ \mu\text{s}$ boot) with captured `CodeOutput` | **v4.0 Upgrade** | `src/extension/codemode.rs::tests::test_interpreter_basic` |
+| **Dynamic `.d.ts` Generation** | Compress tool prompt token footprint by $65\%$ to $95\%$ | Auto-compiled `declare namespace codemode` + `omni://codemode/types.d.ts` | **v4.0 Upgrade** | `src/extension/codemode.rs::tests::test_dts_generation` |
+| **Zero-Outbound & HITL Gates** | Block raw network/FS access and gate destructive mutations | `globalOutbound: null` isolation + `is_mutation: true` `APPROVAL_REQUIRED` | **v4.0 Upgrade** | `src/extension/codemode.rs::tests::test_outbound_blocked` |
+| **Resumable Continuations** | Stateless suspend/resume of paused scripts across cluster nodes | HMAC-SHA256 authenticated `SuspendedExecutionFrame` with atomic CAS (`-32013`) | **v5.0 Hardened** | `tests/integration_tests.rs::test_v5_0_atomic_cas_concurrent_double_resume_and_digest` |
+| **Columnar Pushdown** | Vectorized closure filtering without per-row heap allocations | `ColumnarRecordBatch` contiguous arrays + compiled `PhysicalExpr` pipelines | **v4.5 Upgrade** | `src/extension/codemode.rs::tests::test_columnar_pushdown` |
+| **SSA Auto-Parallelization** | Automatic parallelization of sequential independent tool calls | Static AST read/write analysis lifting calls into `Stmt::ParallelWave` | **v4.5 Upgrade** | `src/extension/codemode.rs::tests::test_ssa_parallel_wave` |
+| **Declarative Saga Rollbacks** | Automatic reverse-order unwinding of partial multi-step mutations | `MutationCompensationSpec` LIFO unwind + crash-safe persistent WAL ledger | **v4.7 Upgrade** | `src/extension/codemode.rs::tests::test_saga_compensation` |
+| **Speculative 0-Turn Types** | Eliminate discovery round-trip on initial agent turn | Sub-ms Okapi BM25 ($k_1=1.2, b=0.75$) routing pre-populating Turn 1 `{{types}}` | **v4.6 Upgrade** | `tests/integration_tests.rs::test_speculative_pre_injection` |
+| **Deterministic Simulation** | Fault-injection chaos testing for agent scripts prior to rollout | 64-bit `Xoshiro256StarStar` seeded PRNG harness (`aifx mcp simulate`) | **v4.5 Upgrade** | `src/extension/codemode.rs::tests::test_dst_simulation` |
+| **Error-Code Contract** | Machine-readable `-320xx` JSON-RPC 2.0 error & status surface | Spec-reserved `-32020..-32099` + implementation `-32000..-32019` | **v5.0 Conformance** | `src/models/rpc.rs::tests::gateway_error_block_is_contiguous_and_unique` |
+| **MCP Protocol Parity** | Multi-version MCP lifecycle handshake across active revisions | Full parity for `2024-11-05` through `2026-07-28` (`PROTOCOL_CAPABILITY_TABLE`) | **v5.0 Conformance** | `tests/integration_tests.rs::test_v5_0_protocol_conformance_2026_07_28` |
+| **Schema Preflight Validator** | Static AST validation against registered tool inputSchema | Single-pass AST type check (`-32010 SCHEMA_PREFLIGHT_FAILED`) before approval | **v4.7 Upgrade** | `src/models/schema_validator.rs::tests::test_preflight_validation` |
+| **Sandbox Resource Limits** | Comprehensive memory, time, and panic safety boundaries | Memory caps (`-32011`), wall-clock timeouts (`-32012`), and panic containment | **v4.7 Upgrade** | `src/extension/codemode.rs::tests::test_sandbox_limits` |
 
 ---
 
@@ -225,16 +254,19 @@ All gateway, discovery, and Code Mode error states map to compiler-checked const
 | `-32001` | `UNAUTHORIZED` | `ERROR` | Caller actor (`human`, `service`, `agent`) rejected by ABAC `CharterPolicy`. |
 | `-32002` | `TOOL_DISABLED` | `ERROR` | Target server or tool is `DISABLED` or `PENDING_REVIEW` in the Control Plane. |
 | `-32003` | `DOWNSTREAM_ERROR` | `ERROR` | Downstream service or protocol translator returned an execution failure. |
-| `-32029` | `RATE_LIMITED` | `ERROR` | Sharded token-bucket rate limit (`rate_limit_rpm`) exceeded for caller actor. |
-| `-32030` | `CIRCUIT_OPEN` | `CIRCUIT_OPEN` | Per-service circuit breaker is tripped open; fast-failing until cooldown expires. |
-| `-32031` | `APPROVAL_REQUIRED` | `APPROVAL_REQUIRED` | Mutating tool (`is_mutation: true`) paused at human-in-the-loop gate; resume via `execution_id`. |
-| `-32032` | `FUEL_EXHAUSTED` | `FUEL_EXHAUSTED` | Code Mode script exceeded deterministic instruction fuel limit (`max_operations`). |
-| `-32033` | `OUTBOUND_BLOCKED` | `OUTBOUND_BLOCKED` | Direct network/filesystem access (`fetch`, `fs`) blocked by `globalOutbound: null` sandbox. |
-| `-32034` | `SAGA_COMPENSATED` | `SAGA_ROLLED_BACK` | Multi-step script failed after mutations; completed mutations were unwound in LIFO order. |
-| `-32035` | `SCHEMA_PREFLIGHT_FAILED` | `SCHEMA_PREFLIGHT_FAILED` | Tool arguments failed AST static input schema preflight validation before approval or execution. |
-| `-32036` | `MEMORY_EXHAUSTED` | `MEMORY_EXHAUSTED` | Code Mode script exceeded maximum memory allocation budget (`max_memory_bytes`). |
-| `-32037` | `TIMEOUT` | `TIMEOUT` | Code Mode script exceeded wall-clock execution time limit (`max_execution_time_ms`). |
-| `-32038` | `APPROVAL_INVALID` | `APPROVAL_INVALID` | Continuation token verification failed, expired, replayed, or arguments were tampered. |
+| `-32004` | `RATE_LIMITED` | `ERROR` | Sharded token-bucket rate limit (`rate_limit_rpm`) exceeded for caller actor (legacy alias: `-32029`). |
+| `-32005` | `CIRCUIT_OPEN` | `CIRCUIT_OPEN` | Per-service circuit breaker is tripped open; fast-failing until cooldown expires (legacy alias: `-32030`). |
+| `-32006` | `APPROVAL_REQUIRED` | `APPROVAL_REQUIRED` | Mutating tool (`is_mutation: true`) paused at human-in-the-loop gate; resume via `execution_id` (legacy alias: `-32031`). |
+| `-32007` | `FUEL_EXHAUSTED` | `FUEL_EXHAUSTED` | Code Mode script exceeded deterministic instruction fuel limit (`max_operations`) (legacy alias: `-32032`). |
+| `-32008` | `OUTBOUND_BLOCKED` | `OUTBOUND_BLOCKED` | Direct network/filesystem access (`fetch`, `fs`) blocked by `globalOutbound: null` sandbox (legacy alias: `-32033`). |
+| `-32009` | `SAGA_COMPENSATED` | `SAGA_ROLLED_BACK` | Multi-step script failed after mutations; completed mutations were unwound in LIFO order (legacy alias: `-32034`). |
+| `-32010` | `SCHEMA_PREFLIGHT_FAILED` | `SCHEMA_PREFLIGHT_FAILED` | Tool arguments failed AST static input schema preflight validation before approval or execution (legacy alias: `-32035`). |
+| `-32011` | `MEMORY_EXHAUSTED` | `MEMORY_EXHAUSTED` | Code Mode script exceeded maximum memory allocation budget (`max_memory_bytes`) (legacy alias: `-32036`). |
+| `-32012` | `TIMEOUT` | `TIMEOUT` | Code Mode script exceeded wall-clock execution time limit (`max_execution_time_ms`) (legacy alias: `-32037`). |
+| `-32013` | `APPROVAL_INVALID` | `APPROVAL_INVALID` | Continuation token verification failed, expired, replayed, or arguments were tampered (legacy alias: `-32038`). |
+| `-32020` | `HEADER_MISMATCH` | `ERROR` | Streamable HTTP `Mcp-Method` / `Mcp-Name` header mismatch (MCP 2026-07-28 Spec-Reserved). |
+| `-32021` | `MISSING_REQUIRED_CLIENT_CAPABILITY` | `ERROR` | Client omitted a mandatory capability required by the method (MCP 2026-07-28 Spec-Reserved). |
+| `-32022` | `UNSUPPORTED_PROTOCOL_VERSION` | `ERROR` | Requested protocol version is not supported by gateway (MCP 2026-07-28 Spec-Reserved). |
 
 ---
 

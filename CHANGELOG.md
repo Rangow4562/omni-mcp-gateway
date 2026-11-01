@@ -2,6 +2,30 @@
 
 All notable changes to Omni MCP. Per-release narrative notes live in [`docs/`](docs/).
 
+## [5.0.0] - 2026-11-01
+
+### Added
+- **Full MCP `2026-07-28` Protocol Conformance (B1–B10)**:
+  - Required `"resultType": "complete"` on successful responses and `"resultType": "input_required"` with `requestState` for multi-round-trip requests (B1).
+  - Deterministic tool, resource, and prompt sorting with caching directives (`ttlMs` and `cacheScope: "workspace"`) on catalog endpoints (B2).
+  - Streamable HTTP `Mcp-Method` and `Mcp-Name` header enforcement and echo on POST `/omni/mcp` and `/<service>/mcp` (B3).
+  - Strict client capability validation (`-32021`) on `initialize`, and pruning of deprecated endpoints (`ping`, `logging/setLevel`, `roots/list_changed`) under `2026-07-28` (B4).
+  - Spec-reserved error code allocation (`-32020..-32099` for spec definitions, `-32000..-32019` for gateway implementation codes) (B5).
+  - RFC 9728 protected-resource metadata (`/.well-known/oauth-protected-resource`), HTTP 401 `WWW-Authenticate: Bearer resource_metadata=...`, and HTTP 403 `insufficient_scope` (B6).
+  - Tasks extension (`io.modelcontextprotocol/tasks`) with `tasks/get` and `tasks/update` endpoints (B7).
+  - Feature-gated `/sse` transport returning `410 Gone` by default (enabled via optional `--features legacy-sse`) (B8).
+  - Structural response validation via `validate_mcp_response` across all supported protocol revisions (B10).
+- **Architecture, Stability & Tooling (D7, D8, C1)**:
+  - $O(1)$ ring-buffer trace eviction via `VecDeque<TraceSpan>` in production gateway context (D7).
+  - Versioned REST routes `/api/v1/*` aliased to `/api/*` and OpenAPI 3.1 specification at `/openapi.json` and `/api/v1/openapi.json` (D8).
+  - Database and configuration state migration tool via `omni-gateway migrate` (D8).
+  - Subcommand execution supporting direct commands (`list`, `search`, `call`, `bench`, `codemode`, `types`, `resume`, `simulate`, `migrate`) without requiring `mcp` prefix (C1).
+
+### Changed
+- **Breaking**: Gateway implementation error codes renumbered from `-32029..-32038` to `-32004..-32013`, with backward-compatible `data.legacy_code` preserved in responses.
+- **Breaking**: All `/api/*` and `/api/v1/*` endpoints require Bearer authentication with role-based access control (`Agent`, `Operator`, `Approver`, `Admin`).
+- **Breaking**: Default bind address is `127.0.0.1`. Non-loopback network binds strictly require `OMNI_AUTH_SECRET`.
+
 ## [5.0.0-alpha.2] - 2026-10-31
 
 ### Added

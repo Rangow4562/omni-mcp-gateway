@@ -134,6 +134,47 @@ fn validate_value(
     }
 }
 
+/// Validates an MCP JSON-RPC 2.0 response against structural schema requirements for the given revision.
+pub fn validate_mcp_response(resp: &JsonValue, revision: &str) -> Result<(), Vec<String>> {
+    let mut errs = Vec::new();
+    if !resp.is_object() {
+        errs.push("Response must be a JSON object".to_string());
+        return Err(errs);
+    }
+    if resp.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        errs.push("Response 'jsonrpc' field must be '2.0'".to_string());
+    }
+    if resp.get("id").is_none() {
+        errs.push("Response must contain an 'id' field".to_string());
+    }
+    if let Some(err_obj) = resp.get("error") {
+        if err_obj.get("code").and_then(|c| c.as_i64()).is_none() {
+            errs.push("Error response 'code' must be an integer".to_string());
+        }
+        if err_obj
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
+            errs.push("Error response 'message' must be a non-empty string".to_string());
+        }
+    } else if let Some(res_obj) = resp.get("result") {
+        if revision == "2026-07-28" {
+            match res_obj.get("resultType").and_then(|v| v.as_str()) {
+                Some("complete") | Some("input_required") => {}
+                Some(other) => errs.push(format!("Invalid resultType: '{}'", other)),
+                None => errs.push("2026-07-28 result must contain 'resultType'".to_string()),
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +239,24 @@ mod tests {
         });
 
         assert!(validate_tool_schema(&schema, &valid_args).is_ok());
+    }
+
+    #[test]
+    fn test_validate_mcp_response_structural_checks() {
+        let valid_2026 = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "resultType": "complete",
+                "tools": []
+            }
+        });
+        assert!(validate_mcp_response(&valid_2026, "2026-07-28").is_ok());
+
+        let invalid_resp = json!({
+            "jsonrpc": "1.0",
+            "result": {}
+        });
+        assert!(validate_mcp_response(&invalid_resp, "2026-07-28").is_err());
     }
 }

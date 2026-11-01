@@ -15,12 +15,14 @@ use omni_mcp::extension::{AifxCLI, OmniMCPServer};
 use omni_mcp::json;
 use omni_mcp::json::JsonValue;
 use omni_mcp::models::{
-    ActorType, CharterPolicy, ProtocolType, RPCBatchOrSingle, RPCRequest, ServerRecord, ToolRecord,
-    ToolStatus, CIRCUIT_OPEN, TOOL_DISABLED, UNAUTHORIZED,
+    to_legacy_error_code, validate_mcp_response, ActorType, CharterPolicy, ProtocolType,
+    RPCBatchOrSingle, RPCRequest, ServerRecord, ToolRecord, ToolStatus, APPROVAL_INVALID,
+    APPROVAL_REQUIRED, CIRCUIT_OPEN, HEADER_MISMATCH, LATEST_SESSION_MCP_PROTOCOL_VERSION,
+    SCHEMA_PREFLIGHT_FAILED, TOOL_DISABLED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use omni_mcp::server::ProductionGatewayContext;
 use omni_mcp::storage::{MerkleAuditStore, WalRegistryStore, GENESIS_HASH};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::sync::{Arc, RwLock};
@@ -865,7 +867,7 @@ fn test_v3_opentelemetry_w3c_tracing_and_canary_routing() {
     cache.refresh_now();
 
     let audit_store = Arc::new(MerkleAuditStore::new(None));
-    let traces = Arc::new(RwLock::new(Vec::new()));
+    let traces = Arc::new(RwLock::new(VecDeque::new()));
     let gateway =
         MCPProxyGateway::new(cache, None).with_observability(audit_store.clone(), traces.clone());
 
@@ -1087,13 +1089,21 @@ fn test_v3_autonomous_planning_diagnostics_and_mcp_resources() {
         "authorization".to_string(),
         "Bearer test_operator_token".to_string(),
     );
-    let (sse_status, sse_ctype, _sse_headers, sse_body) =
+    let (sse_status, sse_ctype, _sse_headers, _sse_body) =
         ctx.handle_http("GET", "/sse", &headers, &[]);
-    assert_eq!(sse_status, 200);
-    assert!(sse_ctype.contains("text/event-stream"));
-    assert!(String::from_utf8(sse_body)
-        .unwrap()
-        .contains("event: endpoint"));
+    #[cfg(feature = "legacy-sse")]
+    {
+        assert_eq!(sse_status, 200);
+        assert!(sse_ctype.contains("text/event-stream"));
+        assert!(String::from_utf8(sse_body)
+            .unwrap()
+            .contains("event: endpoint"));
+    }
+    #[cfg(not(feature = "legacy-sse"))]
+    {
+        assert_eq!(sse_status, 410);
+        assert!(sse_ctype.contains("application/json"));
+    }
 
     let (traces_status, _, _, traces_body) = ctx.handle_http("GET", "/api/traces", &headers, &[]);
     assert_eq!(traces_status, 200);
@@ -1694,8 +1704,8 @@ fn test_v4_5_deterministic_simulation_testing_dst() {
 #[test]
 fn test_v4_6_protocol_version_negotiation_and_error_contract() {
     use omni_mcp::models::{
-        FeatureStatus, RPCError, APPROVAL_REQUIRED, FUEL_EXHAUSTED, LATEST_MCP_PROTOCOL_VERSION,
-        LEGACY_MCP_PROTOCOL_VERSION, OUTBOUND_BLOCKED, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED,
+        FeatureStatus, RPCError, APPROVAL_REQUIRED, FUEL_EXHAUSTED, LEGACY_MCP_PROTOCOL_VERSION,
+        OUTBOUND_BLOCKED, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED,
     };
 
     let dir = temp_test_path("omni_v46_negotiation_and_contract_test");
@@ -1731,10 +1741,10 @@ fn test_v4_6_protocol_version_negotiation_and_error_contract() {
             .handle_request("driverdispatchservice", &init_unknown, "agent", None);
     assert_eq!(
         resp_unknown.result.as_ref().unwrap()["protocolVersion"].as_str(),
-        Some(LATEST_MCP_PROTOCOL_VERSION)
+        Some(LATEST_SESSION_MCP_PROTOCOL_VERSION)
     );
 
-    // Assert that 2026-07-28 is not offered during negotiation when implemented: false, falling back to 2025-11-25
+    // Assert that 2026-07-28 is negotiated when implemented
     let init_2026 = RPCRequest::new(
         31i64,
         "initialize",
@@ -1745,7 +1755,7 @@ fn test_v4_6_protocol_version_negotiation_and_error_contract() {
         .handle_request("driverdispatchservice", &init_2026, "agent", None);
     assert_eq!(
         resp_2026.result.as_ref().unwrap()["protocolVersion"].as_str(),
-        Some(LATEST_MCP_PROTOCOL_VERSION)
+        Some("2026-07-28")
     );
 
     // Verify 2025-03-26 additive tool annotations on `tools/list`
@@ -1768,12 +1778,18 @@ fn test_v4_6_protocol_version_negotiation_and_error_contract() {
     );
 
     // 2. M3: Verify authoritative -320xx error code table & RPCError::from_status
-    assert_eq!(CIRCUIT_OPEN, -32030);
-    assert_eq!(APPROVAL_REQUIRED, -32031);
-    assert_eq!(FUEL_EXHAUSTED, -32032);
-    assert_eq!(OUTBOUND_BLOCKED, -32033);
-    assert_eq!(SAGA_COMPENSATED, -32034);
-    assert_eq!(SCHEMA_PREFLIGHT_FAILED, -32035);
+    assert_eq!(CIRCUIT_OPEN, -32005);
+    assert_eq!(APPROVAL_REQUIRED, -32006);
+    assert_eq!(FUEL_EXHAUSTED, -32007);
+    assert_eq!(OUTBOUND_BLOCKED, -32008);
+    assert_eq!(SAGA_COMPENSATED, -32009);
+    assert_eq!(SCHEMA_PREFLIGHT_FAILED, -32010);
+    assert_eq!(to_legacy_error_code(CIRCUIT_OPEN), -32030);
+    assert_eq!(to_legacy_error_code(APPROVAL_REQUIRED), -32031);
+    assert_eq!(to_legacy_error_code(FUEL_EXHAUSTED), -32032);
+    assert_eq!(to_legacy_error_code(OUTBOUND_BLOCKED), -32033);
+    assert_eq!(to_legacy_error_code(SAGA_COMPENSATED), -32034);
+    assert_eq!(to_legacy_error_code(SCHEMA_PREFLIGHT_FAILED), -32035);
 
     let rpc_err = RPCError::from_status(
         FeatureStatus::OutboundBlocked,
@@ -1781,7 +1797,8 @@ fn test_v4_6_protocol_version_negotiation_and_error_contract() {
     );
     assert_eq!(rpc_err.code, OUTBOUND_BLOCKED);
     let err_json = rpc_err.to_json();
-    assert_eq!(err_json["code"].as_i64(), Some(-32033));
+    assert_eq!(err_json["code"].as_i64(), Some(OUTBOUND_BLOCKED as i64));
+    assert_eq!(err_json["data"]["legacy_code"].as_i64(), Some(-32033));
     assert_eq!(
         err_json["data"]["status"].as_str(),
         Some("OUTBOUND_BLOCKED")
@@ -1864,8 +1881,8 @@ fn test_v4_7_mcp_protocol_parity_five_versions() {
     assert!(discover_resp.error.is_none());
     let disc_res = discover_resp.result.unwrap();
     let supp = disc_res["supportedVersions"].as_array().unwrap();
-    assert_eq!(supp.len(), 4);
-    assert_eq!(supp[3].as_str(), Some("2025-11-25"));
+    assert_eq!(supp.len(), 5);
+    assert_eq!(supp[4].as_str(), Some("2026-07-28"));
     assert!(disc_res["capabilities"]["extensions"].is_object());
 
     // 3. Subscriptions/listen RPC
@@ -1874,7 +1891,7 @@ fn test_v4_7_mcp_protocol_parity_five_versions() {
     assert!(sub_resp.error.is_none());
     assert_eq!(sub_resp.result.unwrap()["status"].as_str(), Some("ok"));
 
-    // 4. Mismatch on request _meta returns UnsupportedProtocolVersionError (-32602)
+    // 4. Mismatch on request _meta returns UnsupportedProtocolVersion (-32022)
     let bad_proto_req = RPCRequest::new(
         4i64,
         "tools/list",
@@ -1886,7 +1903,10 @@ fn test_v4_7_mcp_protocol_parity_five_versions() {
     );
     let bad_proto_resp = omni.handle_request(&bad_proto_req, "agent", None);
     assert!(bad_proto_resp.error.is_some());
-    assert_eq!(bad_proto_resp.error.unwrap().code, -32602);
+    assert_eq!(
+        bad_proto_resp.error.unwrap().code,
+        UNSUPPORTED_PROTOCOL_VERSION
+    );
 
     // 5. Batching gating: 2026-07-28 rejects array batching with -32600
     let batch_req = RPCBatchOrSingle::Batch(vec![RPCRequest::new(
@@ -1948,7 +1968,8 @@ fn test_v4_7_schema_preflight_validator_32035() {
         .handle_request("accounting", &bad_call_req, "agent", Some("tok"));
     assert!(resp.error.is_some());
     let err = resp.error.unwrap();
-    assert_eq!(err.code, -32035);
+    assert_eq!(err.code, SCHEMA_PREFLIGHT_FAILED);
+    assert_eq!(to_legacy_error_code(err.code), -32035);
     assert!(err.message.contains("Schema preflight validation failed"));
     let violations = err.data.unwrap()["violations"].as_array().unwrap().clone();
     assert!(
@@ -1975,7 +1996,10 @@ fn test_v4_7_schema_preflight_validator_32035() {
         .unwrap()
         .to_string();
     let parsed = JsonValue::parse(&explain_text).unwrap();
-    assert_eq!(parsed["error_code"].as_i64(), Some(-32035));
+    assert_eq!(
+        parsed["error_code"].as_i64(),
+        Some(SCHEMA_PREFLIGHT_FAILED as i64)
+    );
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2002,7 +2026,8 @@ fn test_v4_7_approval_hardening_hmac_and_single_use_32038() {
         .gateway
         .execute_codemode(script, None, true, "agent", Some("tok"), None);
     assert_eq!(out.status, "APPROVAL_REQUIRED");
-    assert_eq!(out.error_code, Some(-32031));
+    assert_eq!(out.error_code, Some(APPROVAL_REQUIRED));
+    assert_eq!(out.error_code.map(to_legacy_error_code), Some(-32031));
     let frame = out.suspended_frame.expect("Must have suspended frame");
     assert!(!frame.frame_hmac.is_empty(), "Frame HMAC must be computed");
     assert!(
@@ -2019,12 +2044,16 @@ fn test_v4_7_approval_hardening_hmac_and_single_use_32038() {
     assert_eq!(resume_out.status, "OK");
     assert_eq!(resume_out.error_code, None);
 
-    // 3. Replaying the consumed frame is rejected with -32038 APPROVAL_INVALID
+    // 3. Replaying the consumed frame is rejected with APPROVAL_INVALID
     let replay_out =
         ctx.gateway
             .resume_codemode(&exec_id, "sec_auditor_alice", None, Some("tok"), None, None);
     assert_eq!(replay_out.status, "APPROVAL_INVALID");
-    assert_eq!(replay_out.error_code, Some(-32038));
+    assert_eq!(replay_out.error_code, Some(APPROVAL_INVALID));
+    assert_eq!(
+        replay_out.error_code.map(to_legacy_error_code),
+        Some(-32038)
+    );
 
     // 4. explain_error diagnoses APPROVAL_INVALID
     let explain_req = RPCRequest::new(
@@ -2045,7 +2074,7 @@ fn test_v4_7_approval_hardening_hmac_and_single_use_32038() {
         .unwrap()
         .to_string();
     let parsed = JsonValue::parse(&explain_text).unwrap();
-    assert_eq!(parsed["error_code"].as_i64(), Some(-32038));
+    assert_eq!(parsed["error_code"].as_i64(), Some(APPROVAL_INVALID as i64));
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2101,11 +2130,22 @@ fn test_v4_7_http_surface_hardening() {
 
     // 4. SSE endpoint returns Deprecation header
     let (sse_status, _, sse_headers, _) = ctx.handle_http("GET", "/sse", &empty_headers, &[]);
-    assert_eq!(sse_status, 200);
-    let has_dep = sse_headers
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("deprecation") && v.contains("@deprecated"));
-    assert!(has_dep, "Expected Deprecation header on legacy /sse");
+    #[cfg(feature = "legacy-sse")]
+    {
+        assert_eq!(sse_status, 200);
+        let has_dep = sse_headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("deprecation") && v.contains("@deprecated"));
+        assert!(has_dep, "Expected Deprecation header on legacy /sse");
+    }
+    #[cfg(not(feature = "legacy-sse"))]
+    {
+        assert_eq!(sse_status, 410);
+        let has_dep = sse_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("deprecation"));
+        assert!(has_dep, "Expected Deprecation header on removed /sse");
+    }
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2411,12 +2451,12 @@ fn test_v5_0_atomic_cas_concurrent_double_resume_and_digest() {
         .gateway
         .execute_codemode(script, None, true, "agent", Some("tok"), None);
     assert_eq!(out.status, "APPROVAL_REQUIRED");
-    assert_eq!(out.error_code, Some(-32031));
+    assert_eq!(out.error_code, Some(APPROVAL_REQUIRED));
     let frame = out.suspended_frame.expect("Must have suspended frame");
     let exec_id = frame.execution_id.clone();
     let pending_hash = frame.pending_arguments_hash.clone();
 
-    // 2. Approver argument digest mismatch is rejected with -32038
+    // 2. Approver argument digest mismatch is rejected with APPROVAL_INVALID
     let bad_digest_out = ctx.gateway.resume_codemode(
         &exec_id,
         "sec_auditor_alice",
@@ -2426,7 +2466,7 @@ fn test_v5_0_atomic_cas_concurrent_double_resume_and_digest() {
         Some("deadbeef1234567890abcdefdeadbeef1234567890abcdefdeadbeef12345678"),
     );
     assert_eq!(bad_digest_out.status, "APPROVAL_INVALID");
-    assert_eq!(bad_digest_out.error_code, Some(-32038));
+    assert_eq!(bad_digest_out.error_code, Some(APPROVAL_INVALID));
     assert!(bad_digest_out.error.unwrap().contains("digest mismatch"));
 
     // 3. Concurrent double-resume test: spawn 2 threads racing to resume
@@ -2472,16 +2512,19 @@ fn test_v5_0_atomic_cas_concurrent_double_resume_and_digest() {
     } else {
         0
     });
-    let rejected_count =
-        (if res1.status == "APPROVAL_INVALID" && res1.error_code == Some(-32038) {
-            1
-        } else {
-            0
-        }) + (if res2.status == "APPROVAL_INVALID" && res2.error_code == Some(-32038) {
-            1
-        } else {
-            0
-        });
+    let rejected_count = (if res1.status == "APPROVAL_INVALID"
+        && (res1.error_code == Some(APPROVAL_INVALID) || res1.error_code == Some(-32038))
+    {
+        1
+    } else {
+        0
+    }) + (if res2.status == "APPROVAL_INVALID"
+        && (res2.error_code == Some(APPROVAL_INVALID) || res2.error_code == Some(-32038))
+    {
+        1
+    } else {
+        0
+    });
 
     assert_eq!(ok_count, 1, "Exactly one concurrent resume must succeed");
     assert_eq!(
@@ -2632,6 +2675,299 @@ fn test_v5_0_raw_socket_http_framing_and_worker_resilience() {
         }));
         assert!(panic_safe.is_ok());
     }
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_0_protocol_conformance_2026_07_28() {
+    let dir = temp_test_path("omni_v50_protocol_conformance");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // 1. tools/list conformance: resultType == "complete", ttlMs == 300000, cacheScope == "workspace"
+    let tools_req = RPCRequest::new(101i64, "tools/list", JsonValue::object());
+    let tools_resp = ctx.omni_mcp.handle_request(&tools_req, "agent", None);
+    assert!(tools_resp.error.is_none());
+    let tools_res = tools_resp.result.as_ref().unwrap();
+    assert_eq!(tools_res["resultType"].as_str(), Some("complete"));
+    assert_eq!(tools_res["ttlMs"].as_i64(), Some(300000));
+    assert_eq!(tools_res["cacheScope"].as_str(), Some("workspace"));
+    assert!(validate_mcp_response(&tools_resp.to_json(), "2026-07-28").is_ok());
+
+    // 2. resources/list and resources/templates/list conformance
+    let res_req = RPCRequest::new(102i64, "resources/list", JsonValue::object());
+    let res_resp = ctx.omni_mcp.handle_request(&res_req, "agent", None);
+    assert!(res_resp.error.is_none());
+    let res_val = res_resp.result.as_ref().unwrap();
+    assert_eq!(res_val["resultType"].as_str(), Some("complete"));
+    assert_eq!(res_val["ttlMs"].as_i64(), Some(300000));
+    assert_eq!(res_val["cacheScope"].as_str(), Some("workspace"));
+    assert!(validate_mcp_response(&res_resp.to_json(), "2026-07-28").is_ok());
+
+    let tpl_req = RPCRequest::new(103i64, "resources/templates/list", JsonValue::object());
+    let tpl_resp = ctx.omni_mcp.handle_request(&tpl_req, "agent", None);
+    assert!(tpl_resp.error.is_none());
+    let tpl_val = tpl_resp.result.as_ref().unwrap();
+    assert_eq!(tpl_val["resultType"].as_str(), Some("complete"));
+    assert!(tpl_val["resourceTemplates"].is_array());
+    assert!(validate_mcp_response(&tpl_resp.to_json(), "2026-07-28").is_ok());
+
+    // 3. prompts/list conformance
+    let prompts_req = RPCRequest::new(104i64, "prompts/list", JsonValue::object());
+    let prompts_resp = ctx.omni_mcp.handle_request(&prompts_req, "agent", None);
+    assert!(prompts_resp.error.is_none());
+    let prompts_val = prompts_resp.result.as_ref().unwrap();
+    assert_eq!(prompts_val["resultType"].as_str(), Some("complete"));
+    assert_eq!(prompts_val["ttlMs"].as_i64(), Some(300000));
+    assert!(validate_mcp_response(&prompts_resp.to_json(), "2026-07-28").is_ok());
+
+    // 4. Streamable HTTP header validation (B3): Mcp-Method / Mcp-Name matching and mismatch rejection
+    let valid_body = json!({
+        "jsonrpc": "2.0",
+        "id": 105,
+        "method": "tools/call",
+        "params": {
+            "name": "explain_error",
+            "arguments": {
+                "server_name": "accounting",
+                "tool_name": "refund",
+                "error_message": "test error"
+            }
+        }
+    })
+    .to_string_compact()
+    .into_bytes();
+
+    let mut good_headers = HashMap::new();
+    good_headers.insert("content-type".to_string(), "application/json".to_string());
+    good_headers.insert("mcp-method".to_string(), "tools/call".to_string());
+    good_headers.insert("mcp-name".to_string(), "explain_error".to_string());
+
+    let (good_status, _, resp_headers, _) =
+        ctx.handle_http("POST", "/omni/mcp", &good_headers, &valid_body);
+    assert_eq!(good_status, 200);
+    assert!(resp_headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("mcp-method") && v == "tools/call"));
+    assert!(resp_headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("mcp-name") && v == "explain_error"));
+
+    // Header mismatch Mcp-Method -> 400 + HEADER_MISMATCH (-32020)
+    let mut bad_method_headers = good_headers.clone();
+    bad_method_headers.insert("mcp-method".to_string(), "tools/list".to_string());
+    let (bad_m_status, _, _, bad_m_body) =
+        ctx.handle_http("POST", "/omni/mcp", &bad_method_headers, &valid_body);
+    assert_eq!(bad_m_status, 400);
+    let bad_m_json = JsonValue::parse(&String::from_utf8(bad_m_body).unwrap()).unwrap();
+    assert_eq!(
+        bad_m_json["error"]["code"].as_i64(),
+        Some(HEADER_MISMATCH as i64)
+    );
+
+    // Header mismatch Mcp-Name -> 400 + HEADER_MISMATCH (-32020)
+    let mut bad_name_headers = good_headers.clone();
+    bad_name_headers.insert("mcp-name".to_string(), "other_tool".to_string());
+    let (bad_n_status, _, _, bad_n_body) =
+        ctx.handle_http("POST", "/omni/mcp", &bad_name_headers, &valid_body);
+    assert_eq!(bad_n_status, 400);
+    let bad_n_json = JsonValue::parse(&String::from_utf8(bad_n_body).unwrap()).unwrap();
+    assert_eq!(
+        bad_n_json["error"]["code"].as_i64(),
+        Some(HEADER_MISMATCH as i64)
+    );
+
+    // 5. io.modelcontextprotocol/tasks extension (B7): tasks/get and tasks/update
+    let suspend_script = r#"
+    async () => {
+        const res = await codemode.accounting.refund({ ride_id: "ride_tasks_1", reason: "charge dispute" });
+        return { res };
+    }
+    "#;
+    let out = ctx
+        .gateway
+        .execute_codemode(suspend_script, None, true, "agent", Some("tok"), None);
+    assert_eq!(out.status, "APPROVAL_REQUIRED");
+    let task_id = out.suspended_frame.unwrap().execution_id;
+
+    let tasks_get_req = RPCRequest::new(106i64, "tasks/get", json!({"taskId": task_id.clone()}));
+    let tasks_get_resp = ctx.omni_mcp.handle_request(&tasks_get_req, "agent", None);
+    assert!(tasks_get_resp.error.is_none());
+    let task_val = tasks_get_resp.result.unwrap();
+    assert_eq!(task_val["taskId"].as_str(), Some(task_id.as_str()));
+    assert_eq!(task_val["status"].as_str(), Some("suspended"));
+    assert_eq!(task_val["requiresApproval"].as_bool(), Some(true));
+    assert_eq!(task_val["resultType"].as_str(), Some("complete"));
+
+    let tasks_update_req = RPCRequest::new(
+        107i64,
+        "tasks/update",
+        json!({
+            "taskId": task_id.clone(),
+            "action": "resume",
+            "approver": "sec_auditor_alice"
+        }),
+    );
+    let tasks_upd_resp = ctx
+        .omni_mcp
+        .handle_request(&tasks_update_req, "agent", None);
+    assert!(tasks_upd_resp.error.is_none());
+    let upd_val = tasks_upd_resp.result.unwrap();
+    assert_eq!(upd_val["status"].as_str(), Some("completed"));
+    assert_eq!(upd_val["resultType"].as_str(), Some("complete"));
+
+    // Verify tasks/get on the completed task returns status "completed" and requiresApproval false
+    let tasks_get_after_resp = ctx.omni_mcp.handle_request(&tasks_get_req, "agent", None);
+    assert!(tasks_get_after_resp.error.is_none());
+    let task_after_val = tasks_get_after_resp.result.unwrap();
+    assert_eq!(task_after_val["status"].as_str(), Some("completed"));
+    assert_eq!(task_after_val["requiresApproval"].as_bool(), Some(false));
+    assert_eq!(task_after_val["resultType"].as_str(), Some("complete"));
+
+    // Test task cancellation via tasks/update
+    let cancel_script = r#"
+    async () => {
+        const res = await codemode.accounting.refund({ ride_id: "ride_tasks_cancel", reason: "testing cancellation" });
+        return { res };
+    }
+    "#;
+    let out_cancel =
+        ctx.gateway
+            .execute_codemode(cancel_script, None, true, "agent", Some("tok"), None);
+    assert_eq!(out_cancel.status, "APPROVAL_REQUIRED");
+    let cancel_task_id = out_cancel.suspended_frame.unwrap().execution_id;
+
+    let cancel_upd_req = RPCRequest::new(
+        108i64,
+        "tasks/update",
+        json!({
+            "taskId": cancel_task_id.clone(),
+            "action": "cancel"
+        }),
+    );
+    let cancel_resp = ctx.omni_mcp.handle_request(&cancel_upd_req, "agent", None);
+    assert!(cancel_resp.error.is_none());
+    assert_eq!(
+        cancel_resp.result.unwrap()["status"].as_str(),
+        Some("cancelled")
+    );
+
+    // Now task is gone
+    let cancel_get_req = RPCRequest::new(109i64, "tasks/get", json!({"taskId": cancel_task_id}));
+    let cancel_get_resp = ctx.omni_mcp.handle_request(&cancel_get_req, "agent", None);
+    assert!(cancel_get_resp.error.is_some());
+
+    // Test invalid action rejection
+    let bad_act_req = RPCRequest::new(
+        110i64,
+        "tasks/update",
+        json!({
+            "taskId": task_id.clone(),
+            "action": "unknown_action_xyz"
+        }),
+    );
+    let bad_act_resp = ctx.omni_mcp.handle_request(&bad_act_req, "agent", None);
+    assert!(bad_act_resp.error.is_some());
+
+    // Schema validation of initialize and server/discover responses under 2026-07-28
+    let init_req = RPCRequest::new(
+        111i64,
+        "initialize",
+        json!({"protocolVersion": "2026-07-28"}),
+    );
+    let init_resp = ctx.omni_mcp.handle_request(&init_req, "agent", None);
+    assert!(init_resp.error.is_none());
+    assert!(validate_mcp_response(&init_resp.to_json(), "2026-07-28").is_ok());
+
+    let disc_req = RPCRequest::new(112i64, "server/discover", JsonValue::object());
+    let disc_resp = ctx.omni_mcp.handle_request(&disc_req, "agent", None);
+    assert!(disc_resp.error.is_none());
+    assert!(validate_mcp_response(&disc_resp.to_json(), "2026-07-28").is_ok());
+
+    // Mixed case headers support on Streamable HTTP
+    let mut mixed_case_headers = HashMap::new();
+    mixed_case_headers.insert("Content-Type".to_string(), "application/json".to_string());
+    mixed_case_headers.insert("Mcp-Method".to_string(), "tools/call".to_string());
+    mixed_case_headers.insert("Mcp-Name".to_string(), "explain_error".to_string());
+    let (m_status, _, m_resp_headers, _) =
+        ctx.handle_http("POST", "/omni/mcp", &mixed_case_headers, &valid_body);
+    assert_eq!(m_status, 200);
+    assert!(m_resp_headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("mcp-method") && v == "tools/call"));
+
+    // 6. RFC 9728 Protected Resource Metadata (B6) and WWW-Authenticate headers
+    let empty_h = HashMap::new();
+    let (meta_status, _, _, meta_body) = ctx.handle_http(
+        "GET",
+        "/.well-known/oauth-protected-resource",
+        &empty_h,
+        &[],
+    );
+    assert_eq!(meta_status, 200);
+    let meta_json = JsonValue::parse(&String::from_utf8(meta_body).unwrap()).unwrap();
+    assert!(meta_json.get("resource").is_some());
+    assert!(meta_json.get("authorization_servers").is_some());
+
+    // 401 returns WWW-Authenticate with resource_metadata
+    let (u401_status, _, u401_headers, _) = ctx.handle_http("GET", "/api/stats", &empty_h, &[]);
+    assert_eq!(u401_status, 401);
+    let www_auth_401 = u401_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+        .unwrap();
+    assert!(www_auth_401
+        .1
+        .contains("resource_metadata=\"/.well-known/oauth-protected-resource\""));
+
+    // 403 returns WWW-Authenticate with error="insufficient_scope"
+    let mut agent_h = HashMap::new();
+    agent_h.insert(
+        "authorization".to_string(),
+        "Bearer agent_token".to_string(),
+    );
+    let (f403_status, _, f403_headers, _) =
+        ctx.handle_http("POST", "/api/crawler/trigger", &agent_h, &[]);
+    assert_eq!(f403_status, 403);
+    let www_auth_403 = f403_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+        .unwrap();
+    assert!(www_auth_403.1.contains("error=\"insufficient_scope\""));
+
+    // 7. Route versioning (/api/v1/* -> /api/*) & OpenAPI spec (D8)
+    let mut op_headers = HashMap::new();
+    op_headers.insert(
+        "authorization".to_string(),
+        "Bearer operator_key".to_string(),
+    );
+    let (v1_status, _, _, v1_body) = ctx.handle_http("GET", "/api/v1/servers", &op_headers, &[]);
+    let (v0_status, _, _, v0_body) = ctx.handle_http("GET", "/api/servers", &op_headers, &[]);
+    assert_eq!(v1_status, 200);
+    assert_eq!(v0_status, 200);
+    assert_eq!(v1_body, v0_body);
+
+    let (oapi_status, _, _, oapi_body) = ctx.handle_http("GET", "/openapi.json", &empty_h, &[]);
+    assert_eq!(oapi_status, 200);
+    let oapi_json = JsonValue::parse(&String::from_utf8(oapi_body).unwrap()).unwrap();
+    assert_eq!(oapi_json["openapi"].as_str(), Some("3.0.3"));
+    assert_eq!(oapi_json["info"]["version"].as_str(), Some("5.0.0"));
+
+    // 8. Real CLI subcommand execution (C1)
+    assert!(!AifxCLI::new(None, None).list_servers("table").is_empty());
+    assert_eq!(
+        omni_mcp::extension::run_aifx_cli(&["omni".to_string(), "--version".to_string()]),
+        0
+    );
+    assert_eq!(
+        omni_mcp::extension::run_aifx_cli(&["aifx".to_string(), "migrate".to_string()]),
+        0
+    );
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);

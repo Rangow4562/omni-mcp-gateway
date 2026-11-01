@@ -4169,7 +4169,7 @@ impl<'a> VmState<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ProtocolType, ToolRecord};
+    use crate::models::{to_legacy_error_code, ProtocolType, ToolRecord};
 
     fn run_noop_script(code: &str, limits: SandboxLimits) -> CodeOutput {
         let mut invoke_cb =
@@ -4254,7 +4254,7 @@ mod tests {
         assert_eq!(out.status, "ERROR");
         assert_eq!(out.feature_status, FeatureStatus::FuelExhausted);
         assert_eq!(out.error_code, Some(FUEL_EXHAUSTED));
-        assert_eq!(out.error_code, Some(-32032));
+        assert_eq!(out.error_code.map(to_legacy_error_code), Some(-32032));
         assert!(out.error.as_deref().unwrap_or("").contains("FuelExhausted"));
     }
 
@@ -4267,7 +4267,7 @@ mod tests {
         assert_eq!(out_fetch.status, "ERROR");
         assert_eq!(out_fetch.feature_status, FeatureStatus::OutboundBlocked);
         assert_eq!(out_fetch.error_code, Some(OUTBOUND_BLOCKED));
-        assert_eq!(out_fetch.error_code, Some(-32033));
+        assert_eq!(out_fetch.error_code.map(to_legacy_error_code), Some(-32033));
 
         let out_fs = run_noop_script(
             r#"async () => { return fs.readFileSync("/etc/passwd"); }"#,
@@ -4353,7 +4353,7 @@ mod tests {
         assert_eq!(suspended.status, "APPROVAL_REQUIRED");
         assert_eq!(suspended.feature_status, FeatureStatus::ApprovalRequired);
         assert_eq!(suspended.error_code, Some(APPROVAL_REQUIRED));
-        assert_eq!(suspended.error_code, Some(-32031));
+        assert_eq!(suspended.error_code.map(to_legacy_error_code), Some(-32031));
 
         let orig_frame = suspended
             .suspended_frame

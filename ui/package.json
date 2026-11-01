@@ -1,7 +1,7 @@
 {
   "name": "omni-mcp-ui",
   "private": true,
-  "version": "4.7.1",
+  "version": "5.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

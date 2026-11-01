@@ -1,7 +1,7 @@
 {
   "name": "@rangow2260/omni-mcp",
-  "version": "4.7.1",
-  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v4.7: MCP protocol parity across 5 revisions (2024-11-05 to 2026-07-28), server/discover, live HTTP/1.1 downstream transport, schema preflight validation (-32035), HMAC-SHA256 authenticated continuations & single-use approvals (-32038), persistent Saga ledger, and sandbox resource limits.",
+  "version": "5.0.0",
+  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v5.0: Trust Boundary Reset, MCP 2026-07-28 protocol conformance, universal RBAC, spec-reserved error codes (-32020..-32022), O(1) trace ring-buffer, and sub-millisecond in-process Code Mode sandbox.",
   "main": "bin/omni-mcp.js",
   "bin": {
     "omni-mcp": "bin/omni-mcp.js",

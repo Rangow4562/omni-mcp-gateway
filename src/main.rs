@@ -13,9 +13,12 @@ fn main() {
 
     // Support stdio MCP server mode for harness agents and MCP plugins
     if let Some(first) = args.first() {
-        if first == "--version" || first == "-V" || first == "version" {
+        if first == "--version" || first == "-V" || first == "-v" || first == "version" {
             println!("omni-mcp v{}", env!("CARGO_PKG_VERSION"));
             process::exit(0);
+        }
+        if first == "--help" || first == "-h" || first == "help" {
+            process::exit(run_aifx_cli(&args));
         }
         if first == "--stdio" || first == "stdio" || first == "serve-stdio" {
             let mut server_name = None;
@@ -30,8 +33,13 @@ fn main() {
             }
             process::exit(omni_mcp::server::run_stdio_server(server_name));
         }
-        if first == "mcp" || first == "aifx" || first == "--help" || first == "-h" {
-            process::exit(run_aifx_cli(&args));
+        match first.as_str() {
+            "mcp" | "aifx" | "omni" | "list" | "search" | "call" | "bench" | "codemode"
+            | "exec" | "types" | "resume" | "simulate" | "dst" | "bench-codemode"
+            | "bench-sandbox" | "migrate" => {
+                process::exit(run_aifx_cli(&args));
+            }
+            _ => {}
         }
     }
 

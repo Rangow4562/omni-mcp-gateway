@@ -1,6 +1,6 @@
 [package]
 name = "omni-mcp"
-version = "4.7.1"
+version = "5.0.0"
 rust-version = "1.75.0"
 edition = "2021"
 authors = ["Omni MCP Engineering"]
@@ -15,6 +15,7 @@ categories = ["web-programming", "network-programming", "command-line-utilities"
 [features]
 default = []
 transport-http = []
+legacy-sse = []
 
 [lib]
 name = "omni_mcp"
