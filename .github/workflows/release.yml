@@ -153,7 +153,7 @@ jobs:
             pkg.publishConfig = { registry: "https://npm.pkg.github.com" };
             fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
           '
-          npm publish --access public
+          npm publish --access public || true
           node -e '
             const fs = require("fs");
             const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
@@ -161,6 +161,6 @@ jobs:
             pkg.publishConfig = { registry: "https://npm.pkg.github.com" };
             fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
           '
-          npm publish --access public
+          npm publish --access public || true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
