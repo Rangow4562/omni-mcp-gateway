@@ -1,10 +1,12 @@
 //! MCP Registry - Single source of truth for discovery, ownership, versioning, diff approval, and enablement.
 //! Supports both high-throughput concurrent in-memory state and durable WAL storage.
 
+use crate::data_plane::codemode::CodeModeTypeGenerator;
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
-    ConfigDiff, HistoryEntry, ServerRecord, SuspendedExecutionFrame, ToolRecord, ToolStatus,
+    ChangeOrigin, ConfigDiff, HistoryEntry, ProtocolType, SchemaSource, ServerRecord,
+    SuspendedExecutionFrame, ToolRecord, ToolStatus,
 };
 use crate::storage::WalRegistryStore;
 use std::collections::{BTreeMap, HashMap};
@@ -12,6 +14,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 static DIFF_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentifierCollision {
+    pub sanitized: String,
+    pub first_raw: String,
+    pub second_raw: String,
+}
+
+impl IdentifierCollision {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "error": "IDENTIFIER_COLLISION",
+            "sanitized": self.sanitized.clone(),
+            "first_raw": self.first_raw.clone(),
+            "second_raw": self.second_raw.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalSyncResult {
+    pub added: usize,
+    pub updated: usize,
+    pub retired: usize,
+    pub unchanged: usize,
+    pub pending_human_conflicts: usize,
+}
+
+impl ExternalSyncResult {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "added": self.added as i64,
+            "updated": self.updated as i64,
+            "retired": self.retired as i64,
+            "unchanged": self.unchanged as i64,
+            "pending_human_conflicts": self.pending_human_conflicts as i64,
+        })
+    }
+}
 
 struct RegistryInner {
     servers: BTreeMap<String, ServerRecord>,
@@ -64,20 +105,102 @@ impl MCPRegistry {
         }
     }
 
+    pub fn preserve_tool_governance_fields(new_tool: &mut ToolRecord, existing: &ToolRecord) {
+        if existing.status == ToolStatus::Enabled {
+            new_tool.status = ToolStatus::Enabled;
+        } else if existing.status == ToolStatus::Disabled {
+            new_tool.status = ToolStatus::Disabled;
+        }
+        if new_tool.charter_policy.is_none() && existing.charter_policy.is_some() {
+            new_tool.charter_policy = existing.charter_policy.clone();
+        }
+        if !new_tool.is_mutation && existing.is_mutation {
+            new_tool.is_mutation = true;
+        }
+        if new_tool.compensation_spec.is_none() && existing.compensation_spec.is_some() {
+            new_tool.compensation_spec = existing.compensation_spec.clone();
+        }
+        if new_tool.canary_version.is_none() && existing.canary_version.is_some() {
+            new_tool.canary_version = existing.canary_version;
+            new_tool.canary_weight_pct = existing.canary_weight_pct;
+        }
+        if new_tool.fallback_tool.is_none() && existing.fallback_tool.is_some() {
+            new_tool.fallback_tool = existing.fallback_tool.clone();
+        }
+    }
+
+    pub fn check_identifier_collisions(
+        &self,
+        candidate_server_name: &str,
+        candidate_tools: &[ToolRecord],
+    ) -> Result<(), IdentifierCollision> {
+        let guard = self.inner.read().unwrap();
+        let cand_slug = candidate_server_name
+            .strip_prefix("external-mcp:")
+            .unwrap_or(candidate_server_name);
+        let cand_srv_san = CodeModeTypeGenerator::sanitize_ident(cand_slug);
+
+        // Level 1: Server-level collision across all servers in registry
+        for existing in guard.servers.values() {
+            if existing.name != candidate_server_name {
+                let exist_slug = existing
+                    .name
+                    .strip_prefix("external-mcp:")
+                    .unwrap_or(&existing.name);
+                let existing_san = CodeModeTypeGenerator::sanitize_ident(exist_slug);
+                if existing_san == cand_srv_san {
+                    return Err(IdentifierCollision {
+                        sanitized: cand_srv_san,
+                        first_raw: existing.name.clone(),
+                        second_raw: candidate_server_name.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Level 2: Tool-level collision within server
+        let mut seen_tools: BTreeMap<String, String> = BTreeMap::new();
+        for tool in candidate_tools {
+            let tool_san = CodeModeTypeGenerator::sanitize_ident(&tool.name);
+            if let Some(first_raw) = seen_tools.get(&tool_san) {
+                return Err(IdentifierCollision {
+                    sanitized: tool_san,
+                    first_raw: first_raw.clone(),
+                    second_raw: tool.name.clone(),
+                });
+            }
+            seen_tools.insert(tool_san, tool.name.clone());
+
+            // Level 3: Property-level collision within tool input_schema
+            if let Some(props) = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+            {
+                let mut seen_props: BTreeMap<String, String> = BTreeMap::new();
+                for (prop_name, _) in props {
+                    let prop_san = CodeModeTypeGenerator::sanitize_ident(prop_name);
+                    if let Some(first_prop) = seen_props.get(&prop_san) {
+                        return Err(IdentifierCollision {
+                            sanitized: prop_san,
+                            first_raw: first_prop.clone(),
+                            second_raw: prop_name.clone(),
+                        });
+                    }
+                    seen_props.insert(prop_san, prop_name.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn register_server(&self, server: ServerRecord) -> ServerRecord {
         let mut guard = self.inner.write().unwrap();
         let target = if let Some(existing) = guard.servers.get_mut(&server.name) {
             for (t_name, mut tool) in server.tools {
                 if let Some(prev) = existing.tools.get(&t_name) {
-                    if prev.status == ToolStatus::Enabled && tool.status == ToolStatus::Disabled {
-                        tool.status = ToolStatus::Enabled;
-                    }
-                    if tool.compensation_spec.is_none() && prev.compensation_spec.is_some() {
-                        tool.compensation_spec = prev.compensation_spec.clone();
-                    }
-                    if !tool.is_mutation && prev.is_mutation {
-                        tool.is_mutation = true;
-                    }
+                    Self::preserve_tool_governance_fields(&mut tool, prev);
                 }
                 existing.tools.insert(t_name, tool);
             }
@@ -227,6 +350,7 @@ impl MCPRegistry {
             approved: false,
             approved_by: None,
             approved_at: None,
+            origin: ChangeOrigin::Human,
         };
 
         guard.diffs.insert(diff_id, diff.clone());
@@ -237,22 +361,29 @@ impl MCPRegistry {
         Ok(diff)
     }
 
-    pub fn approve_diff(&self, diff_id: &str, approved_by: &str) -> bool {
+    pub fn approve_diff(&self, diff_id: &str, approved_by: &str) -> Result<bool, String> {
         let mut guard = self.inner.write().unwrap();
         let diff = match guard.diffs.get(diff_id).cloned() {
             Some(d) if !d.approved => d,
-            _ => return false,
+            _ => return Ok(false),
         };
 
         let (updated_server, updated_diff) = {
             let server = match guard.servers.get_mut(&diff.server_name) {
                 Some(s) => s,
-                None => return false,
+                None => return Ok(false),
             };
             let tool = match server.tools.get_mut(&diff.tool_name) {
                 Some(t) => t,
-                None => return false,
+                None => return Ok(false),
             };
+
+            // CAS version check
+            if tool.version != diff.previous_version {
+                return Err(
+                    "CONFLICT: Tool version has advanced since diff was proposed".to_string(),
+                );
+            }
 
             if let Some(desc) = diff.after_state.get("description").and_then(|x| x.as_str()) {
                 tool.description = desc.to_string();
@@ -261,6 +392,7 @@ impl MCPRegistry {
                 tool.input_schema = schema.clone();
             }
             tool.version = diff.proposed_version;
+            tool.schema_source = SchemaSource::Human;
             let t_name = tool.name.clone();
             let t_ver = tool.version;
 
@@ -292,7 +424,290 @@ impl MCPRegistry {
             store.save_server(&updated_server);
             store.save_diff(&updated_diff);
         }
-        true
+        Ok(true)
+    }
+
+    pub fn apply_external_sync(
+        &self,
+        server_name: &str,
+        fetched_tools: Vec<ToolRecord>,
+    ) -> Result<ExternalSyncResult, String> {
+        let mut guard = self.inner.write().unwrap();
+        let server = guard
+            .servers
+            .get_mut(server_name)
+            .ok_or_else(|| format!("Server '{}' not found in registry", server_name))?;
+
+        let now = now_epoch_secs();
+        let mut added = 0;
+        let mut updated = 0;
+        let mut retired = 0;
+        let mut unchanged = 0;
+        let mut pending_human_conflicts = 0;
+
+        let mut incoming_map: BTreeMap<String, ToolRecord> = BTreeMap::new();
+        for t in fetched_tools {
+            incoming_map.insert(t.name.clone(), t);
+        }
+
+        let mut diffs_to_save: Vec<ConfigDiff> = Vec::new();
+
+        // 1. Process incoming tools (Added & Existing)
+        for (t_name, incoming_tool) in incoming_map.iter() {
+            if let Some(existing_tool) = server.tools.get_mut(t_name) {
+                // Existing tool
+                if existing_tool.status == ToolStatus::Unavailable {
+                    // Revival policy: if schema and description match, restore prior_status; else PendingReview
+                    let schema_match = existing_tool.input_schema == incoming_tool.input_schema
+                        && existing_tool.description == incoming_tool.description;
+                    let prior_status = existing_tool
+                        .metadata
+                        .get("prior_status")
+                        .and_then(|x| x.as_str())
+                        .map(ToolStatus::from_str)
+                        .unwrap_or(ToolStatus::Disabled);
+
+                    let before_state = existing_tool.to_json();
+                    if schema_match {
+                        existing_tool.status = prior_status;
+                    } else {
+                        existing_tool.status = ToolStatus::PendingReview;
+                        existing_tool.description = incoming_tool.description.clone();
+                        existing_tool.input_schema = incoming_tool.input_schema.clone();
+                    }
+                    existing_tool.retired_at = None;
+                    existing_tool.version += 1;
+                    existing_tool.last_seen_in_sync = Some(now);
+
+                    let after_state = existing_tool.to_json();
+                    let seq = DIFF_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let diff_id = format!(
+                        "diff-{:08x}",
+                        ((now * 1000.0) as u64 ^ (seq * 0x9e3779b9)) as u32
+                    );
+                    let diff = ConfigDiff {
+                        diff_id,
+                        server_name: server_name.to_string(),
+                        tool_name: t_name.clone(),
+                        previous_version: existing_tool.version - 1,
+                        proposed_version: existing_tool.version,
+                        before_state,
+                        after_state,
+                        changes_summary: vec![format!("Revived tool '{}'", t_name)],
+                        proposed_by: "external_sync".to_string(),
+                        created_at: now,
+                        approved: true,
+                        approved_by: Some("external_sync".to_string()),
+                        approved_at: Some(now),
+                        origin: ChangeOrigin::ExternalSync,
+                    };
+                    diffs_to_save.push(diff);
+                    updated += 1;
+                } else {
+                    // Existing active tool
+                    let desc_identical = existing_tool.description == incoming_tool.description;
+                    let schema_identical = existing_tool.input_schema == incoming_tool.input_schema;
+
+                    if desc_identical && schema_identical {
+                        existing_tool.last_seen_in_sync = Some(now);
+                        unchanged += 1;
+                    } else if existing_tool.schema_source == SchemaSource::Upstream {
+                        // Upstream source: auto-apply change and write auto-approved diff
+                        let before_state = existing_tool.to_json();
+                        existing_tool.description = incoming_tool.description.clone();
+                        existing_tool.input_schema = incoming_tool.input_schema.clone();
+                        existing_tool.version += 1;
+                        existing_tool.last_seen_in_sync = Some(now);
+                        let after_state = existing_tool.to_json();
+
+                        let seq = DIFF_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        let diff_id = format!(
+                            "diff-{:08x}",
+                            ((now * 1000.0) as u64 ^ (seq * 0x9e3779b9)) as u32
+                        );
+                        let diff = ConfigDiff {
+                            diff_id,
+                            server_name: server_name.to_string(),
+                            tool_name: t_name.clone(),
+                            previous_version: existing_tool.version - 1,
+                            proposed_version: existing_tool.version,
+                            before_state,
+                            after_state,
+                            changes_summary: vec![format!(
+                                "Upstream schema sync for tool '{}'",
+                                t_name
+                            )],
+                            proposed_by: "external_sync".to_string(),
+                            created_at: now,
+                            approved: true,
+                            approved_by: Some("external_sync".to_string()),
+                            approved_at: Some(now),
+                            origin: ChangeOrigin::ExternalSync,
+                        };
+                        diffs_to_save.push(diff);
+                        updated += 1;
+                    } else {
+                        // Human source: DO NOT overwrite! Create unapproved diff in review queue
+                        existing_tool.last_seen_in_sync = Some(now);
+                        let before_state = existing_tool.to_json();
+                        let mut prospective_after = incoming_tool.to_json();
+                        prospective_after.insert("version", (existing_tool.version + 1) as i64);
+
+                        let seq = DIFF_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        let diff_id = format!(
+                            "diff-{:08x}",
+                            ((now * 1000.0) as u64 ^ (seq * 0x9e3779b9)) as u32
+                        );
+                        let diff = ConfigDiff {
+                            diff_id,
+                            server_name: server_name.to_string(),
+                            tool_name: t_name.clone(),
+                            previous_version: existing_tool.version,
+                            proposed_version: existing_tool.version + 1,
+                            before_state,
+                            after_state: prospective_after,
+                            changes_summary: vec![format!(
+                                "Upstream conflict with human-edited tool '{}'",
+                                t_name
+                            )],
+                            proposed_by: "external_sync".to_string(),
+                            created_at: now,
+                            approved: false,
+                            approved_by: None,
+                            approved_at: None,
+                            origin: ChangeOrigin::ExternalSync,
+                        };
+                        diffs_to_save.push(diff);
+                        pending_human_conflicts += 1;
+                    }
+                }
+            } else {
+                // Net-new tool
+                let mut new_tool = incoming_tool.clone();
+                new_tool.status = ToolStatus::Disabled;
+                new_tool.version = 1;
+                new_tool.protocol = ProtocolType::ExternalMcp;
+                new_tool.schema_source = SchemaSource::Upstream;
+                new_tool.last_seen_in_sync = Some(now);
+
+                let after_state = new_tool.to_json();
+                let seq = DIFF_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let diff_id = format!(
+                    "diff-{:08x}",
+                    ((now * 1000.0) as u64 ^ (seq * 0x9e3779b9)) as u32
+                );
+                let diff = ConfigDiff {
+                    diff_id,
+                    server_name: server_name.to_string(),
+                    tool_name: t_name.clone(),
+                    previous_version: 0,
+                    proposed_version: 1,
+                    before_state: JsonValue::Null,
+                    after_state,
+                    changes_summary: vec![format!("Discovered new tool '{}'", t_name)],
+                    proposed_by: "external_sync".to_string(),
+                    created_at: now,
+                    approved: true,
+                    approved_by: Some("external_sync".to_string()),
+                    approved_at: Some(now),
+                    origin: ChangeOrigin::ExternalSync,
+                };
+                diffs_to_save.push(diff);
+                server.tools.insert(t_name.clone(), new_tool);
+                added += 1;
+            }
+        }
+
+        // 2. Process missing tools (Retirement)
+        for (t_name, existing_tool) in server.tools.iter_mut() {
+            if !incoming_map.contains_key(t_name) && existing_tool.status != ToolStatus::Unavailable
+            {
+                let prior_status = existing_tool.status;
+                let before_state = existing_tool.to_json();
+                existing_tool.status = ToolStatus::Unavailable;
+                existing_tool.retired_at = Some(now);
+                existing_tool
+                    .metadata
+                    .insert("prior_status", JsonValue::from(prior_status.as_str()));
+                existing_tool.version += 1;
+                let after_state = existing_tool.to_json();
+
+                let seq = DIFF_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let diff_id = format!(
+                    "diff-{:08x}",
+                    ((now * 1000.0) as u64 ^ (seq * 0x9e3779b9)) as u32
+                );
+                let diff = ConfigDiff {
+                    diff_id,
+                    server_name: server_name.to_string(),
+                    tool_name: t_name.clone(),
+                    previous_version: existing_tool.version - 1,
+                    proposed_version: existing_tool.version,
+                    before_state,
+                    after_state,
+                    changes_summary: vec![format!("Retired missing upstream tool '{}'", t_name)],
+                    proposed_by: "external_sync".to_string(),
+                    created_at: now,
+                    approved: true,
+                    approved_by: Some("external_sync".to_string()),
+                    approved_at: Some(now),
+                    origin: ChangeOrigin::ExternalSync,
+                };
+                diffs_to_save.push(diff);
+                retired += 1;
+            }
+        }
+
+        // 3. Finalize server history and clone
+        server.version += 1;
+        let sync_summary = format!(
+            "External sync: +{} ~{} -{} ={} !{}",
+            added, updated, retired, unchanged, pending_human_conflicts
+        );
+        server.history.push(HistoryEntry {
+            action: sync_summary.clone(),
+            version: server.version,
+            time: now,
+        });
+
+        let mut snap = Self::snapshot_server(server);
+        snap.insert("action", sync_summary);
+        let srv_clone = server.clone();
+
+        // 4. Persist diffs and history into registry state
+        for diff in &diffs_to_save {
+            guard.diffs.insert(diff.diff_id.clone(), diff.clone());
+        }
+        guard
+            .version_history
+            .entry(server_name.to_string())
+            .or_default()
+            .push(snap);
+
+        if let Some(store) = &self.store {
+            for diff in &diffs_to_save {
+                store.save_diff(diff);
+            }
+            store.save_server(&srv_clone);
+        }
+
+        Ok(ExternalSyncResult {
+            added,
+            updated,
+            retired,
+            unchanged,
+            pending_human_conflicts,
+        })
+    }
+
+    pub fn remove_server(&self, name: &str) -> Option<ServerRecord> {
+        let mut guard = self.inner.write().unwrap();
+        let removed = guard.servers.remove(name);
+        guard.version_history.remove(name);
+        if let Some(store) = &self.store {
+            store.delete_server(name);
+        }
+        removed
     }
 
     pub fn rollback_tool(&self, server_name: &str, tool_name: &str, target_version: u32) -> bool {

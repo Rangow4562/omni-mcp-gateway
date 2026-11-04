@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "Omni MCP Gateway v4.7 — Protocol Parity & Real Wire",
+    "title": "Omni MCP Gateway v5.0 — Trust Boundary Reset & MCP 2026-07-28",
     "locale": "en",
     "quality_profile": "showcase",
     "viewBox": [1260, 560],
@@ -22,12 +22,13 @@
       {
         "id": "trust",
         "label": "Trust and containment",
-        "focus": ["codemode", "audit", "controlplane"],
-        "note": "Inspect the sandbox boundary, the audit ledger, and the durable registry state."
+        "focus": ["auth", "codemode", "audit", "controlplane"],
+        "note": "Inspect the deny-by-default RBAC edge, sandbox containment, and the Merkle audit ledger."
       }
     ]
   },
   "components": [
+    { "id": "auth", "type": "security", "label": "Access control", "sublabel": "Deny-by-default RBAC", "pos": [248, 8], "size": [164, 64], "tag": "RFC 9728" },
     { "id": "agents", "type": "external", "label": "Agent harness", "sublabel": "Claude, Cursor, shell", "pos": [16, 120], "size": [144, 72] },
     { "id": "transport", "type": "backend", "label": "MCP transport", "sublabel": "stdio + Streamable HTTP", "pos": [248, 120], "size": [164, 72] },
     { "id": "codemode", "type": "backend", "label": "Omni Code Mode", "sublabel": "~100 us AST sandbox", "pos": [500, 110], "size": [176, 92] },
@@ -43,6 +44,7 @@
   ],
   "connections": [
     { "id": "agents-transport", "from": "agents", "to": "transport", "label": "JSON-RPC 2.0", "variant": "emphasis" },
+    { "id": "auth-transport", "from": "auth", "to": "transport", "label": "Bearer + RBAC", "variant": "security", "labelAt": [330, 86] },
     { "id": "transport-codemode", "from": "transport", "to": "codemode", "label": "tool script" },
     { "id": "codemode-dataplane", "from": "codemode", "to": "dataplane", "label": "governed call" },
     { "id": "dataplane-downstream", "from": "dataplane", "to": "downstream", "label": "wire translation" },
@@ -53,7 +55,7 @@
   ],
   "cards": [
     { "dot": "cyan", "title": "Code Mode first", "items": ["Agents ship one procedural script instead of hundreds of schemas", "Static SSA analysis lifts independent calls into parallel waves", "Columnar pushdown filters 50k+ records without per-row objects"] },
-    { "dot": "amber", "title": "Governed data plane", "items": ["Copy-on-write routing table scales to 800+ servers", "Per-service circuit breaker fast-fails with -32030", "TTL semantic cache plus DFA PII and secret redaction"] },
-    { "dot": "violet", "title": "Protocol parity", "items": ["Negotiates 2024-11-05 through 2026-07-28", "server/discover and subscriptions/listen for stateless MCP", "HMAC-SHA256 continuations bound to single-use approvals"] }
+    { "dot": "amber", "title": "Trust boundary reset", "items": ["Deny-by-default RBAC gates every /api/v1 route", "RFC 9728 Bearer metadata on 401 and 403 responses", "Requesters cannot self-approve; HMAC-SHA256 continuations"] },
+    { "dot": "violet", "title": "MCP 2026-07-28 parity", "items": ["resultType envelopes with deterministically sorted catalogs", "tasks/get and tasks/update resumable execution frames", "SSE /sse returns 410 Gone; Streamable HTTP is the default"] }
   ]
 }

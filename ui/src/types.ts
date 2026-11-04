@@ -1,23 +1,37 @@
+export type ProtocolTypeStr =
+  | 'HTTP'
+  | 'gRPC'
+  | 'TChannel'
+  | 'Native_MCP'
+  | 'ThirdParty'
+  | 'External_MCP';
+
+export type ToolStatusStr = 'DISABLED' | 'ENABLED' | 'PENDING_REVIEW' | 'UNAVAILABLE';
+
 export interface ServerSummary {
   name: string;
   displayName: string;
   description: string;
   owningTeam: string;
-  protocol: 'HTTP' | 'gRPC' | 'TChannel' | 'Native_MCP' | 'ThirdParty';
-  status: 'DISABLED' | 'ENABLED' | 'PENDING_REVIEW';
+  protocol: ProtocolTypeStr;
+  status: ToolStatusStr;
   version: number;
   toolsCount: number;
   enabledToolsCount: number;
+  upstream_config?: UpstreamTransportConfig;
 }
 
 export interface ToolItem {
   name: string;
   description: string;
   inputSchema: Record<string, any>;
-  status: 'DISABLED' | 'ENABLED' | 'PENDING_REVIEW';
+  status: ToolStatusStr;
   version: number;
   protocol: string;
   downstreamEndpoint?: string;
+  schema_source?: 'upstream' | 'human';
+  retired_at?: number | null;
+  last_seen_in_sync?: number | null;
 }
 
 export interface ServerDetail extends ServerSummary {
@@ -36,6 +50,8 @@ export interface ConfigDiffItem {
   createdAt: number;
   beforeState: Record<string, any>;
   afterState: Record<string, any>;
+  origin?: 'human' | 'external_sync' | 'auto_crawler';
+  approved?: boolean;
 }
 
 export interface PlatformStats {
@@ -46,3 +62,42 @@ export interface PlatformStats {
   version: string;
 }
 
+export interface StdioTransportConfig {
+  transport: 'stdio';
+  command: string;
+  canonical_command?: string;
+  args: string[];
+  env_refs: Record<string, string>;
+  cwd?: string | null;
+}
+
+export interface HttpTransportConfig {
+  transport: 'streamable_http';
+  url: string;
+  bearer_ref?: string | null;
+  header_refs: Record<string, string>;
+  session_mode: 'stateless' | 'stateful';
+}
+
+export type UpstreamTransportConfig = StdioTransportConfig | HttpTransportConfig;
+
+export interface ExternalSyncResult {
+  added: number;
+  updated: number;
+  retired: number;
+  unchanged: number;
+  pending_human_conflicts: number;
+}
+
+export interface ServerInspection {
+  server_name: string;
+  health: 'Connected' | 'Idle' | 'Unreachable';
+  last_initialize: number | null;
+  session_mode: string | null;
+  total_tools: number;
+  enabled_tools: number;
+  disabled_tools: number;
+  unavailable_tools: number;
+  transport_summary: Record<string, any>;
+  stderr_tail: string[];
+}

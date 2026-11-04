@@ -1,7 +1,7 @@
 {
   "name": "@rangow2260/omni-mcp",
-  "version": "5.0.0",
-  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v5.0: Trust Boundary Reset, MCP 2026-07-28 protocol conformance, universal RBAC, spec-reserved error codes (-32020..-32022), O(1) trace ring-buffer, and sub-millisecond in-process Code Mode sandbox.",
+  "version": "5.5.0",
+  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v5.5: Unified External MCP Fleet, stdio & Streamable HTTP upstream supervision, refs-only secret resolver, Okapi BM25 discovery, Code Mode TypeScript .d.ts generation, and Merkle audit trail.",
   "main": "bin/omni-mcp.js",
   "bin": {
     "omni-mcp": "bin/omni-mcp.js",

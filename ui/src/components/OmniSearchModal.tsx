@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { apiFetch } from '../api';
 
 interface OmniSearchModalProps {
   isOpen: boolean;
@@ -21,9 +22,8 @@ export const OmniSearchModal: React.FC<OmniSearchModalProps> = ({
     if (!intentQuery.trim()) return;
     setSearching(true);
     try {
-      const res = await fetch('http://localhost:8080/omni/mcp', {
+      const data = await apiFetch<any>('/omni/mcp', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: Date.now(),
@@ -34,7 +34,6 @@ export const OmniSearchModal: React.FC<OmniSearchModalProps> = ({
           },
         }),
       });
-      const data = await res.json();
       if (data.result && data.result.content && data.result.content[0]) {
         const parsed = JSON.parse(data.result.content[0].text);
         setResults(parsed.servers || []);

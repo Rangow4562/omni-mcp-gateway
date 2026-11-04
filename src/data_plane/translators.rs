@@ -3,17 +3,22 @@
 //! dispatches live network I/O via `HttpDownstreamClient`.
 
 use crate::control_plane::third_party::ThirdPartyAuthExchange;
+use crate::data_plane::cache::InMemoryConfigCache;
 use crate::data_plane::downstream_http::HttpDownstreamClient;
 use crate::data_plane::muttley::MuttleyMeshClient;
 use crate::json::JsonValue;
 use crate::models::{ProtocolType, ToolRecord};
+use crate::upstream::UpstreamManager;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub struct ProtocolTranslator {
     pub mesh_client: MuttleyMeshClient,
     pub http_client: HttpDownstreamClient,
     pub auth_exchange: ThirdPartyAuthExchange,
+    pub upstream_manager: Option<Arc<UpstreamManager>>,
+    pub config_cache: Option<InMemoryConfigCache>,
 }
 
 impl ProtocolTranslator {
@@ -25,7 +30,19 @@ impl ProtocolTranslator {
             mesh_client: mesh_client.unwrap_or_default(),
             http_client: HttpDownstreamClient::new(),
             auth_exchange: auth_exchange.unwrap_or_default(),
+            upstream_manager: None,
+            config_cache: None,
         }
+    }
+
+    pub fn with_upstream(
+        mut self,
+        upstream_manager: Arc<UpstreamManager>,
+        cache: InMemoryConfigCache,
+    ) -> Self {
+        self.upstream_manager = Some(upstream_manager);
+        self.config_cache = Some(cache);
+        self
     }
 
     pub fn execute_tool_call(
@@ -38,6 +55,90 @@ impl ProtocolTranslator {
     ) -> Result<JsonValue, String> {
         let mut headers = extra_headers.unwrap_or_default();
         let protocol = tool.protocol;
+
+        if protocol == ProtocolType::ExternalMcp {
+            let um = self
+                .upstream_manager
+                .as_ref()
+                .ok_or_else(|| "Upstream manager not configured for ExternalMcp".to_string())?;
+
+            let server_record = if let Some(cache) = &self.config_cache {
+                cache
+                    .get_server_arc(server_name)
+                    .ok_or_else(|| format!("Server '{}' not found in config cache", server_name))?
+            } else {
+                return Err("Config cache not configured for ExternalMcp".to_string());
+            };
+
+            let raw_result = um.call_tool(&server_record, &tool.name, arguments)?;
+
+            // 1. If result.get("isError") == Some(true), returns Err(extracted_error_text)
+            if raw_result
+                .get("isError")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false)
+            {
+                let err_msg =
+                    if let Some(content) = raw_result.get("content").and_then(|c| c.as_array()) {
+                        let texts: Vec<String> = content
+                            .iter()
+                            .filter_map(|item| {
+                                item.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .collect();
+                        if !texts.is_empty() {
+                            texts.join("\n")
+                        } else {
+                            raw_result.to_string_compact()
+                        }
+                    } else {
+                        raw_result.to_string_compact()
+                    };
+                return Err(err_msg);
+            }
+
+            // 2. If result.get("structuredContent") is present and non-null, returns it directly as JsonValue
+            if let Some(structured) = raw_result.get("structuredContent") {
+                if !structured.is_null() {
+                    return Ok(structured.clone());
+                }
+            }
+
+            // 3. Otherwise inspects result.get("content") array:
+            // if a single "type": "text" block is valid JSON, parses and returns it;
+            // otherwise returns json!({ "text": combined_text, "content": content_arr })
+            if let Some(content_arr) = raw_result.get("content").and_then(|c| c.as_array()) {
+                if content_arr.len() == 1 {
+                    if let Some(first) = content_arr.first() {
+                        if first.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(text_str) = first.get("text").and_then(|t| t.as_str()) {
+                                if let Ok(parsed) = JsonValue::parse(text_str) {
+                                    return Ok(parsed);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut combined_text = String::new();
+                for item in content_arr {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        if !combined_text.is_empty() {
+                            combined_text.push('\n');
+                        }
+                        combined_text.push_str(text);
+                    }
+                }
+                return Ok(json!({
+                    "text": combined_text,
+                    "content": JsonValue::Array(content_arr.clone())
+                }));
+            }
+
+            return Ok(raw_result);
+        }
 
         let wire_payload: Vec<u8> = match protocol {
             ProtocolType::ThirdParty => {
@@ -81,6 +182,7 @@ impl ProtocolTranslator {
                 headers.insert("content-type".to_string(), "application/json".to_string());
                 arguments.to_string_compact().into_bytes()
             }
+            ProtocolType::ExternalMcp => unreachable!(),
         };
 
         let method_name = if tool.downstream_method.is_empty() {

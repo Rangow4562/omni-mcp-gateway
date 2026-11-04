@@ -48,9 +48,13 @@ pub struct MCPProxyGateway {
 
 impl MCPProxyGateway {
     pub fn new(cache: InMemoryConfigCache, translator: Option<ProtocolTranslator>) -> Self {
+        let mut trans = translator.unwrap_or_default();
+        if trans.config_cache.is_none() {
+            trans.config_cache = Some(cache.clone());
+        }
         Self {
             cache,
-            translator: translator.unwrap_or_default(),
+            translator: trans,
             circuit_breaker: CircuitBreakerRegistry::default(),
             semantic_cache: SemanticResponseCache::new(0.0),
             audit_store: None,
@@ -60,10 +64,13 @@ impl MCPProxyGateway {
 
     pub fn with_resilience(
         cache: InMemoryConfigCache,
-        translator: ProtocolTranslator,
+        mut translator: ProtocolTranslator,
         circuit_breaker: CircuitBreakerRegistry,
         semantic_cache: SemanticResponseCache,
     ) -> Self {
+        if translator.config_cache.is_none() {
+            translator.config_cache = Some(cache.clone());
+        }
         Self {
             cache,
             translator,
@@ -72,6 +79,14 @@ impl MCPProxyGateway {
             audit_store: None,
             traces: None,
         }
+    }
+
+    pub fn with_upstream(
+        mut self,
+        upstream_manager: Arc<crate::upstream::UpstreamManager>,
+    ) -> Self {
+        self.translator.upstream_manager = Some(upstream_manager);
+        self
     }
 
     pub fn with_observability(
@@ -535,15 +550,21 @@ impl MCPProxyGateway {
             meta.insert("fallback_tool", fallback_tool_name);
         }
 
+        let content_val = if let Some(arr) = final_result.get("content").and_then(|c| c.as_array())
+        {
+            JsonValue::Array(arr.clone())
+        } else if let Some(t) = final_result.get("text").and_then(|t| t.as_str()) {
+            json!([{"type": "text", "text": t}])
+        } else if let Some(s) = final_result.as_str() {
+            json!([{"type": "text", "text": s}])
+        } else {
+            json!([{"type": "text", "text": final_result.to_string_pretty()}])
+        };
+
         RPCResponse::ok(
             request.id.clone(),
             json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": final_result.to_string_pretty()
-                    }
-                ],
+                "content": content_val,
                 "structuredContent": final_result,
                 "isError": false,
                 "resultType": "complete",

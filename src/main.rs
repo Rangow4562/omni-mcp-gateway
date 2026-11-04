@@ -43,7 +43,11 @@ fn main() {
         }
     }
 
-    let cfg = get_config();
+    let mut cfg = get_config();
+    if args.iter().any(|a| a == "--demo") {
+        cfg.demo_seed = true;
+        omni_mcp::config::set_config(cfg.clone());
+    }
     let host = cfg.host.clone();
     let port = args
         .first()

@@ -2,7 +2,7 @@
   <img src="assets/omni-mcp-eink-banner.png" alt="Omni MCP Banner" width="100%" />
 </p>
 
-# Omni MCP (`omni-mcp` v5.0 — Autonomous Runtime & Enterprise MCP Gateway)
+# Omni MCP (`omni-mcp` v5.5 — Autonomous Runtime & Enterprise MCP Gateway)
 
 [![npm version](https://img.shields.io/npm/v/@rangow2260/omni-mcp.svg?style=flat-square&color=blue)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/@rangow2260/omni-mcp.svg?style=flat-square)](https://www.npmjs.com/package/@rangow2260/omni-mcp)
@@ -149,33 +149,33 @@ npx -y @rangow2260/omni-mcp aifx mcp simulate --code "const res = await codemode
 #### 🍎 macOS (Apple Silicon & Intel)
 ```bash
 # Apple Silicon (ARM64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-darwin-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.5.0/omni-gateway-darwin-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Intel (x64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-darwin-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.5.0/omni-gateway-darwin-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🐧 Linux (x86_64 & ARM64)
 ```bash
 # Linux x64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-linux-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.5.0/omni-gateway-linux-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Linux ARM64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-linux-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.5.0/omni-gateway-linux-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🪟 Windows (PowerShell — x64 & ARM64)
 ```powershell
 # Windows x64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.5.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 
 # Windows ARM64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.0.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v5.5.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 ```
 

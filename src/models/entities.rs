@@ -222,6 +222,7 @@ pub enum ProtocolType {
     TChannel,
     NativeMcp,
     ThirdParty,
+    ExternalMcp,
 }
 
 impl ProtocolType {
@@ -232,6 +233,7 @@ impl ProtocolType {
             ProtocolType::TChannel => "TChannel",
             ProtocolType::NativeMcp => "Native_MCP",
             ProtocolType::ThirdParty => "ThirdParty",
+            ProtocolType::ExternalMcp => "External_MCP",
         }
     }
 
@@ -242,6 +244,7 @@ impl ProtocolType {
             "TChannel" | "tchannel" | "TCHANNEL" => ProtocolType::TChannel,
             "Native_MCP" | "native_mcp" | "NATIVE_MCP" => ProtocolType::NativeMcp,
             "ThirdParty" | "third_party" | "THIRDPARTY" => ProtocolType::ThirdParty,
+            "External_MCP" | "external_mcp" | "EXTERNAL_MCP" => ProtocolType::ExternalMcp,
             _ => ProtocolType::Http,
         }
     }
@@ -252,6 +255,7 @@ pub enum ToolStatus {
     Disabled,
     PendingReview,
     Enabled,
+    Unavailable,
 }
 
 impl ToolStatus {
@@ -260,6 +264,7 @@ impl ToolStatus {
             ToolStatus::Disabled => "DISABLED",
             ToolStatus::PendingReview => "PENDING_REVIEW",
             ToolStatus::Enabled => "ENABLED",
+            ToolStatus::Unavailable => "UNAVAILABLE",
         }
     }
 
@@ -268,7 +273,210 @@ impl ToolStatus {
         match s.to_uppercase().as_str() {
             "ENABLED" => ToolStatus::Enabled,
             "PENDING_REVIEW" => ToolStatus::PendingReview,
+            "UNAVAILABLE" => ToolStatus::Unavailable,
             _ => ToolStatus::Disabled,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaSource {
+    Upstream,
+    Human,
+}
+
+impl SchemaSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SchemaSource::Upstream => "upstream",
+            SchemaSource::Human => "human",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "human" => SchemaSource::Human,
+            _ => SchemaSource::Upstream,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionMode {
+    Stateless,
+    Stateful,
+}
+
+impl SessionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionMode::Stateless => "stateless",
+            SessionMode::Stateful => "stateful",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "stateful" => SessionMode::Stateful,
+            _ => SessionMode::Stateless,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpstreamTransportConfig {
+    Stdio {
+        command: String,
+        canonical_command: String,
+        args: Vec<String>,
+        env_refs: BTreeMap<String, String>,
+        cwd: Option<String>,
+    },
+    StreamableHttp {
+        url: String,
+        bearer_ref: Option<String>,
+        header_refs: BTreeMap<String, String>,
+        session_mode: SessionMode,
+    },
+}
+
+impl UpstreamTransportConfig {
+    pub fn to_json(&self) -> JsonValue {
+        match self {
+            UpstreamTransportConfig::Stdio {
+                command,
+                canonical_command,
+                args,
+                env_refs,
+                cwd,
+            } => {
+                let mut env_obj = JsonValue::object();
+                for (k, v) in env_refs {
+                    env_obj.insert(k.clone(), JsonValue::from(v.as_str()));
+                }
+                let args_arr: Vec<JsonValue> =
+                    args.iter().map(|a| JsonValue::from(a.as_str())).collect();
+                json!({
+                    "transport": "stdio",
+                    "command": command.clone(),
+                    "canonical_command": canonical_command.clone(),
+                    "args": JsonValue::Array(args_arr),
+                    "env_refs": env_obj,
+                    "cwd": cwd.as_ref().map(|c| JsonValue::from(c.as_str())).unwrap_or(JsonValue::Null),
+                })
+            }
+            UpstreamTransportConfig::StreamableHttp {
+                url,
+                bearer_ref,
+                header_refs,
+                session_mode,
+            } => {
+                let mut hdr_obj = JsonValue::object();
+                for (k, v) in header_refs {
+                    hdr_obj.insert(k.clone(), JsonValue::from(v.as_str()));
+                }
+                json!({
+                    "transport": "streamable_http",
+                    "url": url.clone(),
+                    "bearer_ref": bearer_ref.as_ref().map(|b| JsonValue::from(b.as_str())).unwrap_or(JsonValue::Null),
+                    "header_refs": hdr_obj,
+                    "session_mode": session_mode.as_str(),
+                })
+            }
+        }
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let transport = v.get("transport")?.as_str()?;
+        match transport.to_ascii_lowercase().as_str() {
+            "stdio" => {
+                let command = v.get("command")?.as_str()?.to_string();
+                let canonical_command = v
+                    .get("canonical_command")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(&command)
+                    .to_string();
+                let args = v
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut env_refs = BTreeMap::new();
+                if let Some(obj) = v.get("env_refs").and_then(|o| o.as_object()) {
+                    for (k, val) in obj {
+                        if let Some(s) = val.as_str() {
+                            env_refs.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+                let cwd = v.get("cwd").and_then(|x| x.as_str()).map(String::from);
+                Some(UpstreamTransportConfig::Stdio {
+                    command,
+                    canonical_command,
+                    args,
+                    env_refs,
+                    cwd,
+                })
+            }
+            "streamable_http" | "streamablehttp" | "http" => {
+                let url = v.get("url")?.as_str()?.to_string();
+                let bearer_ref = v
+                    .get("bearer_ref")
+                    .and_then(|b| b.as_str())
+                    .map(String::from);
+                let mut header_refs = BTreeMap::new();
+                if let Some(obj) = v.get("header_refs").and_then(|o| o.as_object()) {
+                    for (k, val) in obj {
+                        if let Some(s) = val.as_str() {
+                            header_refs.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+                let session_mode = v
+                    .get("session_mode")
+                    .and_then(|x| x.as_str())
+                    .map(SessionMode::from_str)
+                    .unwrap_or(SessionMode::Stateless);
+                Some(UpstreamTransportConfig::StreamableHttp {
+                    url,
+                    bearer_ref,
+                    header_refs,
+                    session_mode,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeOrigin {
+    Human,
+    ExternalSync,
+    AutoCrawler,
+}
+
+impl ChangeOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChangeOrigin::Human => "human",
+            ChangeOrigin::ExternalSync => "external_sync",
+            ChangeOrigin::AutoCrawler => "auto_crawler",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "external_sync" | "externalsync" => ChangeOrigin::ExternalSync,
+            "auto_crawler" | "autocrawler" => ChangeOrigin::AutoCrawler,
+            _ => ChangeOrigin::Human,
         }
     }
 }
@@ -291,11 +499,20 @@ impl ActorType {
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "human" => Some(ActorType::Human),
-            "service" => Some(ActorType::Service),
-            "agent" => Some(ActorType::Agent),
-            _ => None,
+        let lower = s.to_lowercase();
+        if lower == "human"
+            || lower.contains("admin")
+            || lower.contains("user")
+            || lower.contains("approver")
+            || lower.contains("operator")
+        {
+            Some(ActorType::Human)
+        } else if lower == "agent" || lower.contains("agent") {
+            Some(ActorType::Agent)
+        } else if lower == "service" || lower.contains("service") {
+            Some(ActorType::Service)
+        } else {
+            None
         }
     }
 }
@@ -833,6 +1050,9 @@ pub struct ToolRecord {
     pub tags: Vec<String>,
     pub is_mutation: bool,
     pub compensation_spec: Option<MutationCompensationSpec>,
+    pub schema_source: SchemaSource,
+    pub retired_at: Option<f64>,
+    pub last_seen_in_sync: Option<f64>,
 }
 
 impl ToolRecord {
@@ -860,6 +1080,9 @@ impl ToolRecord {
             tags: Vec::new(),
             is_mutation: false,
             compensation_spec: None,
+            schema_source: SchemaSource::Upstream,
+            retired_at: None,
+            last_seen_in_sync: None,
         }
     }
 
@@ -927,6 +1150,9 @@ impl ToolRecord {
             "tags": JsonValue::Array(self.tags.iter().map(|t| JsonValue::from(t.as_str())).collect()),
             "is_mutation": self.is_mutation,
             "compensation_spec": comp_val,
+            "schema_source": self.schema_source.as_str(),
+            "retired_at": self.retired_at,
+            "last_seen_in_sync": self.last_seen_in_sync,
         })
     }
 
@@ -1010,6 +1236,13 @@ impl ToolRecord {
                 MutationCompensationSpec::from_json(cs)
             }
         });
+        let schema_source = v
+            .get("schema_source")
+            .and_then(|x| x.as_str())
+            .map(SchemaSource::from_str)
+            .unwrap_or(SchemaSource::Upstream);
+        let retired_at = v.get("retired_at").and_then(|x| x.as_f64());
+        let last_seen_in_sync = v.get("last_seen_in_sync").and_then(|x| x.as_f64());
 
         Some(Self {
             name,
@@ -1030,6 +1263,9 @@ impl ToolRecord {
             tags,
             is_mutation,
             compensation_spec,
+            schema_source,
+            retired_at,
+            last_seen_in_sync,
         })
     }
 }
@@ -1049,6 +1285,7 @@ pub struct ConfigDiff {
     pub approved: bool,
     pub approved_by: Option<String>,
     pub approved_at: Option<f64>,
+    pub origin: ChangeOrigin,
 }
 
 impl ConfigDiff {
@@ -1072,10 +1309,17 @@ impl ConfigDiff {
             "approved": self.approved,
             "approved_by": self.approved_by.clone(),
             "approved_at": self.approved_at,
+            "origin": self.origin.as_str(),
         })
     }
 
     pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let origin = v
+            .get("origin")
+            .and_then(|x| x.as_str())
+            .map(ChangeOrigin::from_str)
+            .unwrap_or(ChangeOrigin::Human);
+
         Some(Self {
             diff_id: v.get("diff_id")?.as_str()?.to_string(),
             server_name: v.get("server_name")?.as_str()?.to_string(),
@@ -1108,6 +1352,7 @@ impl ConfigDiff {
                 .and_then(|x| x.as_str())
                 .map(String::from),
             approved_at: v.get("approved_at").and_then(|x| x.as_f64()),
+            origin,
         })
     }
 }
@@ -1153,6 +1398,7 @@ pub struct ServerRecord {
     pub is_third_party: bool,
     pub third_party_provider: Option<String>,
     pub history: Vec<HistoryEntry>,
+    pub upstream_config: Option<UpstreamTransportConfig>,
 }
 
 impl ServerRecord {
@@ -1177,6 +1423,7 @@ impl ServerRecord {
             is_third_party: false,
             third_party_provider: None,
             history: Vec::new(),
+            upstream_config: None,
         }
     }
 
@@ -1220,6 +1467,11 @@ impl ServerRecord {
             "is_third_party": self.is_third_party,
             "third_party_provider": self.third_party_provider.clone(),
             "history": JsonValue::Array(history_arr),
+            "upstream_config": self
+                .upstream_config
+                .as_ref()
+                .map(|c| c.to_json())
+                .unwrap_or(JsonValue::Null),
         })
     }
 
@@ -1290,6 +1542,14 @@ impl ServerRecord {
             })
             .unwrap_or_default();
 
+        let upstream_config = v.get("upstream_config").and_then(|c| {
+            if c.is_null() {
+                None
+            } else {
+                UpstreamTransportConfig::from_json(c)
+            }
+        });
+
         Some(Self {
             name,
             display_name,
@@ -1305,6 +1565,7 @@ impl ServerRecord {
             is_third_party,
             third_party_provider,
             history,
+            upstream_config,
         })
     }
 }

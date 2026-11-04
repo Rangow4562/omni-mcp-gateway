@@ -665,6 +665,15 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             }
             crate::server::run_stdio_server(server_name)
         }
+        "mock-echo-mcp" => {
+            let mut flood_stderr = false;
+            for arg in &args[2..] {
+                if arg == "--flood-stderr" {
+                    flood_stderr = true;
+                }
+            }
+            run_mock_echo_mcp_server(flood_stderr)
+        }
         "migrate" => {
             println!(
                 "Omni MCP v4 -> v5 State Migration Utility (v{})",
@@ -707,4 +716,120 @@ fn print_help() {
             "NOTE: Commands can be prefixed with 'aifx', 'omni', or 'mcp' interchangeably."
         )
     );
+}
+
+pub fn run_mock_echo_mcp_server(flood_stderr: bool) -> i32 {
+    use std::io::{BufRead, BufReader, Write};
+    if flood_stderr {
+        let mut err = std::io::stderr();
+        let chunk = "E".repeat(1024);
+        for _ in 0..150 {
+            let _ = writeln!(err, "STDERR_FLOOD: {}", chunk);
+        }
+        let _ = err.flush();
+    }
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let reader = BufReader::new(stdin.lock());
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(json_val) = crate::json::JsonValue::parse(trimmed) {
+            let id = json_val
+                .get("id")
+                .cloned()
+                .unwrap_or(crate::json::JsonValue::Null);
+            let method = json_val
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+
+            match method {
+                "initialize" => {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "mock-echo-mcp", "version": "1.0.0" }
+                        }
+                    });
+                    let _ = writeln!(stdout, "{}", resp.to_string_compact());
+                    let _ = stdout.flush();
+                }
+                "notifications/initialized" => {}
+                "tools/list" => {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "echo_nonce",
+                                    "description": "Echoes back the cryptographic nonce",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "nonce": { "type": "string" }
+                                        },
+                                        "required": ["nonce"]
+                                    }
+                                }
+                            ]
+                        }
+                    });
+                    let _ = writeln!(stdout, "{}", resp.to_string_compact());
+                    let _ = stdout.flush();
+                }
+                "tools/call" => {
+                    let params = json_val
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(crate::json::JsonValue::Null);
+                    let args = params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(crate::json::JsonValue::Null);
+                    let nonce = args
+                        .get("nonce")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("no-nonce");
+
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": nonce
+                                }
+                            ]
+                        }
+                    });
+                    let _ = writeln!(stdout, "{}", resp.to_string_compact());
+                    let _ = stdout.flush();
+                }
+                _ => {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32601, "message": "Method not found" }
+                    });
+                    let _ = writeln!(stdout, "{}", resp.to_string_compact());
+                    let _ = stdout.flush();
+                }
+            }
+        }
+    }
+    0
 }

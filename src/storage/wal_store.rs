@@ -121,6 +121,12 @@ impl WalRegistryStore {
                                                 guard.servers.insert(srv.name.clone(), srv);
                                             }
                                         }
+                                    } else if op == "DELETE_SERVER" {
+                                        if let Some(name) =
+                                            entry.get("data").and_then(|d| d.as_str())
+                                        {
+                                            guard.servers.remove(name);
+                                        }
                                     } else if op == "SAVE_DIFF" {
                                         if let Some(d_val) = entry.get("data") {
                                             if let Some(diff) = ConfigDiff::from_json(d_val) {
@@ -249,6 +255,15 @@ impl WalRegistryStore {
         self.append_wal_and_maybe_compact("SAVE_SERVER", server.to_json(), &mut guard);
     }
 
+    pub fn delete_server(&self, name: &str) -> Option<ServerRecord> {
+        let mut guard = self.state.write().unwrap();
+        let removed = guard.servers.remove(name);
+        if removed.is_some() {
+            self.append_wal_and_maybe_compact("DELETE_SERVER", JsonValue::from(name), &mut guard);
+        }
+        removed
+    }
+
     pub fn get_server(&self, name: &str) -> Option<ServerRecord> {
         let guard = self.state.read().unwrap();
         guard.servers.get(name).cloned()
@@ -273,6 +288,20 @@ impl WalRegistryStore {
             .filter(|d| !only_pending || !d.approved)
             .cloned()
             .collect()
+    }
+
+    pub fn get_diff(&self, diff_id: &str) -> Option<ConfigDiff> {
+        let guard = self.state.read().unwrap();
+        guard.diffs.get(diff_id).cloned()
+    }
+
+    pub fn checkpoint_snapshot(&self) {
+        if !self.is_memory {
+            if let Ok(mut guard) = self.state.write() {
+                self.write_snapshot(&guard);
+                guard.wal_entries_since_compact = 0;
+            }
+        }
     }
 
     pub fn save_suspended_frame(&self, frame: &SuspendedExecutionFrame) {
@@ -430,6 +459,249 @@ mod tests {
         assert!(reopened
             .get_suspended_frame("01JC0000000000000000000001")
             .is_none());
+        reopened.close();
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_wal_external_mcp_round_trip_and_legacy_snapshot_compat() {
+        use crate::models::{
+            ChangeOrigin, ProtocolType, SchemaSource, SessionMode, ToolRecord, ToolStatus,
+            UpstreamTransportConfig,
+        };
+        use std::collections::BTreeMap;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "omni_wal_ext_compat_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let db_path = tmp_dir
+            .join("legacy_and_external.db")
+            .to_string_lossy()
+            .into_owned();
+
+        // 1. Write legacy snapshot JSON (missing all v5.5 fields) to test backward compatibility
+        let legacy_json = json!({
+            "servers": [
+                {
+                    "name": "legacy_service",
+                    "display_name": "Legacy Service",
+                    "description": "Pre-v5.5 server record",
+                    "owning_team": "core",
+                    "protocol": "HTTP",
+                    "status": "ENABLED",
+                    "version": 2,
+                    "tools": {
+                        "legacy_tool": {
+                            "name": "legacy_tool",
+                            "description": "A legacy tool",
+                            "input_schema": {"type": "object"},
+                            "output_schema": {"type": "object"},
+                            "status": "ENABLED",
+                            "version": 2,
+                            "protocol": "HTTP",
+                            "downstream_endpoint": "",
+                            "downstream_method": "",
+                            "metadata": {},
+                            "idempotent_cacheable": true,
+                            "canary_weight_pct": 0,
+                            "tags": [],
+                            "is_mutation": false
+                        }
+                    },
+                    "charter_policy": {
+                        "allowed_actors": ["agent", "human"],
+                        "allowed_tools": ["*"],
+                        "rate_limit_rpm": 600,
+                        "require_redaction": true,
+                        "custom_attributes": {}
+                    },
+                    "is_native": false,
+                    "is_third_party": false,
+                    "history": []
+                }
+            ],
+            "diffs": [
+                {
+                    "diff_id": "diff-legacy-01",
+                    "server_name": "legacy_service",
+                    "tool_name": "legacy_tool",
+                    "previous_version": 1,
+                    "proposed_version": 2,
+                    "before_state": {"description": "v1"},
+                    "after_state": {"description": "v2"},
+                    "changes_summary": ["updated"],
+                    "proposed_by": "alice",
+                    "created_at": 1700000000.0,
+                    "approved": true
+                }
+            ],
+            "suspended_frames": [],
+            "saga_compensations": []
+        });
+
+        fs::write(&db_path, legacy_json.to_string()).expect("Must write legacy snapshot");
+
+        // Verify recovery of legacy snapshot
+        {
+            let store = WalRegistryStore::new(&db_path);
+            let srv = store
+                .get_server("legacy_service")
+                .expect("Legacy server must be recovered");
+            assert_eq!(srv.protocol, ProtocolType::Http);
+            assert_eq!(srv.upstream_config, None);
+            let tool = srv.tools.get("legacy_tool").expect("Tool must exist");
+            assert_eq!(tool.status, ToolStatus::Enabled);
+            assert_eq!(tool.schema_source, SchemaSource::Upstream);
+            assert_eq!(tool.retired_at, None);
+            assert_eq!(tool.last_seen_in_sync, None);
+
+            let diff = store.get_diff("diff-legacy-01").expect("Diff must exist");
+            assert_eq!(diff.origin, ChangeOrigin::Human);
+
+            // 2. Now register and persist a new ExternalMcp server with refs-only secrets
+            let mut env_refs = BTreeMap::new();
+            env_refs.insert("API_KEY".to_string(), "{env:FLEET_API_KEY}".to_string());
+            env_refs.insert("SECRET_PATH".to_string(), "{file:./token.txt}".to_string());
+
+            let mut ext_server = ServerRecord::new(
+                "external-mcp:filesystem",
+                "Local Filesystem",
+                "Stdio external filesystem tools",
+                "infra",
+            );
+            ext_server.protocol = ProtocolType::ExternalMcp;
+            ext_server.upstream_config = Some(UpstreamTransportConfig::Stdio {
+                command: "npx".to_string(),
+                canonical_command: "C:\\Program Files\\nodejs\\npx.cmd".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                ],
+                env_refs,
+                cwd: Some("D:\\Data".to_string()),
+            });
+
+            let mut tool1 = ToolRecord::new(
+                "read_file",
+                "Read file contents",
+                json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            );
+            tool1.protocol = ProtocolType::ExternalMcp;
+            tool1.status = ToolStatus::Unavailable;
+            tool1.schema_source = SchemaSource::Human;
+            tool1.retired_at = Some(1720000000.0);
+            tool1.last_seen_in_sync = Some(1719999000.0);
+            ext_server.add_tool(tool1);
+
+            store.save_server(&ext_server);
+
+            let mut header_refs = BTreeMap::new();
+            header_refs.insert("X-Custom-Auth".to_string(), "{env:AUTH_HEADER}".to_string());
+            let mut http_server = ServerRecord::new(
+                "external-mcp:remote-api",
+                "Remote Streamable HTTP Server",
+                "Remote streamable HTTP tools",
+                "platform",
+            );
+            http_server.protocol = ProtocolType::ExternalMcp;
+            http_server.upstream_config = Some(UpstreamTransportConfig::StreamableHttp {
+                url: "http://127.0.0.1:9090/mcp".to_string(),
+                bearer_ref: Some("{env:BEARER_TOKEN}".to_string()),
+                header_refs,
+                session_mode: SessionMode::Stateful,
+            });
+            store.save_server(&http_server);
+
+            let sync_diff = ConfigDiff {
+                diff_id: "diff-sync-01".to_string(),
+                server_name: "external-mcp:filesystem".to_string(),
+                tool_name: "read_file".to_string(),
+                previous_version: 1,
+                proposed_version: 2,
+                before_state: json!({"status": "DISABLED"}),
+                after_state: json!({"status": "UNAVAILABLE"}),
+                changes_summary: vec!["Tool retired upstream".to_string()],
+                proposed_by: "external_sync".to_string(),
+                created_at: 1720000000.0,
+                approved: true,
+                approved_by: Some("external_sync".to_string()),
+                approved_at: Some(1720000000.0),
+                origin: ChangeOrigin::ExternalSync,
+            };
+            store.save_diff(&sync_diff);
+
+            // Force checkpoint
+            store.checkpoint_snapshot();
+            store.close();
+        }
+
+        // 3. Assert zero raw secret bytes on disk
+        let disk_content = fs::read_to_string(&db_path).expect("Must read compacted db");
+        assert!(disk_content.contains("{env:FLEET_API_KEY}"));
+        assert!(disk_content.contains("{file:./token.txt}"));
+        assert!(disk_content.contains("{env:BEARER_TOKEN}"));
+        // Assert no unexpected raw secret leaks
+        assert!(!disk_content.contains("super_secret_raw_token"));
+
+        // 4. Reopen and verify complete round-trip identity
+        let reopened = WalRegistryStore::new(&db_path);
+        let recovered_ext = reopened
+            .get_server("external-mcp:filesystem")
+            .expect("Must recover external stdio server");
+        assert_eq!(recovered_ext.protocol, ProtocolType::ExternalMcp);
+        match recovered_ext.upstream_config.as_ref().unwrap() {
+            UpstreamTransportConfig::Stdio {
+                command,
+                canonical_command,
+                args,
+                env_refs,
+                cwd,
+            } => {
+                assert_eq!(command, "npx");
+                assert_eq!(canonical_command, "C:\\Program Files\\nodejs\\npx.cmd");
+                assert_eq!(args, &["-y", "@modelcontextprotocol/server-filesystem"]);
+                assert_eq!(env_refs.get("API_KEY").unwrap(), "{env:FLEET_API_KEY}");
+                assert_eq!(cwd.as_deref(), Some("D:\\Data"));
+            }
+            _ => panic!("Expected Stdio transport config"),
+        }
+
+        let recovered_tool = recovered_ext.tools.get("read_file").unwrap();
+        assert_eq!(recovered_tool.status, ToolStatus::Unavailable);
+        assert_eq!(recovered_tool.schema_source, SchemaSource::Human);
+        assert_eq!(recovered_tool.retired_at, Some(1720000000.0));
+        assert_eq!(recovered_tool.last_seen_in_sync, Some(1719999000.0));
+
+        let recovered_http = reopened
+            .get_server("external-mcp:remote-api")
+            .expect("Must recover external http server");
+        match recovered_http.upstream_config.as_ref().unwrap() {
+            UpstreamTransportConfig::StreamableHttp {
+                url,
+                bearer_ref,
+                header_refs,
+                session_mode,
+            } => {
+                assert_eq!(url, "http://127.0.0.1:9090/mcp");
+                assert_eq!(bearer_ref.as_deref(), Some("{env:BEARER_TOKEN}"));
+                assert_eq!(
+                    header_refs.get("X-Custom-Auth").unwrap(),
+                    "{env:AUTH_HEADER}"
+                );
+                assert_eq!(*session_mode, SessionMode::Stateful);
+            }
+            _ => panic!("Expected StreamableHttp transport config"),
+        }
+
+        let recovered_diff = reopened.get_diff("diff-sync-01").unwrap();
+        assert_eq!(recovered_diff.origin, ChangeOrigin::ExternalSync);
+        assert!(recovered_diff.approved);
+
         reopened.close();
         let _ = fs::remove_dir_all(&tmp_dir);
     }

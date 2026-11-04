@@ -68,6 +68,7 @@ pub struct ProductionGatewayContext {
     pub metrics: Arc<GatewayMetrics>,
     pub audit_store: Arc<MerkleAuditStore>,
     pub traces: Arc<RwLock<VecDeque<TraceSpan>>>,
+    pub upstream_manager: Arc<crate::upstream::UpstreamManager>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -205,7 +206,11 @@ impl ProductionGatewayContext {
         let auth_exchange = ThirdPartyAuthExchange::new();
         let crawler = AutoCrawler::new(registry.clone(), Some(native_monitor.clone()), None);
         let cache = InMemoryConfigCache::new(registry.clone(), config.cache_refresh_interval_sec);
-        let translator = ProtocolTranslator::new(None, Some(auth_exchange.clone()));
+        let upstream_manager = Arc::new(crate::upstream::UpstreamManager::new(Arc::new(
+            config.clone(),
+        )));
+        let translator = ProtocolTranslator::new(None, Some(auth_exchange.clone()))
+            .with_upstream(upstream_manager.clone(), cache.clone());
         let cb = CircuitBreakerRegistry::new(
             config.circuit_breaker_threshold,
             config.circuit_breaker_reset_sec,
@@ -220,7 +225,8 @@ impl ProductionGatewayContext {
         let traces = Arc::new(RwLock::new(VecDeque::new()));
 
         let gateway = MCPProxyGateway::with_resilience(cache.clone(), translator, cb, sem_cache)
-            .with_observability(audit_store.clone(), traces.clone());
+            .with_observability(audit_store.clone(), traces.clone())
+            .with_upstream(upstream_manager.clone());
         let omni_mcp = OmniMCPServer::new(cache.clone(), gateway.clone());
 
         let ctx = Self {
@@ -238,12 +244,10 @@ impl ProductionGatewayContext {
             metrics: Arc::new(GatewayMetrics::new()),
             audit_store,
             traces,
+            upstream_manager,
         };
 
-        if ctx.registry.list_servers(None).is_empty()
-            || ctx.registry.get_server("rides_service").is_none()
-            || ctx.registry.get_server("uber_rides").is_none()
-        {
+        if ctx.config.demo_seed && ctx.registry.list_servers(None).is_empty() {
             ctx.seed_sample_catalog();
         }
         ctx
@@ -492,24 +496,47 @@ impl ProductionGatewayContext {
             && !method.eq_ignore_ascii_case("OPTIONS")
         {
             let required_role = match path {
-                "/api/stats"
-                | "/api/servers"
-                | "/api/codemode/types"
-                | "/api/codemode/speculative_types" => AuthRole::Agent,
-                _ if path.starts_with("/api/servers/") => AuthRole::Agent,
-                "/api/execute" | "/api/codemode/eval" | "/api/codemode/simulate" => AuthRole::Agent,
+                "/api/servers/external/register" | "/api/v1/servers/external/register" => {
+                    AuthRole::Admin
+                }
+                _ if (path.starts_with("/api/servers/external/")
+                    || path.starts_with("/api/v1/servers/external/"))
+                    && path.ends_with("/deregister") =>
+                {
+                    AuthRole::Admin
+                }
+                _ if (path.starts_with("/api/servers/external/")
+                    || path.starts_with("/api/v1/servers/external/"))
+                    && path.ends_with("/rediscover") =>
+                {
+                    AuthRole::Admin
+                }
+                _ if (path.starts_with("/api/servers/external/")
+                    || path.starts_with("/api/v1/servers/external/"))
+                    && path.ends_with("/inspect") =>
+                {
+                    AuthRole::Agent
+                }
+                "/api/servers/toggle_status"
+                | "/api/tools/toggle_status"
+                | "/api/tools/rollback"
+                | "/api/crawler/trigger" => AuthRole::Admin,
+                "/api/codemode/suspended" | "/api/codemode/resume" | "/api/diffs/approve" => {
+                    AuthRole::Approver
+                }
                 "/api/diffs"
                 | "/api/traces"
                 | "/api/audit"
                 | "/api/audit/verify"
                 | "/api/tools/propose_update" => AuthRole::Operator,
-                "/api/codemode/suspended" | "/api/codemode/resume" | "/api/diffs/approve" => {
-                    AuthRole::Approver
-                }
-                "/api/tools/toggle_status"
-                | "/api/servers/toggle_status"
-                | "/api/tools/rollback"
-                | "/api/crawler/trigger" => AuthRole::Admin,
+                "/api/stats"
+                | "/api/servers"
+                | "/api/codemode/types"
+                | "/api/codemode/speculative_types"
+                | "/api/execute"
+                | "/api/codemode/eval"
+                | "/api/codemode/simulate" => AuthRole::Agent,
+                _ if path.starts_with("/api/servers/") => AuthRole::Agent,
                 _ => AuthRole::Admin,
             };
 
@@ -535,6 +562,10 @@ impl ProductionGatewayContext {
 
         if method.eq_ignore_ascii_case("POST") {
             return self.handle_post(path, headers, body_bytes);
+        }
+
+        if method.eq_ignore_ascii_case("DELETE") {
+            return self.handle_delete(path, headers);
         }
 
         self.json_response(405, json!({"error": "Method not allowed"}))
@@ -818,6 +849,38 @@ impl ProductionGatewayContext {
                 }
                 self.json_response(200, json!({"diffs": JsonValue::Array(out)}))
             }
+            _ if (path.starts_with("/api/servers/external/")
+                || path.starts_with("/api/v1/servers/external/"))
+                && path.ends_with("/inspect") =>
+            {
+                let name_part = path
+                    .strip_prefix("/api/servers/external/")
+                    .or_else(|| path.strip_prefix("/api/v1/servers/external/"))
+                    .unwrap();
+                let raw_name = name_part.strip_suffix("/inspect").unwrap_or(name_part).trim();
+                let server_name = if raw_name.starts_with("external-mcp:")
+                    || self.registry.get_server(raw_name).is_some()
+                {
+                    raw_name.to_string()
+                } else {
+                    format!("external-mcp:{}", raw_name)
+                };
+
+                let server = match self.registry.get_server(&server_name) {
+                    Some(s) => s,
+                    None => {
+                        return self.json_response(
+                            404,
+                            json!({"error": format!("Server '{}' not found", server_name)}),
+                        )
+                    }
+                };
+
+                match self.upstream_manager.inspect(&server) {
+                    Ok(inspection) => self.json_response(200, inspection),
+                    Err(e) => self.json_response(500, json!({"error": e})),
+                }
+            }
             _ if path.starts_with("/api/servers/") => {
                 let server_name = path.trim_start_matches("/api/servers/").trim();
                 let server = match self.registry.get_server(server_name) {
@@ -1079,6 +1142,40 @@ impl ProductionGatewayContext {
         }
     }
 
+    fn handle_delete(
+        &self,
+        path: &str,
+        _headers: &HashMap<String, String>,
+    ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
+        if path.starts_with("/api/servers/external/")
+            || path.starts_with("/api/v1/servers/external/")
+        {
+            let name_part = path
+                .strip_prefix("/api/servers/external/")
+                .or_else(|| path.strip_prefix("/api/v1/servers/external/"))
+                .unwrap();
+            let raw_name = name_part
+                .strip_suffix("/deregister")
+                .unwrap_or(name_part)
+                .trim();
+            let server_name = if raw_name.starts_with("external-mcp:")
+                || self.registry.get_server(raw_name).is_some()
+            {
+                raw_name.to_string()
+            } else {
+                format!("external-mcp:{}", raw_name)
+            };
+
+            self.upstream_manager.deregister_server(&server_name);
+            let removed = self.registry.remove_server(&server_name);
+            self.cache.refresh_now();
+            self.gateway.semantic_cache.invalidate_service(&server_name);
+            return self.json_response(200, json!({"success": removed.is_some()}));
+        }
+
+        self.json_response(404, json!({"error": format!("Route '{}' not found", path)}))
+    }
+
     fn handle_post(
         &self,
         path: &str,
@@ -1331,6 +1428,309 @@ impl ProductionGatewayContext {
 
         // 3. Control Plane Management APIs
         match path {
+            "/api/servers/external/register" | "/api/v1/servers/external/register" => {
+                let raw_name = body
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if raw_name.is_empty() {
+                    return self.json_response(400, json!({"error": "Field 'name' is required"}));
+                }
+                let server_name = if raw_name.starts_with("external-mcp:") {
+                    raw_name.to_string()
+                } else {
+                    format!("external-mcp:{}", raw_name)
+                };
+
+                // Check identifier collision for server name
+                if let Err(coll) = self.registry.check_identifier_collisions(&server_name, &[]) {
+                    return self.json_response(
+                        409,
+                        json!({
+                            "error": "IDENTIFIER_COLLISION",
+                            "sanitized": coll.sanitized,
+                            "first_raw": coll.first_raw,
+                            "second_raw": coll.second_raw
+                        }),
+                    );
+                }
+
+                let display_name = body
+                    .get("display_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(raw_name);
+                let description = body
+                    .get("description")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let owner_team = body
+                    .get("owner_team")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("platform");
+
+                let transport_val = match body.get("transport") {
+                    Some(v) => v,
+                    None => {
+                        return self
+                            .json_response(400, json!({"error": "Field 'transport' is required"}))
+                    }
+                };
+
+                let transport_type = transport_val
+                    .get("transport")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let transport_config = match transport_type {
+                    "stdio" => {
+                        let command = match transport_val.get("command").and_then(|x| x.as_str()) {
+                            Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+                            _ => return self.json_response(400, json!({"error": "stdio transport requires non-empty 'command'"})),
+                        };
+
+                        let args: Vec<String> = transport_val
+                            .get("args")
+                            .and_then(|a| a.as_array())
+                            .map(|arr| arr.iter().filter_map(|x| x.as_str()).map(|s| s.to_string()).collect())
+                            .unwrap_or_default();
+
+                        let mut env_refs = std::collections::BTreeMap::new();
+                        if let Some(obj) = transport_val.get("env_refs").and_then(|e| e.as_object()) {
+                            for (k, v) in obj {
+                                if let Some(v_str) = v.as_str() {
+                                    if let Err(e) = crate::upstream::secrets::validate_secret_ref_syntax(v_str) {
+                                        return self.json_response(400, json!({"error": e}));
+                                    }
+                                    env_refs.insert(k.clone(), v_str.to_string());
+                                }
+                            }
+                        }
+
+                        let cwd = transport_val.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string());
+
+                        let canonical_cmd = match crate::upstream::stdio::check_stdio_command_allowlist(&command, &self.config.stdio_allowlist) {
+                            Ok(canon) => canon.to_string_lossy().to_string(),
+                            Err(e) => return self.json_response(403, json!({"error": e})),
+                        };
+
+                        crate::models::UpstreamTransportConfig::Stdio {
+                            command,
+                            canonical_command: canonical_cmd,
+                            args,
+                            env_refs,
+                            cwd,
+                        }
+                    }
+                    "streamable_http" => {
+                        let url = match transport_val.get("url").and_then(|x| x.as_str()) {
+                            Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+                            _ => return self.json_response(400, json!({"error": "streamable_http transport requires non-empty 'url'"})),
+                        };
+
+                        let bearer_ref = match transport_val.get("bearer_ref").and_then(|x| x.as_str()) {
+                            Some(b) if !b.trim().is_empty() => {
+                                if let Err(e) = crate::upstream::secrets::validate_secret_ref_syntax(b) {
+                                    return self.json_response(400, json!({"error": e}));
+                                }
+                                Some(b.to_string())
+                            }
+                            _ => None,
+                        };
+
+                        let mut header_refs = std::collections::BTreeMap::new();
+                        if let Some(obj) = transport_val.get("header_refs").and_then(|h| h.as_object()) {
+                            for (k, v) in obj {
+                                if let Some(v_str) = v.as_str() {
+                                    if let Err(e) = crate::upstream::secrets::validate_secret_ref_syntax(v_str) {
+                                        return self.json_response(400, json!({"error": e}));
+                                    }
+                                    header_refs.insert(k.clone(), v_str.to_string());
+                                }
+                            }
+                        }
+
+                        let session_mode = match transport_val.get("session_mode").and_then(|x| x.as_str()) {
+                            Some("stateless") => crate::models::SessionMode::Stateless,
+                            _ => crate::models::SessionMode::Stateful,
+                        };
+
+                        if let Err(e) = crate::upstream::http::validate_upstream_url_and_resolve(&url, self.config.allow_loopback_upstream) {
+                            if e.contains("-32014") {
+                                return self.json_response(400, json!({"error": e, "code": -32014}));
+                            } else if e.contains("SSRF Guard") {
+                                return self.json_response(403, json!({"error": e}));
+                            } else {
+                                return self.json_response(400, json!({"error": e}));
+                            }
+                        }
+
+                        crate::models::UpstreamTransportConfig::StreamableHttp {
+                            url,
+                            bearer_ref,
+                            header_refs,
+                            session_mode,
+                        }
+                    }
+                    other => return self.json_response(400, json!({"error": format!("Unsupported transport '{}'; use 'stdio' or 'streamable_http'", other)})),
+                };
+
+                let mut server = crate::models::ServerRecord::new(
+                    &server_name,
+                    display_name,
+                    description,
+                    owner_team,
+                );
+                server.protocol = crate::models::ProtocolType::ExternalMcp;
+                server.upstream_config = Some(transport_config);
+
+                // Initial tool discovery
+                let initial_tools = match self.upstream_manager.fetch_tools(&server) {
+                    Ok(tools) => {
+                        if let Err(coll) = self
+                            .registry
+                            .check_identifier_collisions(&server_name, &tools)
+                        {
+                            return self.json_response(
+                                409,
+                                json!({
+                                    "error": "IDENTIFIER_COLLISION",
+                                    "sanitized": coll.sanitized,
+                                    "first_raw": coll.first_raw,
+                                    "second_raw": coll.second_raw
+                                }),
+                            );
+                        }
+                        tools
+                    }
+                    Err(_) => Vec::new(),
+                };
+
+                let registered = self.registry.register_server(server);
+                if !initial_tools.is_empty() {
+                    let _ = self
+                        .registry
+                        .apply_external_sync(&server_name, initial_tools);
+                }
+                self.cache.refresh_now();
+
+                self.json_response(
+                    200,
+                    json!({
+                        "success": true,
+                        "server": registered.to_json()
+                    }),
+                )
+            }
+            _ if (path.starts_with("/api/servers/external/")
+                || path.starts_with("/api/v1/servers/external/"))
+                && path.ends_with("/rediscover") =>
+            {
+                let name_part = path
+                    .strip_prefix("/api/servers/external/")
+                    .or_else(|| path.strip_prefix("/api/v1/servers/external/"))
+                    .unwrap();
+                let raw_name = name_part
+                    .strip_suffix("/rediscover")
+                    .unwrap_or(name_part)
+                    .trim();
+                let server_name = if raw_name.starts_with("external-mcp:")
+                    || self.registry.get_server(raw_name).is_some()
+                {
+                    raw_name.to_string()
+                } else {
+                    format!("external-mcp:{}", raw_name)
+                };
+
+                let server = match self.registry.get_server(&server_name) {
+                    Some(s) => s,
+                    None => {
+                        return self.json_response(
+                            404,
+                            json!({"error": format!("Server '{}' not found", server_name)}),
+                        )
+                    }
+                };
+
+                if !self.upstream_manager.try_lock_rediscovery(&server_name) {
+                    return self.json_response(
+                        409,
+                        json!({"error": "Rediscovery already in progress for server"}),
+                    );
+                }
+
+                let fetch_res = self.upstream_manager.fetch_tools(&server);
+                self.upstream_manager.unlock_rediscovery(&server_name);
+
+                let tools = match fetch_res {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return self.json_response(
+                            502,
+                            json!({"error": format!("Upstream tools/list failed: {}", e)}),
+                        )
+                    }
+                };
+
+                if let Err(coll) = self
+                    .registry
+                    .check_identifier_collisions(&server_name, &tools)
+                {
+                    return self.json_response(
+                        409,
+                        json!({
+                            "error": "IDENTIFIER_COLLISION",
+                            "sanitized": coll.sanitized,
+                            "first_raw": coll.first_raw,
+                            "second_raw": coll.second_raw
+                        }),
+                    );
+                }
+
+                match self.registry.apply_external_sync(&server_name, tools) {
+                    Ok(sync_res) => {
+                        self.cache.refresh_now();
+                        self.gateway.semantic_cache.invalidate_service(&server_name);
+                        self.json_response(
+                            200,
+                            json!({
+                                "success": true,
+                                "added": sync_res.added as i64,
+                                "updated": sync_res.updated as i64,
+                                "retired": sync_res.retired as i64,
+                                "unchanged": sync_res.unchanged as i64,
+                                "pending_human_conflicts": sync_res.pending_human_conflicts as i64
+                            }),
+                        )
+                    }
+                    Err(e) => self.json_response(500, json!({"error": e})),
+                }
+            }
+            _ if (path.starts_with("/api/servers/external/")
+                || path.starts_with("/api/v1/servers/external/"))
+                && path.ends_with("/deregister") =>
+            {
+                let name_part = path
+                    .strip_prefix("/api/servers/external/")
+                    .or_else(|| path.strip_prefix("/api/v1/servers/external/"))
+                    .unwrap();
+                let raw_name = name_part
+                    .strip_suffix("/deregister")
+                    .unwrap_or(name_part)
+                    .trim();
+                let server_name = if raw_name.starts_with("external-mcp:")
+                    || self.registry.get_server(raw_name).is_some()
+                {
+                    raw_name.to_string()
+                } else {
+                    format!("external-mcp:{}", raw_name)
+                };
+
+                self.upstream_manager.deregister_server(&server_name);
+                let removed = self.registry.remove_server(&server_name);
+                self.cache.refresh_now();
+                self.gateway.semantic_cache.invalidate_service(&server_name);
+                self.json_response(200, json!({"success": removed.is_some()}))
+            }
             "/api/crawler/trigger" => {
                 let res = self.crawler.run_discovery_workflow();
                 self.cache.refresh_now();
@@ -1407,9 +1807,20 @@ impl ProductionGatewayContext {
                     .get("approver")
                     .and_then(|x| x.as_str())
                     .unwrap_or("service_owner");
-                let ok = self.registry.approve_diff(diff_id, approver);
-                self.cache.refresh_now();
-                self.json_response(200, json!({"success": ok}))
+                match self.registry.approve_diff(diff_id, approver) {
+                    Ok(true) => {
+                        self.cache.refresh_now();
+                        self.json_response(200, json!({"success": true}))
+                    }
+                    Ok(false) => self.json_response(
+                        404,
+                        json!({"error": "Diff not found or already approved", "success": false}),
+                    ),
+                    Err(e) if e.contains("CONFLICT") => {
+                        self.json_response(409, json!({"error": e}))
+                    }
+                    Err(e) => self.json_response(400, json!({"error": e})),
+                }
             }
             "/api/tools/rollback" => {
                 let s_name = body

@@ -16,15 +16,17 @@ use omni_mcp::json;
 use omni_mcp::json::JsonValue;
 use omni_mcp::models::{
     to_legacy_error_code, validate_mcp_response, ActorType, CharterPolicy, ProtocolType,
-    RPCBatchOrSingle, RPCRequest, ServerRecord, ToolRecord, ToolStatus, APPROVAL_INVALID,
-    APPROVAL_REQUIRED, CIRCUIT_OPEN, HEADER_MISMATCH, LATEST_SESSION_MCP_PROTOCOL_VERSION,
-    SCHEMA_PREFLIGHT_FAILED, TOOL_DISABLED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
+    RPCBatchOrSingle, RPCRequest, SchemaSource, ServerRecord, ToolRecord, ToolStatus,
+    UpstreamTransportConfig, APPROVAL_INVALID, APPROVAL_REQUIRED, CIRCUIT_OPEN, HEADER_MISMATCH,
+    LATEST_SESSION_MCP_PROTOCOL_VERSION, SCHEMA_PREFLIGHT_FAILED, TOOL_DISABLED, UNAUTHORIZED,
+    UNSUPPORTED_PROTOCOL_VERSION,
 };
 use omni_mcp::server::ProductionGatewayContext;
 use omni_mcp::storage::{MerkleAuditStore, WalRegistryStore, GENESIS_HASH};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,6 +38,24 @@ fn temp_test_path(prefix: &str) -> String {
     let mut p = env::temp_dir();
     p.push(format!("{}_{}_{}", prefix, std::process::id(), nanos));
     p.to_string_lossy().into_owned()
+}
+
+fn find_omni_binary() -> std::path::PathBuf {
+    let current_exe = std::env::current_exe().expect("Must have current exe");
+    let mut dir = current_exe.parent().unwrap();
+    if dir.file_name().and_then(|n| n.to_str()) == Some("deps") {
+        dir = dir.parent().unwrap();
+    }
+    let omni_name = if cfg!(windows) { "omni.exe" } else { "omni" };
+    let candidate = dir.join(omni_name);
+    if candidate.exists() {
+        return std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    }
+    let fallback = std::path::PathBuf::from(format!("./target/debug/{}", omni_name));
+    if fallback.exists() {
+        return std::fs::canonicalize(&fallback).unwrap_or(fallback);
+    }
+    current_exe
 }
 
 #[test]
@@ -75,7 +95,7 @@ fn test_wal_persistence_across_restart() {
                 "alice",
             )
             .unwrap();
-        assert!(registry.approve_diff(&diff.diff_id, "tech_lead"));
+        assert!(registry.approve_diff(&diff.diff_id, "tech_lead").unwrap());
         store.close();
     }
 
@@ -162,7 +182,9 @@ fn test_disabled_by_default_and_diff_rollback() {
     );
 
     // Approve diff
-    assert!(registry.approve_diff(&diff.diff_id, "bob-lead@uber.com"));
+    assert!(registry
+        .approve_diff(&diff.diff_id, "bob-lead@uber.com")
+        .unwrap());
     let updated = registry.get_server("paymentservice").unwrap();
     let t2 = updated.get_tool("ChargeRider").unwrap();
     assert_eq!(t2.version, 2);
@@ -2970,6 +2992,913 @@ fn test_v5_0_protocol_conformance_2026_07_28() {
         0
     );
 
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ====================================================================================
+// v5.5.0 UNIFIED EXTERNAL MCP FLEET ACCEPTANCE SUITE (AC-1 through AC-9)
+// ====================================================================================
+
+#[test]
+fn test_v5_5_ac1_stdio_e2e_registration_and_nonce_echo() {
+    let dir = temp_test_path("omni_v5_5_ac1_stdio");
+    let omni_bin = find_omni_binary();
+    let omni_bin_str = omni_bin.to_string_lossy().to_string();
+
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        stdio_allowlist: vec![omni_bin_str.clone()],
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut admin_h = HashMap::new();
+    admin_h.insert(
+        "authorization".to_string(),
+        "Bearer admin_dev_token".to_string(),
+    );
+
+    // 1. Register stdio external server
+    let reg_body = json!({
+        "name": "stdio-echo",
+        "display_name": "Stdio Echo Server",
+        "description": "Subprocess stdio MCP server",
+        "transport": {
+            "transport": "stdio",
+            "command": omni_bin_str,
+            "args": ["mcp", "mock-echo-mcp"]
+        }
+    });
+    let (status, _, _, body) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &reg_body.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        status,
+        200,
+        "Registration failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // 2. Enable server and tool
+    let toggle_srv = json!({ "serverName": "external-mcp:stdio-echo", "status": "ENABLED" });
+    ctx.handle_http(
+        "POST",
+        "/api/servers/toggle_status",
+        &admin_h,
+        &toggle_srv.to_string_compact().into_bytes(),
+    );
+    let toggle_tool = json!({ "serverName": "external-mcp:stdio-echo", "toolName": "echo_nonce", "status": "ENABLED" });
+    ctx.handle_http(
+        "POST",
+        "/api/tools/toggle_status",
+        &admin_h,
+        &toggle_tool.to_string_compact().into_bytes(),
+    );
+
+    // 3. Invoke via /omni/mcp tools/call
+    let nonce = "crypto_nonce_xyz_777";
+    let call_req = json!({
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "tools/call",
+        "params": {
+            "name": "echo_nonce",
+            "arguments": { "nonce": nonce }
+        }
+    });
+    let (c_status, _, _, c_body) = ctx.handle_http(
+        "POST",
+        "/omni/mcp",
+        &admin_h,
+        &call_req.to_string_compact().into_bytes(),
+    );
+    assert_eq!(c_status, 200);
+    let c_json = JsonValue::parse(&String::from_utf8(c_body).unwrap()).unwrap();
+    assert_eq!(c_json["result"]["content"][0]["text"].as_str(), Some(nonce));
+
+    // 4. Invoke via Code Mode script
+    let code_script = format!(
+        "const res = await call_tool('external-mcp:stdio-echo', 'echo_nonce', {{ nonce: '{}' }}); res.content[0].text;",
+        nonce
+    );
+    let cm_res = ctx.gateway.execute_codemode(
+        &code_script,
+        None,
+        false,
+        "admin",
+        None,
+        Some("admin_dev_token"),
+    );
+    assert_eq!(cm_res.status, "OK");
+    assert_eq!(cm_res.result.as_str(), Some(nonce));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_5_ac2_streamable_http_session_lifecycle_and_404_recovery() {
+    let dir = temp_test_path("omni_v5_5_ac2_http");
+    let test_url = "http://127.0.0.1:18888/mcp";
+
+    let session_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let sess_clone = session_count.clone();
+    let call_clone = call_attempts.clone();
+
+    omni_mcp::upstream::register_mock_http(test_url, move |_path, body, headers| {
+        let body_str = String::from_utf8_lossy(body);
+        let json_val = JsonValue::parse(&body_str).unwrap_or(JsonValue::Null);
+        let method = json_val
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        let id = json_val.get("id").cloned().unwrap_or(JsonValue::Null);
+
+        let mut resp_headers = std::collections::BTreeMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+
+        if method == "initialize" {
+            let s = sess_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let sid = format!("sess_{}", s);
+            resp_headers.insert("mcp-session-id".to_string(), sid);
+            let resp_body = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "mock-http-server", "version": "1.0.0" }
+                }
+            })
+            .to_string_compact();
+            (200, resp_headers, resp_body.into_bytes())
+        } else if method == "notifications/initialized" {
+            (200, resp_headers, Vec::new())
+        } else if method == "tools/list" {
+            let resp_body = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "http_echo",
+                            "description": "HTTP echo tool",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": { "msg": { "type": "string" } }
+                            }
+                        }
+                    ]
+                }
+            })
+            .to_string_compact();
+            (200, resp_headers, resp_body.into_bytes())
+        } else if method == "tools/call" {
+            let att = call_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if att == 1 {
+                (404, resp_headers, b"Session expired".to_vec())
+            } else {
+                let sid_hdr = headers.get("mcp-session-id").map(|s| s.as_str());
+                assert_eq!(
+                    sid_hdr,
+                    Some("sess_2"),
+                    "Expected refreshed session ID sess_2 on retry"
+                );
+                let msg = json_val["params"]["arguments"]["msg"]
+                    .as_str()
+                    .unwrap_or("no-msg");
+                let resp_body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [
+                            { "type": "text", "text": msg }
+                        ]
+                    }
+                })
+                .to_string_compact();
+                (200, resp_headers, resp_body.into_bytes())
+            }
+        } else {
+            (400, resp_headers, b"Unknown method".to_vec())
+        }
+    });
+
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        allow_loopback_upstream: true,
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut admin_h = HashMap::new();
+    admin_h.insert(
+        "authorization".to_string(),
+        "Bearer admin_dev_token".to_string(),
+    );
+
+    let reg_body = json!({
+        "name": "remote-http",
+        "display_name": "Remote HTTP MCP Server",
+        "description": "Streamable HTTP MCP server",
+        "transport": {
+            "transport": "streamable_http",
+            "url": test_url,
+            "session_mode": "stateful"
+        }
+    });
+
+    let (status, _, _, body) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &reg_body.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        status,
+        200,
+        "Registration failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let toggle_srv = json!({ "serverName": "external-mcp:remote-http", "status": "ENABLED" });
+    ctx.handle_http(
+        "POST",
+        "/api/servers/toggle_status",
+        &admin_h,
+        &toggle_srv.to_string_compact().into_bytes(),
+    );
+    let toggle_tool = json!({ "serverName": "external-mcp:remote-http", "toolName": "http_echo", "status": "ENABLED" });
+    ctx.handle_http(
+        "POST",
+        "/api/tools/toggle_status",
+        &admin_h,
+        &toggle_tool.to_string_compact().into_bytes(),
+    );
+
+    let call_req = json!({
+        "jsonrpc": "2.0",
+        "id": 202,
+        "method": "tools/call",
+        "params": {
+            "name": "http_echo",
+            "arguments": { "msg": "hello_http_recovery" }
+        }
+    });
+    let (c_status, _, _, c_body) = ctx.handle_http(
+        "POST",
+        "/omni/mcp",
+        &admin_h,
+        &call_req.to_string_compact().into_bytes(),
+    );
+    assert_eq!(c_status, 200);
+    let c_json = JsonValue::parse(&String::from_utf8(c_body).unwrap()).unwrap();
+    assert_eq!(
+        c_json["result"]["content"][0]["text"].as_str(),
+        Some("hello_http_recovery")
+    );
+
+    omni_mcp::upstream::clear_mock_http(test_url);
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_5_ac3_first_class_surface_inheritance() {
+    let dir = temp_test_path("omni_v5_5_ac3_surface");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut ext_server = ServerRecord::new(
+        "external-mcp:billing",
+        "External Billing Service",
+        "External billing tools",
+        "finance",
+    );
+    ext_server.protocol = ProtocolType::ExternalMcp;
+    let mut ext_tool = ToolRecord::new(
+        "generate_invoice",
+        "Generate customer invoice PDF",
+        json!({"type": "object", "properties": {"amount": {"type": "number"}}}),
+    );
+    ext_tool.protocol = ProtocolType::ExternalMcp;
+    ext_tool.status = ToolStatus::Disabled;
+    ext_server.add_tool(ext_tool);
+    ctx.registry.register_server(ext_server);
+    ctx.cache.refresh_now();
+
+    // 1. While Disabled: must not appear in discover_tools or .d.ts
+    let disc_req = RPCRequest::new(
+        1i64,
+        "tools/call",
+        json!({"name": "discover_tools", "arguments": {"server_name": "external-mcp:billing"}}),
+    );
+    let disc_resp = ctx.omni_mcp.handle_request(&disc_req, "agent", None);
+    let text_before = disc_resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !text_before.contains("generate_invoice"),
+        "Disabled external tool must not appear in discover_tools"
+    );
+    let ts_before = ctx.gateway.generate_codemode_types(None, None);
+    assert!(
+        !ts_before
+            .typescript_declarations
+            .contains("generate_invoice"),
+        "Disabled external tool must not appear in .d.ts"
+    );
+
+    // 2. Enable server and tool
+    ctx.registry
+        .toggle_server_status("external-mcp:billing", ToolStatus::Enabled);
+    ctx.registry.toggle_tool_status(
+        "external-mcp:billing",
+        "generate_invoice",
+        ToolStatus::Enabled,
+    );
+    ctx.cache.refresh_now();
+
+    // 3. Immediately visible
+    let disc_resp_after = ctx.omni_mcp.handle_request(&disc_req, "agent", None);
+    let text_after = disc_resp_after.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text_after.contains("generate_invoice"),
+        "Enabled external tool must appear in discover_tools"
+    );
+    let ts_after = ctx.gateway.generate_codemode_types(None, None);
+    assert!(
+        ts_after
+            .typescript_declarations
+            .contains("generate_invoice"),
+        "Enabled external tool must appear in .d.ts"
+    );
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_5_ac4_rediscovery_provenance_and_rollback() {
+    let dir = temp_test_path("omni_v5_5_ac4_sync");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    // Initial server with tool v1
+    let mut server = ServerRecord::new(
+        "external-mcp:inventory",
+        "Inventory",
+        "Warehouse tools",
+        "logistics",
+    );
+    server.protocol = ProtocolType::ExternalMcp;
+    let mut tool1 = ToolRecord::new(
+        "check_stock",
+        "Check stock level v1",
+        json!({"type": "object", "properties": {"sku": {"type": "string"}}}),
+    );
+    tool1.protocol = ProtocolType::ExternalMcp;
+    tool1.status = ToolStatus::Enabled;
+    tool1.schema_source = SchemaSource::Upstream;
+    server.add_tool(tool1);
+
+    let mut tool_to_retire = ToolRecord::new(
+        "legacy_barcode",
+        "Legacy barcode scanner",
+        json!({"type": "object"}),
+    );
+    tool_to_retire.protocol = ProtocolType::ExternalMcp;
+    tool_to_retire.status = ToolStatus::Enabled;
+    server.add_tool(tool_to_retire);
+
+    ctx.registry.register_server(server);
+    ctx.cache.refresh_now();
+
+    // Reconcile with:
+    // - check_stock updated (description changed)
+    // - new_tool added
+    // - legacy_barcode omitted (retired)
+    let updated_t1 = ToolRecord::new(
+        "check_stock",
+        "Check stock level v2 with warehouse bin location",
+        json!({"type": "object", "properties": {"sku": {"type": "string"}, "bin": {"type": "string"}}}),
+    );
+    let new_t2 = ToolRecord::new(
+        "reserve_stock",
+        "Reserve stock for shipment",
+        json!({"type": "object"}),
+    );
+
+    let sync_res = ctx
+        .registry
+        .apply_external_sync(
+            "external-mcp:inventory",
+            vec![updated_t1.clone(), new_t2.clone()],
+        )
+        .expect("Sync must succeed");
+
+    assert_eq!(sync_res.added, 1);
+    assert_eq!(sync_res.updated, 1);
+    assert_eq!(sync_res.retired, 1);
+    assert_eq!(sync_res.unchanged, 0);
+
+    // Verify updated tool preserved its Enabled status
+    let srv = ctx.registry.get_server("external-mcp:inventory").unwrap();
+    let t1_live = srv.get_tool("check_stock").unwrap();
+    assert_eq!(t1_live.status, ToolStatus::Enabled);
+    assert_eq!(t1_live.version, 2);
+
+    // Verify retired tool is Unavailable
+    let retired_live = srv.get_tool("legacy_barcode").unwrap();
+    assert_eq!(retired_live.status, ToolStatus::Unavailable);
+    assert!(retired_live.retired_at.is_some());
+
+    // Verify auto-approved diff exists with origin: ExternalSync
+    let diffs = ctx.registry.list_pending_diffs(None);
+    assert!(diffs.is_empty());
+
+    // Rollback check_stock to v1
+    assert!(ctx
+        .registry
+        .rollback_tool("external-mcp:inventory", "check_stock", 1));
+    let srv_rolled = ctx.registry.get_server("external-mcp:inventory").unwrap();
+    let t1_rolled = srv_rolled.get_tool("check_stock").unwrap();
+    assert_eq!(t1_rolled.version, 1);
+    assert_eq!(t1_rolled.description, "Check stock level v1");
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_5_ac5_human_override_protection_and_cas_guard() {
+    let dir = temp_test_path("omni_v5_5_ac5_human");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut server = ServerRecord::new("external-mcp:crm", "CRM", "Customer records", "sales");
+    server.protocol = ProtocolType::ExternalMcp;
+    let mut tool = ToolRecord::new(
+        "update_lead",
+        "Original upstream description",
+        json!({"type": "object"}),
+    );
+    tool.protocol = ProtocolType::ExternalMcp;
+    tool.status = ToolStatus::Enabled;
+    tool.schema_source = SchemaSource::Upstream;
+    server.add_tool(tool);
+    ctx.registry.register_server(server);
+
+    // 1. Human operator proposes and approves update
+    let diff = ctx
+        .registry
+        .propose_tool_update(
+            "external-mcp:crm",
+            "update_lead",
+            Some("Human curated description for sales team"),
+            None,
+            "operator_alice",
+        )
+        .unwrap();
+
+    assert!(ctx
+        .registry
+        .approve_diff(&diff.diff_id, "lead_bob")
+        .unwrap());
+    let t_human = ctx
+        .registry
+        .get_server("external-mcp:crm")
+        .unwrap()
+        .get_tool("update_lead")
+        .unwrap()
+        .clone();
+    assert_eq!(t_human.schema_source, SchemaSource::Human);
+    assert_eq!(
+        t_human.description,
+        "Human curated description for sales team"
+    );
+
+    // 2. Upstream sync attempts to overwrite with divergent description
+    let upstream_tool = ToolRecord::new(
+        "update_lead",
+        "Automated upstream change that conflicts with human override",
+        json!({"type": "object"}),
+    );
+
+    let sync_res = ctx
+        .registry
+        .apply_external_sync("external-mcp:crm", vec![upstream_tool])
+        .unwrap();
+    assert_eq!(sync_res.pending_human_conflicts, 1);
+
+    // Assert human description is PRESERVED on live tool
+    let t_preserved = ctx
+        .registry
+        .get_server("external-mcp:crm")
+        .unwrap()
+        .get_tool("update_lead")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        t_preserved.description,
+        "Human curated description for sales team"
+    );
+
+    // Assert unapproved diff was queued
+    let pending = ctx.registry.list_pending_diffs(None);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].server_name, "external-mcp:crm");
+
+    // 3. CAS guard: if version has advanced, approve_diff returns CONFLICT
+    let diff_2 = ctx
+        .registry
+        .propose_tool_update(
+            "external-mcp:crm",
+            "update_lead",
+            Some("Version 3 description"),
+            None,
+            "lead_bob",
+        )
+        .unwrap();
+
+    // Advance tool to version 3 by approving diff_2
+    assert!(ctx
+        .registry
+        .approve_diff(&diff_2.diff_id, "lead_bob")
+        .unwrap());
+
+    // Now attempting to approve pending[0] (which expected previous_version: 2, but tool is now v3)
+    let cas_res = ctx.registry.approve_diff(&pending[0].diff_id, "approver");
+    assert!(cas_res.is_err());
+    assert!(cas_res.unwrap_err().contains("CONFLICT"));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_5_ac6_zero_secret_bytes_on_disk() {
+    let dir = temp_test_path("omni_v5_5_ac6_zero_secret");
+    let secrets_dir = PathBuf::from(&dir).join("secrets");
+    fs::create_dir_all(&secrets_dir).unwrap();
+
+    let secret_file = secrets_dir.join("api_token.txt");
+    fs::write(&secret_file, "raw_sensitive_secret_value_12345").unwrap();
+
+    env::set_var("TEST_UPSTREAM_ENV_KEY", "super_secret_env_value_67890");
+
+    let db_path = format!("{}/registry.db", dir);
+    let store = Arc::new(WalRegistryStore::new(&db_path));
+    let registry = MCPRegistry::new(Some(store.clone()));
+
+    let mut env_refs = std::collections::BTreeMap::new();
+    env_refs.insert(
+        "SECRET_KEY".to_string(),
+        "{env:TEST_UPSTREAM_ENV_KEY}".to_string(),
+    );
+    env_refs.insert(
+        "TOKEN_FILE".to_string(),
+        "{file:./api_token.txt}".to_string(),
+    );
+
+    let mut ext_server = ServerRecord::new(
+        "external-mcp:secure-fleet",
+        "Secure Fleet",
+        "Zero raw secrets on disk",
+        "security",
+    );
+    ext_server.protocol = ProtocolType::ExternalMcp;
+    ext_server.upstream_config = Some(UpstreamTransportConfig::Stdio {
+        command: "node".to_string(),
+        canonical_command: "C:\\Program Files\\nodejs\\node.exe".to_string(),
+        args: vec!["server.js".to_string()],
+        env_refs,
+        cwd: None,
+    });
+
+    registry.register_server(ext_server);
+
+    store.checkpoint_snapshot();
+    store.close();
+
+    let disk_raw = fs::read_to_string(&db_path).unwrap();
+    assert!(
+        !disk_raw.contains("super_secret_env_value_67890"),
+        "Raw environment secret must never appear on disk"
+    );
+    assert!(
+        !disk_raw.contains("raw_sensitive_secret_value_12345"),
+        "Raw file secret must never appear on disk"
+    );
+    assert!(disk_raw.contains("{env:TEST_UPSTREAM_ENV_KEY}"));
+    assert!(disk_raw.contains("{file:./api_token.txt}"));
+
+    env::remove_var("TEST_UPSTREAM_ENV_KEY");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_5_ac7_sanitized_identifier_collision_rejection() {
+    let dir = temp_test_path("omni_v5_5_ac7_collision");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut admin_h = HashMap::new();
+    admin_h.insert(
+        "authorization".to_string(),
+        "Bearer admin_dev_token".to_string(),
+    );
+
+    // 1. Server collision: "payments-service" vs "payments_service"
+    let s1 = ServerRecord::new("payments_service", "Payments", "Desc", "fin");
+    ctx.registry.register_server(s1);
+
+    let reg_coll = json!({
+        "name": "payments-service",
+        "transport": {
+            "transport": "streamable_http",
+            "url": "http://127.0.0.1:8080/mcp"
+        }
+    });
+    let (s_code, _, _, s_body) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &reg_coll.to_string_compact().into_bytes(),
+    );
+    assert_eq!(s_code, 409);
+    let s_json = JsonValue::parse(&String::from_utf8(s_body).unwrap()).unwrap();
+    assert_eq!(s_json["error"].as_str(), Some("IDENTIFIER_COLLISION"));
+
+    // 2. Tool collision within a server: "web-search" vs "web_search"
+    let tools = vec![
+        ToolRecord::new("web-search", "Search web", json!({"type": "object"})),
+        ToolRecord::new(
+            "web_search",
+            "Search web duplicate",
+            json!({"type": "object"}),
+        ),
+    ];
+    let t_coll = ctx
+        .registry
+        .check_identifier_collisions("external-mcp:test", &tools);
+    assert!(t_coll.is_err());
+    let err = t_coll.unwrap_err();
+    assert_eq!(err.sanitized, "web_search");
+    assert_eq!(err.first_raw, "web-search");
+    assert_eq!(err.second_raw, "web_search");
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_5_ac8_rbac_and_allowlist_enforcement() {
+    let dir = temp_test_path("omni_v5_5_ac8_rbac");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        stdio_allowlist: vec!["/bin/allowed_cmd".to_string()],
+        allow_loopback_upstream: false,
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let roles = [
+        ("Bearer agent_dev_token", "Agent"),
+        ("Bearer operator_dev_token", "Operator"),
+        ("Bearer approver_dev_token", "Approver"),
+    ];
+
+    for (token, role_name) in roles {
+        let mut h = HashMap::new();
+        h.insert("authorization".to_string(), token.to_string());
+
+        let (st1, _, _, _) =
+            ctx.handle_http("POST", "/api/v1/servers/external/register", &h, b"{}");
+        assert_eq!(
+            st1, 403,
+            "Role {} must be forbidden from /register",
+            role_name
+        );
+
+        let (st2, _, _, _) =
+            ctx.handle_http("POST", "/api/v1/servers/external/srv/deregister", &h, b"{}");
+        assert_eq!(
+            st2, 403,
+            "Role {} must be forbidden from /deregister",
+            role_name
+        );
+
+        let (st3, _, _, _) =
+            ctx.handle_http("POST", "/api/v1/servers/external/srv/rediscover", &h, b"{}");
+        assert_eq!(
+            st3, 403,
+            "Role {} must be forbidden from /rediscover",
+            role_name
+        );
+
+        let (st4, _, _, _) = ctx.handle_http("POST", "/api/servers/toggle_status", &h, b"{}");
+        assert_eq!(
+            st4, 403,
+            "Role {} must be forbidden from /api/servers/toggle_status",
+            role_name
+        );
+    }
+
+    let mut admin_h = HashMap::new();
+    admin_h.insert(
+        "authorization".to_string(),
+        "Bearer admin_dev_token".to_string(),
+    );
+
+    let non_allow = json!({
+        "name": "unauthorized-cmd",
+        "transport": {
+            "transport": "stdio",
+            "command": "malicious_script.sh"
+        }
+    });
+    let (st_cmd, _, _, body_cmd) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &non_allow.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        st_cmd,
+        403,
+        "Non-allowlisted binary must receive 403: {}",
+        String::from_utf8_lossy(&body_cmd)
+    );
+
+    let ssrf_req = json!({
+        "name": "metadata-target",
+        "transport": {
+            "transport": "streamable_http",
+            "url": "http://169.254.169.254/latest/meta-data"
+        }
+    });
+    let (st_ssrf, _, _, body_ssrf) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &ssrf_req.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        st_ssrf,
+        403,
+        "Metadata IP must receive 403: {}",
+        String::from_utf8_lossy(&body_ssrf)
+    );
+
+    let https_req = json!({
+        "name": "tls-target",
+        "transport": {
+            "transport": "streamable_http",
+            "url": "https://api.github.com/mcp"
+        }
+    });
+    let (st_tls, _, _, body_tls) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &https_req.to_string_compact().into_bytes(),
+    );
+    assert_eq!(st_tls, 400);
+    let tls_json = JsonValue::parse(&String::from_utf8(body_tls).unwrap()).unwrap();
+    assert_eq!(tls_json["code"].as_i64(), Some(-32014));
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v5_5_ac9_supervision_stderr_flood_and_shutdown() {
+    let dir = temp_test_path("omni_v5_5_ac9_supervision");
+    let omni_bin = find_omni_binary();
+    let omni_bin_str = omni_bin.to_string_lossy().to_string();
+
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        stdio_allowlist: vec![omni_bin_str.clone()],
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut admin_h = HashMap::new();
+    admin_h.insert(
+        "authorization".to_string(),
+        "Bearer admin_dev_token".to_string(),
+    );
+
+    let reg_body = json!({
+        "name": "flood-server",
+        "display_name": "Stderr Flood Server",
+        "description": "Tests deadlock freedom on stderr flood",
+        "transport": {
+            "transport": "stdio",
+            "command": omni_bin_str,
+            "args": ["mcp", "mock-echo-mcp", "--flood-stderr"]
+        }
+    });
+
+    let (status, _, _, body) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &reg_body.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        status,
+        200,
+        "Registration failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let toggle_srv = json!({ "serverName": "external-mcp:flood-server", "status": "ENABLED" });
+    ctx.handle_http(
+        "POST",
+        "/api/servers/toggle_status",
+        &admin_h,
+        &toggle_srv.to_string_compact().into_bytes(),
+    );
+    let toggle_tool = json!({ "serverName": "external-mcp:flood-server", "toolName": "echo_nonce", "status": "ENABLED" });
+    ctx.handle_http(
+        "POST",
+        "/api/tools/toggle_status",
+        &admin_h,
+        &toggle_tool.to_string_compact().into_bytes(),
+    );
+
+    let call_req = json!({
+        "jsonrpc": "2.0",
+        "id": 901,
+        "method": "tools/call",
+        "params": {
+            "name": "echo_nonce",
+            "arguments": { "nonce": "flood_resilient_nonce_123" }
+        }
+    });
+    let (c_status, _, _, c_body) = ctx.handle_http(
+        "POST",
+        "/omni/mcp",
+        &admin_h,
+        &call_req.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        c_status, 200,
+        "Tool call deadlocked or failed after stderr flood"
+    );
+    let c_json = JsonValue::parse(&String::from_utf8(c_body).unwrap()).unwrap();
+    assert_eq!(
+        c_json["result"]["content"][0]["text"].as_str(),
+        Some("flood_resilient_nonce_123")
+    );
+
+    let (insp_st, _, _, insp_body) = ctx.handle_http(
+        "GET",
+        "/api/v1/servers/external/flood-server/inspect",
+        &admin_h,
+        &[],
+    );
+    assert_eq!(insp_st, 200);
+    let insp_json = JsonValue::parse(&String::from_utf8(insp_body).unwrap()).unwrap();
+    let stderr_tail = insp_json["stderr_tail"]
+        .as_array()
+        .expect("stderr_tail array");
+    assert!(
+        stderr_tail.len() <= 256,
+        "Ring buffer must be capped at 256 lines, got {}",
+        stderr_tail.len()
+    );
+    assert!(
+        !stderr_tail.is_empty(),
+        "Ring buffer must have captured flooded lines"
+    );
+
+    ctx.upstream_manager.shutdown_all();
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);
 }

@@ -534,13 +534,33 @@ impl OmniMCPServer {
                     "simulate_codemode" => {
                         self.call_simulate_codemode(request, &arguments, caller_actor, user_token)
                     }
-                    other => RPCResponse::err(
-                        request.id.clone(),
-                        RPCError::new(
-                            METHOD_NOT_FOUND,
-                            format!("Unknown Omni MCP tool: {}", other),
-                        ),
-                    ),
+                    other => {
+                        let mut found_srv = None;
+                        for srv in self.cache.list_servers() {
+                            if srv.tools.contains_key(other) {
+                                found_srv = Some(srv.name.clone());
+                                break;
+                            }
+                        }
+
+                        if let Some(srv_name) = found_srv {
+                            self.gateway.handle_request_with_trace(
+                                &srv_name,
+                                request,
+                                caller_actor,
+                                user_token,
+                                None,
+                            )
+                        } else {
+                            RPCResponse::err(
+                                request.id.clone(),
+                                RPCError::new(
+                                    METHOD_NOT_FOUND,
+                                    format!("Unknown Omni MCP tool: {}", other),
+                                ),
+                            )
+                        }
+                    }
                 }
             }
             other => RPCResponse::err(

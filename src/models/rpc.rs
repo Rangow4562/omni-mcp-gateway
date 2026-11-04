@@ -31,6 +31,7 @@ pub const SCHEMA_PREFLIGHT_FAILED: i32 = -32010;
 pub const MEMORY_EXHAUSTED: i32 = -32011;
 pub const TIMEOUT: i32 = -32012;
 pub const APPROVAL_INVALID: i32 = -32013;
+pub const UPSTREAM_TLS_UNSUPPORTED: i32 = -32014;
 
 // Legacy 4.x compatibility aliases (-32029..-32038)
 pub const RATE_LIMITED_LEGACY: i32 = -32029;

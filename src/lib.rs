@@ -19,3 +19,4 @@ pub mod logging;
 pub mod models;
 pub mod server;
 pub mod storage;
+pub mod upstream;

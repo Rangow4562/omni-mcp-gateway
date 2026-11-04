@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { ToolItem } from '../types';
+import { apiFetch } from '../api';
 
 interface TestConsoleProps {
   serverName: string;
@@ -45,12 +46,10 @@ export const TestConsole: React.FC<TestConsoleProps> = ({
         parsedArgs._projection = projection.split(',').map((p) => p.trim()).filter(Boolean);
       }
 
-      const res = await fetch(`http://localhost:8080/${serverName}/mcp`, {
+      const data = await apiFetch<any>(`/${encodeURIComponent(serverName)}/mcp`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
           'X-Caller-Actor': callerActor,
-          'Authorization': 'Bearer demo_token_operator',
         },
         body: JSON.stringify({
           jsonrpc: '2.0',
@@ -63,7 +62,6 @@ export const TestConsole: React.FC<TestConsoleProps> = ({
         }),
       });
 
-      const data = await res.json();
       setResponse(data);
     } catch (err: any) {
       setErrorMsg(`Network or gateway error: ${err.message}`);

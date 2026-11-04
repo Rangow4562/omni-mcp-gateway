@@ -6,6 +6,7 @@ interface RegistryCatalogProps {
   selectedServer: string | null;
   onSelectServer: (serverName: string) => void;
   onToggleServerStatus: (serverName: string, currentStatus: string) => void;
+  onInspectServer?: (server: ServerSummary) => void;
 }
 
 export const RegistryCatalog: React.FC<RegistryCatalogProps> = ({
@@ -13,6 +14,7 @@ export const RegistryCatalog: React.FC<RegistryCatalogProps> = ({
   selectedServer,
   onSelectServer,
   onToggleServerStatus,
+  onInspectServer,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [protocolFilter, setProtocolFilter] = useState('ALL');
@@ -36,6 +38,8 @@ export const RegistryCatalog: React.FC<RegistryCatalogProps> = ({
         return '#9d4edd';
       case 'Native_MCP':
         return '#06d6a0';
+      case 'External_MCP':
+        return '#00e575';
       case 'ThirdParty':
         return '#ffb703';
       default:
@@ -78,6 +82,7 @@ export const RegistryCatalog: React.FC<RegistryCatalogProps> = ({
             }}
           >
             <option value="ALL">All Protocols</option>
+            <option value="External_MCP">External MCP Fleet</option>
             <option value="gRPC">gRPC</option>
             <option value="TChannel">TChannel</option>
             <option value="HTTP">HTTP</option>
@@ -166,7 +171,29 @@ export const RegistryCatalog: React.FC<RegistryCatalogProps> = ({
                 <span>
                   Tools: <strong style={{ color: s.enabledToolsCount > 0 ? '#00e575' : '#686b80' }}>{s.enabledToolsCount}</strong> / {s.toolsCount} active
                 </span>
-                <span style={{ color: '#276ef1', fontWeight: 500 }}>Configure →</span>
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  {s.protocol === 'External_MCP' && onInspectServer && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onInspectServer(s);
+                      }}
+                      style={{
+                        background: '#1b382b',
+                        border: '1px solid #00e57544',
+                        color: '#00e575',
+                        fontSize: '11px',
+                        padding: '2px 7px',
+                        borderRadius: '4px',
+                        cursor: 'pointer',
+                        fontWeight: 600,
+                      }}
+                    >
+                      🔍 Inspect
+                    </button>
+                  )}
+                  <span style={{ color: '#276ef1', fontWeight: 500 }}>Configure →</span>
+                </div>
               </div>
             </div>
           );

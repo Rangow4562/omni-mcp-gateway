@@ -3532,11 +3532,13 @@ impl<'a> VmState<'a> {
             return Ok(JsonValue::Null);
         }
 
-        // 3. Explicit `mcp::call("server", "tool", args)`
-        if namespace == Some("mcp") && func == "call" {
+        // 3. Explicit `mcp::call("server", "tool", args)` or `call_tool("server", "tool", args)`
+        if (namespace == Some("mcp") && func == "call")
+            || (namespace.is_none() && (func == "call_tool" || func == "callTool"))
+        {
             if evaluated_args.len() < 2 {
                 return Err(CodeModeError::RuntimeError(
-                    "mcp::call requires (server_name, tool_name, [arguments])".to_string(),
+                    "call_tool requires (server_name, tool_name, [arguments])".to_string(),
                 ));
             }
             let srv = evaluated_args[0].as_str().unwrap_or("").to_string();
