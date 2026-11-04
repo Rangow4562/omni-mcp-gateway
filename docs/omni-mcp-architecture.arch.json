@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "Omni MCP Gateway v5.0 — Trust Boundary Reset & MCP 2026-07-28",
+    "title": "Omni MCP Gateway v5.5.0 — Unified External MCP Fleet",
     "locale": "en",
     "quality_profile": "showcase",
     "viewBox": [1260, 560],
@@ -16,8 +16,8 @@
       {
         "id": "registry",
         "label": "Registry and discovery",
-        "focus": ["crawler", "controlplane", "dataplane", "transport"],
-        "note": "See how IDL discovery becomes published routing for the data plane."
+        "focus": ["crawler", "controlplane", "dataplane", "mcpservers"],
+        "note": "See how IDL discovery and external fleet registration become published routing for the data plane."
       },
       {
         "id": "trust",
@@ -34,7 +34,8 @@
     { "id": "codemode", "type": "backend", "label": "Omni Code Mode", "sublabel": "~100 us AST sandbox", "pos": [500, 110], "size": [176, 92] },
     { "id": "dataplane", "type": "backend", "label": "Data plane", "sublabel": "route, guard, project", "pos": [764, 110], "size": [176, 92] },
     { "id": "downstream", "type": "external", "label": "Downstream services", "sublabel": "HTTP, gRPC, TChannel", "pos": [1050, 40], "size": [164, 72] },
-    { "id": "mcpservers", "type": "external", "label": "Native MCP servers", "sublabel": "MCPFx heartbeat", "pos": [1050, 240], "size": [164, 72] },
+    { "id": "mcpservers", "type": "external", "label": "External MCP fleet", "sublabel": "stdio + Streamable HTTP", "pos": [1050, 240], "size": [164, 72], "tag": "SSRF-guarded" },
+    { "id": "secrets", "type": "security", "label": "Secret resolver", "sublabel": "{env}/{file} refs only", "pos": [1050, 130], "size": [164, 64] },
     { "id": "crawler", "type": "backend", "label": "AutoCrawler", "sublabel": "OpenAPI, Protobuf, Thrift", "pos": [1050, 420], "size": [164, 80] },
     { "id": "controlplane", "type": "database", "label": "Control plane registry", "sublabel": "WAL + atomic snapshot", "pos": [764, 420], "size": [176, 80] },
     { "id": "audit", "type": "security", "label": "Merkle audit ledger", "sublabel": "SHA-256 chained", "pos": [500, 420], "size": [176, 80] }
@@ -48,7 +49,8 @@
     { "id": "transport-codemode", "from": "transport", "to": "codemode", "label": "tool script" },
     { "id": "codemode-dataplane", "from": "codemode", "to": "dataplane", "label": "governed call" },
     { "id": "dataplane-downstream", "from": "dataplane", "to": "downstream", "label": "wire translation" },
-    { "id": "dataplane-mcpservers", "from": "dataplane", "to": "mcpservers", "label": "MCP proxy" },
+    { "id": "dataplane-mcpservers", "from": "dataplane", "to": "mcpservers", "label": "fleet proxy" },
+    { "id": "secrets-mcpservers", "from": "secrets", "to": "mcpservers", "label": "refs at spawn", "variant": "dashed", "labelAt": [1132, 208] },
     { "id": "controlplane-dataplane", "from": "controlplane", "to": "dataplane", "label": "routing table" },
     { "id": "crawler-controlplane", "from": "crawler", "to": "controlplane", "label": "IDL discovery" },
     { "id": "codemode-audit", "from": "codemode", "to": "audit", "label": "Merkle chain", "variant": "dashed", "labelAt": [588, 315] }
@@ -56,6 +58,6 @@
   "cards": [
     { "dot": "cyan", "title": "Code Mode first", "items": ["Agents ship one procedural script instead of hundreds of schemas", "Static SSA analysis lifts independent calls into parallel waves", "Columnar pushdown filters 50k+ records without per-row objects"] },
     { "dot": "amber", "title": "Trust boundary reset", "items": ["Deny-by-default RBAC gates every /api/v1 route", "RFC 9728 Bearer metadata on 401 and 403 responses", "Requesters cannot self-approve; HMAC-SHA256 continuations"] },
-    { "dot": "violet", "title": "MCP 2026-07-28 parity", "items": ["resultType envelopes with deterministically sorted catalogs", "tasks/get and tasks/update resumable execution frames", "SSE /sse returns 410 Gone; Streamable HTTP is the default"] }
+    { "dot": "violet", "title": "Unified external fleet", "items": ["External stdio + Streamable HTTP servers inherit the full governance envelope", "Secrets use {env}/{file} refs only — raw credentials never persisted", "Provenance-aware rediscover queues upstream diffs for CAS approval"] }
   ]
 }

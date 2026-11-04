@@ -276,6 +276,10 @@ All gateway, discovery, and Code Mode error states map to compiler-checked const
   <img src="assets/architecture.svg" alt="Omni MCP Architecture" width="100%" />
 </p>
 
+> **Interactive diagram**: open [`docs/omni-mcp-architecture.html`](docs/omni-mcp-architecture.html) — a self-contained v5.5.0 map of the gateway with guided views for the request path, registry & discovery, and trust & containment.
+
+![Omni MCP Gateway v5.5.0 — Unified External MCP Fleet](assets/architecture-v5.5.0.png)
+
 ```
                     AI Agents / LLMs / Shell Coding Agents
                         │                         │
