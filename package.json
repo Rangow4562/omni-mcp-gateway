@@ -1,6 +1,6 @@
 {
   "name": "@rangow2260/omni-mcp",
-  "version": "5.5.0",
+  "version": "5.5.1",
   "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v5.5: Unified External MCP Fleet, stdio & Streamable HTTP upstream supervision, refs-only secret resolver, Okapi BM25 discovery, Code Mode TypeScript .d.ts generation, and Merkle audit trail.",
   "main": "bin/omni-mcp.js",
   "bin": {

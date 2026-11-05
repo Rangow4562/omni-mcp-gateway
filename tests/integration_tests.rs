@@ -3725,6 +3725,19 @@ fn test_v5_5_ac8_rbac_and_allowlist_enforcement() {
             "Role {} must be forbidden from /api/servers/toggle_status",
             role_name
         );
+
+        let (st5, _, _, _) = ctx.handle_http("DELETE", "/api/servers/external/srv", &h, b"");
+        assert_eq!(
+            st5, 403,
+            "Role {} must be forbidden from DELETE /api/servers/external/srv",
+            role_name
+        );
+        let (st6, _, _, _) = ctx.handle_http("DELETE", "/api/v1/servers/external/srv", &h, b"");
+        assert_eq!(
+            st6, 403,
+            "Role {} must be forbidden from DELETE /api/v1/servers/external/srv",
+            role_name
+        );
     }
 
     let mut admin_h = HashMap::new();
@@ -3901,4 +3914,333 @@ fn test_v5_5_ac9_supervision_stderr_flood_and_shutdown() {
     ctx.upstream_manager.shutdown_all();
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_remediation_security_privilege_escalation_and_url_decoding() {
+    let dir = temp_test_path("omni_remediation_sec_and_url_decoding");
+    let omni_bin = find_omni_binary();
+    let omni_bin_str = omni_bin.to_string_lossy().to_string();
+
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        stdio_allowlist: vec![omni_bin_str.clone()],
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut admin_h = HashMap::new();
+    admin_h.insert(
+        "authorization".to_string(),
+        "Bearer admin_dev_token".to_string(),
+    );
+    let mut agent_h = HashMap::new();
+    agent_h.insert(
+        "authorization".to_string(),
+        "Bearer agent_dev_token".to_string(),
+    );
+
+    // 1. Verify schema mismatch defensive fields: name/slug, display_name/displayName, owner_team/owningTeam, nested transport
+    let reg_body = json!({
+        "slug": "url-test",
+        "displayName": "URL Test Server",
+        "description": "Tests percent-decoding and DELETE authorization",
+        "owningTeam": "security-core",
+        "transport": {
+            "transport": "stdio",
+            "command": omni_bin_str.clone(),
+            "args": ["mcp", "mock-echo-mcp"]
+        }
+    });
+
+    let (st_reg, _, _, body_reg) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &reg_body.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        st_reg,
+        200,
+        "Registration failed: {}",
+        String::from_utf8_lossy(&body_reg)
+    );
+
+    // 2. Privilege Escalation Verification:
+    // DELETE /api/servers/external/:name (without /deregister)
+    // - Agent role MUST receive 403 Forbidden
+    let (st_del_agent, _, _, _) = ctx.handle_http(
+        "DELETE",
+        "/api/servers/external/external-mcp:url-test",
+        &agent_h,
+        b"",
+    );
+    assert_eq!(
+        st_del_agent, 403,
+        "Agent role must be strictly forbidden from DELETE /api/servers/external/:name"
+    );
+
+    let (st_del_agent_v1, _, _, _) =
+        ctx.handle_http("DELETE", "/api/v1/servers/external/url-test", &agent_h, b"");
+    assert_eq!(
+        st_del_agent_v1, 403,
+        "Agent role must be strictly forbidden from DELETE /api/v1/servers/external/:name"
+    );
+
+    // DELETE on /inspect route with Agent token must NOT be exempted (must return 403 Forbidden)
+    let (st_del_insp_agent, _, _, _) = ctx.handle_http(
+        "DELETE",
+        "/api/servers/external/url-test/inspect",
+        &agent_h,
+        b"",
+    );
+    assert_eq!(
+        st_del_insp_agent, 403,
+        "Agent role must be forbidden from DELETE /api/servers/external/:name/inspect"
+    );
+
+    // DELETE on /inspect or /rediscover with Admin token must return 404 Not Found (not valid delete target)
+    let (st_del_insp_admin, _, _, _) = ctx.handle_http(
+        "DELETE",
+        "/api/servers/external/url-test/inspect",
+        &admin_h,
+        b"",
+    );
+    assert_eq!(
+        st_del_insp_admin, 404,
+        "Admin role DELETE /inspect must return 404 Not Found"
+    );
+    let (st_del_redis_admin, _, _, _) = ctx.handle_http(
+        "DELETE",
+        "/api/servers/external/url-test/rediscover",
+        &admin_h,
+        b"",
+    );
+    assert_eq!(
+        st_del_redis_admin, 404,
+        "Admin role DELETE /rediscover must return 404 Not Found"
+    );
+
+    // 3. Percent-decoding verification with URL-encoded colon: external-mcp%3Aurl-test
+    // 3a. GET /api/servers/external-mcp%3Aurl-test
+    let (st_get, _, _, body_get) =
+        ctx.handle_http("GET", "/api/servers/external-mcp%3Aurl-test", &agent_h, &[]);
+    assert_eq!(
+        st_get,
+        200,
+        "GET /api/servers/external-mcp%3A<slug> must decode percent-encoded colons: {}",
+        String::from_utf8_lossy(&body_get)
+    );
+
+    // 3a-2. GET /api/servers/url-test (unprefixed slug resolution)
+    let (st_get_slug, _, _, body_get_slug) =
+        ctx.handle_http("GET", "/api/servers/url-test", &agent_h, &[]);
+    assert_eq!(
+        st_get_slug,
+        200,
+        "GET /api/servers/<slug> must resolve external-mcp:<slug> fallback: {}",
+        String::from_utf8_lossy(&body_get_slug)
+    );
+
+    // 3b. GET /api/servers/external/external-mcp%3Aurl-test/inspect
+    let (st_insp, _, _, body_insp) = ctx.handle_http(
+        "GET",
+        "/api/servers/external/external-mcp%3Aurl-test/inspect",
+        &agent_h,
+        &[],
+    );
+    assert_eq!(
+        st_insp,
+        200,
+        "GET inspect with external-mcp%3A<slug> must decode percent-encoded colon: {}",
+        String::from_utf8_lossy(&body_insp)
+    );
+
+    // 3c. POST /api/servers/external/external-mcp%3Aurl-test/rediscover
+    let (st_redis, _, _, body_redis) = ctx.handle_http(
+        "POST",
+        "/api/servers/external/external-mcp%3Aurl-test/rediscover",
+        &admin_h,
+        b"{}",
+    );
+    assert_eq!(
+        st_redis,
+        200,
+        "POST rediscover with external-mcp%3A<slug> must decode percent-encoded colon: {}",
+        String::from_utf8_lossy(&body_redis)
+    );
+
+    // Enable server and tool
+    let toggle_srv = json!({ "serverName": "external-mcp:url-test", "status": "ENABLED" });
+    ctx.handle_http(
+        "POST",
+        "/api/servers/toggle_status",
+        &admin_h,
+        &toggle_srv.to_string_compact().into_bytes(),
+    );
+    let toggle_tool = json!({ "serverName": "external-mcp:url-test", "toolName": "echo_nonce", "status": "ENABLED" });
+    ctx.handle_http(
+        "POST",
+        "/api/tools/toggle_status",
+        &admin_h,
+        &toggle_tool.to_string_compact().into_bytes(),
+    );
+
+    // 3d. POST /external-mcp%3Aurl-test/mcp
+    let mcp_call = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "echo_nonce",
+            "arguments": {"nonce": "percent_decode_ok"}
+        }
+    });
+    let (st_mcp, _, _, body_mcp) = ctx.handle_http(
+        "POST",
+        "/external-mcp%3Aurl-test/mcp",
+        &agent_h,
+        &mcp_call.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        st_mcp,
+        200,
+        "POST /:service/mcp with external-mcp%3A<slug> must succeed: {}",
+        String::from_utf8_lossy(&body_mcp)
+    );
+    let json_mcp = JsonValue::parse(&String::from_utf8(body_mcp).unwrap()).unwrap();
+    assert_eq!(
+        json_mcp["result"]["content"][0]["text"].as_str(),
+        Some("percent_decode_ok")
+    );
+
+    // 3d-2. POST /url-test/mcp (unprefixed slug resolution)
+    let (st_mcp_slug, _, _, body_mcp_slug) = ctx.handle_http(
+        "POST",
+        "/url-test/mcp",
+        &agent_h,
+        &mcp_call.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        st_mcp_slug,
+        200,
+        "POST /:service/mcp with <slug> fallback must succeed: {}",
+        String::from_utf8_lossy(&body_mcp_slug)
+    );
+
+    // 3e. DELETE /api/servers/external/external-mcp%3Aurl-test
+    // First, verify Agent still receives 403 on encoded identifier
+    let (st_del_enc_agent, _, _, _) = ctx.handle_http(
+        "DELETE",
+        "/api/servers/external/external-mcp%3Aurl-test",
+        &agent_h,
+        b"",
+    );
+    assert_eq!(
+        st_del_enc_agent, 403,
+        "Agent must receive 403 on encoded identifier"
+    );
+
+    // Next, Admin role MUST succeed with 200 OK
+    let (st_del_admin, _, _, body_del_admin) = ctx.handle_http(
+        "DELETE",
+        "/api/servers/external/external-mcp%3Aurl-test",
+        &admin_h,
+        b"",
+    );
+    assert_eq!(
+        st_del_admin,
+        200,
+        "Admin role must succeed with 200 OK on DELETE /api/servers/external/:name: {}",
+        String::from_utf8_lossy(&body_del_admin)
+    );
+    let del_json = JsonValue::parse(&String::from_utf8(body_del_admin).unwrap()).unwrap();
+    assert_eq!(del_json["success"].as_bool(), Some(true));
+
+    // Server must be gone from registry
+    assert!(ctx.registry.get_server("external-mcp:url-test").is_none());
+
+    // 4. Test flat and legacy registration payloads
+    let flat_reg = json!({
+        "name": "flat-test",
+        "transport": "stdio",
+        "command": omni_bin_str.clone(),
+        "args": ["mcp", "mock-echo-mcp"]
+    });
+    let (st_flat, _, _, body_flat) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &flat_reg.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        st_flat,
+        200,
+        "Flat payload registration failed: {}",
+        String::from_utf8_lossy(&body_flat)
+    );
+    assert!(ctx.registry.get_server("external-mcp:flat-test").is_some());
+
+    let legacy_reg = json!({
+        "slug": "legacy-test",
+        "displayName": "Legacy Echo",
+        "owningTeam": "legacy-team",
+        "transport": "stdio",
+        "stdio": {
+            "command": omni_bin_str,
+            "args": ["mcp", "mock-echo-mcp"]
+        }
+    });
+    let (st_legacy, _, _, body_legacy) = ctx.handle_http(
+        "POST",
+        "/api/v1/servers/external/register",
+        &admin_h,
+        &legacy_reg.to_string_compact().into_bytes(),
+    );
+    assert_eq!(
+        st_legacy,
+        200,
+        "Legacy UI payload registration failed: {}",
+        String::from_utf8_lossy(&body_legacy)
+    );
+    assert!(ctx
+        .registry
+        .get_server("external-mcp:legacy-test")
+        .is_some());
+
+    ctx.upstream_manager.shutdown_all();
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_percent_decode_unit() {
+    assert_eq!(
+        omni_mcp::server::percent_decode("external-mcp%3Atest"),
+        "external-mcp:test"
+    );
+    assert_eq!(
+        omni_mcp::server::percent_decode("hello%20world"),
+        "hello world"
+    );
+    assert_eq!(
+        omni_mcp::server::percent_decode("no_encoding_here"),
+        "no_encoding_here"
+    );
+    assert_eq!(omni_mcp::server::percent_decode("trailing%"), "trailing%");
+    assert_eq!(omni_mcp::server::percent_decode("invalid%zz"), "invalid%zz");
+    assert_eq!(
+        omni_mcp::server::percent_decode("case%3a%3Atest"),
+        "case::test"
+    );
+    assert_eq!(omni_mcp::server::percent_decode("%C3%BCber"), "\u{00fc}ber");
+    assert_eq!(omni_mcp::server::percent_decode(""), "");
+    assert_eq!(
+        omni_mcp::server::percent_decode("%FF%FE"),
+        "\u{fffd}\u{fffd}"
+    );
+    assert_eq!(omni_mcp::server::percent_decode("foo%2Fbar"), "foo/bar");
+    assert_eq!(omni_mcp::server::percent_decode("%%%"), "%%%");
+    assert_eq!(omni_mcp::server::percent_decode("test%1"), "test%1");
+    assert_eq!(omni_mcp::server::percent_decode("%E2%9C%93"), "\u{2713}");
 }

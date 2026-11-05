@@ -106,14 +106,7 @@ export const RegisterExternalServerModal: React.FC<RegisterExternalServerModalPr
 
     setSubmitting(true);
     try {
-      let payload: any = {
-        slug: cleanSlug,
-        displayName: displayName.trim() || cleanSlug,
-        description: description.trim(),
-        owningTeam: owningTeam.trim() || 'engineering',
-        transport,
-      };
-
+      let transportConfig: any;
       if (transport === 'stdio') {
         const args = argsStr
           .split('\n')
@@ -125,7 +118,8 @@ export const RegisterExternalServerModal: React.FC<RegisterExternalServerModalPr
             env_refs[r.key.trim()] = r.ref.trim();
           }
         }
-        payload.stdio = {
+        transportConfig = {
+          transport: 'stdio',
           command: command.trim(),
           args,
           cwd: cwd.trim() || null,
@@ -138,13 +132,25 @@ export const RegisterExternalServerModal: React.FC<RegisterExternalServerModalPr
             header_refs[h.key.trim()] = h.ref.trim();
           }
         }
-        payload.streamable_http = {
+        transportConfig = {
+          transport: 'streamable_http',
           url: url.trim(),
           session_mode: sessionMode,
           bearer_ref: bearerRef.trim() || null,
           header_refs,
         };
       }
+
+      const payload = {
+        name: cleanSlug,
+        slug: cleanSlug,
+        display_name: displayName.trim() || cleanSlug,
+        displayName: displayName.trim() || cleanSlug,
+        description: description.trim(),
+        owner_team: owningTeam.trim() || 'engineering',
+        owningTeam: owningTeam.trim() || 'engineering',
+        transport: transportConfig,
+      };
 
       await apiFetch('/api/v1/servers/external/register', {
         method: 'POST',

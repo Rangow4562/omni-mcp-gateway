@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::RwLock;
 
 /// Pure standard library SHA-256 implementation (FIPS 180-4 compliant).
+#[allow(unknown_lints)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn sha256(input: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [

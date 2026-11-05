@@ -119,6 +119,29 @@ pub struct AuthPrincipal {
     pub role: AuthRole,
 }
 
+/// Pure zero-dependency URL percent-decode helper function.
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = bytes[i + 1];
+            let h2 = bytes[i + 2];
+            let d1 = (h1 as char).to_digit(16);
+            let d2 = (h2 as char).to_digit(16);
+            if let (Some(v1), Some(v2)) = (d1, d2) {
+                out.push(((v1 << 4) | v2) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn is_local_origin(origin: &str) -> bool {
     let rest = if let Some(r) = origin.strip_prefix("http://") {
         r
@@ -496,26 +519,17 @@ impl ProductionGatewayContext {
             && !method.eq_ignore_ascii_case("OPTIONS")
         {
             let required_role = match path {
-                "/api/servers/external/register" | "/api/v1/servers/external/register" => {
-                    AuthRole::Admin
-                }
                 _ if (path.starts_with("/api/servers/external/")
                     || path.starts_with("/api/v1/servers/external/"))
-                    && path.ends_with("/deregister") =>
-                {
-                    AuthRole::Admin
-                }
-                _ if (path.starts_with("/api/servers/external/")
-                    || path.starts_with("/api/v1/servers/external/"))
-                    && path.ends_with("/rediscover") =>
-                {
-                    AuthRole::Admin
-                }
-                _ if (path.starts_with("/api/servers/external/")
-                    || path.starts_with("/api/v1/servers/external/"))
-                    && path.ends_with("/inspect") =>
+                    && path.ends_with("/inspect")
+                    && method.eq_ignore_ascii_case("GET") =>
                 {
                     AuthRole::Agent
+                }
+                _ if path.starts_with("/api/servers/external/")
+                    || path.starts_with("/api/v1/servers/external/") =>
+                {
+                    AuthRole::Admin
                 }
                 "/api/servers/toggle_status"
                 | "/api/tools/toggle_status"
@@ -858,10 +872,11 @@ impl ProductionGatewayContext {
                     .or_else(|| path.strip_prefix("/api/v1/servers/external/"))
                     .unwrap();
                 let raw_name = name_part.strip_suffix("/inspect").unwrap_or(name_part).trim();
+                let raw_name = percent_decode(raw_name);
                 let server_name = if raw_name.starts_with("external-mcp:")
-                    || self.registry.get_server(raw_name).is_some()
+                    || self.registry.get_server(&raw_name).is_some()
                 {
-                    raw_name.to_string()
+                    raw_name
                 } else {
                     format!("external-mcp:{}", raw_name)
                 };
@@ -882,8 +897,16 @@ impl ProductionGatewayContext {
                 }
             }
             _ if path.starts_with("/api/servers/") => {
-                let server_name = path.trim_start_matches("/api/servers/").trim();
-                let server = match self.registry.get_server(server_name) {
+                let raw_name = path.trim_start_matches("/api/servers/").trim();
+                let server_name = percent_decode(raw_name);
+                let server = self.registry.get_server(&server_name).or_else(|| {
+                    if !server_name.starts_with("external-mcp:") {
+                        self.registry.get_server(&format!("external-mcp:{}", server_name))
+                    } else {
+                        None
+                    }
+                });
+                let server = match server {
                     Some(s) => s,
                     None => {
                         return self.json_response(
@@ -1033,8 +1056,15 @@ impl ProductionGatewayContext {
             _ if path.ends_with("/mcp") => {
                 let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
                 if parts.len() == 2 && parts[1] == "mcp" {
-                    let service_name = parts[0];
-                    if let Some(srv) = self.registry.get_server(service_name) {
+                    let service_name = percent_decode(parts[0]);
+                    let srv = self.registry.get_server(&service_name).or_else(|| {
+                        if !service_name.starts_with("external-mcp:") {
+                            self.registry.get_server(&format!("external-mcp:{}", service_name))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(srv) = srv {
                         return self.json_response(
                             200,
                             json!({
@@ -1147,8 +1177,12 @@ impl ProductionGatewayContext {
         path: &str,
         _headers: &HashMap<String, String>,
     ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
-        if path.starts_with("/api/servers/external/")
-            || path.starts_with("/api/v1/servers/external/")
+        if (path.starts_with("/api/servers/external/")
+            || path.starts_with("/api/v1/servers/external/"))
+            && !path.ends_with("/inspect")
+            && !path.ends_with("/rediscover")
+            && path != "/api/servers/external/register"
+            && path != "/api/v1/servers/external/register"
         {
             let name_part = path
                 .strip_prefix("/api/servers/external/")
@@ -1158,10 +1192,14 @@ impl ProductionGatewayContext {
                 .strip_suffix("/deregister")
                 .unwrap_or(name_part)
                 .trim();
+            if raw_name.is_empty() {
+                return self.json_response(400, json!({"error": "Server name is required"}));
+            }
+            let raw_name = percent_decode(raw_name);
             let server_name = if raw_name.starts_with("external-mcp:")
-                || self.registry.get_server(raw_name).is_some()
+                || self.registry.get_server(&raw_name).is_some()
             {
-                raw_name.to_string()
+                raw_name
             } else {
                 format!("external-mcp:{}", raw_name)
             };
@@ -1250,7 +1288,20 @@ impl ProductionGatewayContext {
         if path.ends_with("/mcp") && path != "/omni/mcp" {
             let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
             if parts.len() == 2 && parts[1] == "mcp" {
-                let service_name = parts[0];
+                let service_name = percent_decode(parts[0]);
+                let service_name = if self.cache.get_server_arc(&service_name).is_some()
+                    || service_name.starts_with("external-mcp:")
+                {
+                    service_name
+                } else if self
+                    .cache
+                    .get_server_arc(&format!("external-mcp:{}", service_name))
+                    .is_some()
+                {
+                    format!("external-mcp:{}", service_name)
+                } else {
+                    service_name
+                };
                 let json_val = match parsed_body {
                     Ok(v) => v,
                     Err(e) => {
@@ -1310,7 +1361,7 @@ impl ProductionGatewayContext {
                 match RPCBatchOrSingle::from_json(&json_val) {
                     Ok(batch_or_single) => {
                         let resp_json = self.gateway.handle_batch_or_single_with_trace(
-                            service_name,
+                            &service_name,
                             batch_or_single,
                             actor,
                             Some(token),
@@ -1431,9 +1482,12 @@ impl ProductionGatewayContext {
             "/api/servers/external/register" | "/api/v1/servers/external/register" => {
                 let raw_name = body
                     .get("name")
+                    .or_else(|| body.get("slug"))
                     .and_then(|x| x.as_str())
                     .unwrap_or("")
                     .trim();
+                let raw_name = percent_decode(raw_name);
+                let raw_name = raw_name.trim();
                 if raw_name.is_empty() {
                     return self.json_response(400, json!({"error": "Field 'name' is required"}));
                 }
@@ -1458,6 +1512,7 @@ impl ProductionGatewayContext {
 
                 let display_name = body
                     .get("display_name")
+                    .or_else(|| body.get("displayName"))
                     .and_then(|x| x.as_str())
                     .unwrap_or(raw_name);
                 let description = body
@@ -1466,22 +1521,40 @@ impl ProductionGatewayContext {
                     .unwrap_or("");
                 let owner_team = body
                     .get("owner_team")
+                    .or_else(|| body.get("owningTeam"))
                     .and_then(|x| x.as_str())
                     .unwrap_or("platform");
 
-                let transport_val = match body.get("transport") {
-                    Some(v) => v,
-                    None => {
+                let (transport_type, transport_val) = match body.get("transport") {
+                    Some(v) if v.is_object() => {
+                        let tt = v
+                            .get("transport")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        (tt, v.clone())
+                    }
+                    Some(v) if v.is_string() => {
+                        let tt = v.as_str().unwrap_or("").to_string();
+                        let mut cfg = if let Some(sub) = body.get(&tt).and_then(|x| x.as_object()) {
+                            let mut map = body.clone();
+                            for (k, val) in sub {
+                                map.insert(k.clone(), val.clone());
+                            }
+                            map
+                        } else {
+                            body.clone()
+                        };
+                        cfg.insert("transport", tt.clone());
+                        (tt, cfg)
+                    }
+                    _ => {
                         return self
                             .json_response(400, json!({"error": "Field 'transport' is required"}))
                     }
                 };
 
-                let transport_type = transport_val
-                    .get("transport")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                let transport_config = match transport_type {
+                let transport_config = match transport_type.as_str() {
                     "stdio" => {
                         let command = match transport_val.get("command").and_then(|x| x.as_str()) {
                             Some(c) if !c.trim().is_empty() => c.trim().to_string(),
@@ -1633,10 +1706,11 @@ impl ProductionGatewayContext {
                     .strip_suffix("/rediscover")
                     .unwrap_or(name_part)
                     .trim();
+                let raw_name = percent_decode(raw_name);
                 let server_name = if raw_name.starts_with("external-mcp:")
-                    || self.registry.get_server(raw_name).is_some()
+                    || self.registry.get_server(&raw_name).is_some()
                 {
-                    raw_name.to_string()
+                    raw_name
                 } else {
                     format!("external-mcp:{}", raw_name)
                 };
@@ -1717,10 +1791,11 @@ impl ProductionGatewayContext {
                     .strip_suffix("/deregister")
                     .unwrap_or(name_part)
                     .trim();
+                let raw_name = percent_decode(raw_name);
                 let server_name = if raw_name.starts_with("external-mcp:")
-                    || self.registry.get_server(raw_name).is_some()
+                    || self.registry.get_server(&raw_name).is_some()
                 {
-                    raw_name.to_string()
+                    raw_name
                 } else {
                     format!("external-mcp:{}", raw_name)
                 };
@@ -1741,15 +1816,20 @@ impl ProductionGatewayContext {
                     .get("serverName")
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
+                let decoded_s_name = percent_decode(s_name);
                 let t_name = body.get("toolName").and_then(|x| x.as_str()).unwrap_or("");
                 let status_str = body
                     .get("status")
                     .and_then(|x| x.as_str())
                     .unwrap_or("ENABLED");
                 let new_status = ToolStatus::from_str(status_str);
-                let ok = self.registry.toggle_tool_status(s_name, t_name, new_status);
+                let ok = self
+                    .registry
+                    .toggle_tool_status(&decoded_s_name, t_name, new_status);
                 self.cache.refresh_now();
-                self.gateway.semantic_cache.invalidate_service(s_name);
+                self.gateway
+                    .semantic_cache
+                    .invalidate_service(&decoded_s_name);
                 self.json_response(200, json!({"success": ok}))
             }
             "/api/servers/toggle_status" => {
@@ -1757,12 +1837,15 @@ impl ProductionGatewayContext {
                     .get("serverName")
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
+                let decoded_s_name = percent_decode(s_name);
                 let status_str = body
                     .get("status")
                     .and_then(|x| x.as_str())
                     .unwrap_or("ENABLED");
                 let new_status = ToolStatus::from_str(status_str);
-                let ok = self.registry.toggle_server_status(s_name, new_status);
+                let ok = self
+                    .registry
+                    .toggle_server_status(&decoded_s_name, new_status);
                 self.cache.refresh_now();
                 self.json_response(200, json!({"success": ok}))
             }

@@ -112,7 +112,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: release-assets/*
-          body_path: docs/RELEASE_v5.0.0.md
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
