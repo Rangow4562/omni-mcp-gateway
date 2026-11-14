@@ -1,6 +1,6 @@
 <div align="center">
 
-<img alt="OmniMCP: Enterprise MCP Fleet, Tool Groups & Code Mode Gateway. Works with Claude, Codex, Cursor, Antigravity and any MCP client." src="assets/banner.png" width="100%">
+<img alt="OmniMCP: Enterprise MCP Fleet, Tool Groups & Code Mode Gateway. Works with Claude, Codex, Cursor, Antigravity and any MCP client." src="assets/banner.gif" width="100%">
 
 <p>
   <a href="https://github.com/Rangow4562/omni-mcp-gateway/stargazers"><img src="https://img.shields.io/github/stars/Rangow4562/omni-mcp-gateway?style=social" alt="GitHub stars"></a>
