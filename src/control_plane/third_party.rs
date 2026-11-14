@@ -1,5 +1,6 @@
 //! Third-Party Authentication & Token Exchange Service (Jira, Google, GitHub, Slack).
 
+#[cfg(any(feature = "testing-mocks", test))]
 use crate::logging::now_epoch_millis;
 use crate::models::{ProtocolType, ServerRecord, ToolRecord, ToolStatus};
 use std::collections::{BTreeMap, HashMap};
@@ -40,6 +41,28 @@ impl ThirdPartyAuthExchange {
                 }
             }
         }
+
+        // Check environment-configured provider token: OMNI_3P_TOKEN_<PROVIDER>
+        let env_key = format!("OMNI_3P_TOKEN_{}", provider_lc.to_uppercase());
+        if let Ok(tok) = std::env::var(&env_key) {
+            if !tok.is_empty() {
+                return Some(tok);
+            }
+        }
+
+        // RFC 8693 OAuth 2.0 Token Exchange against configured endpoint
+        if let Ok(endpoint) = std::env::var("OMNI_3P_TOKEN_ENDPOINT") {
+            if !endpoint.is_empty() {
+                if let Some(exchanged) =
+                    self.perform_rfc8693_exchange(&endpoint, internal_user_token, &provider_lc)
+                {
+                    self.register_user_token(internal_user_token, &provider_lc, &exchanged);
+                    return Some(exchanged);
+                }
+            }
+        }
+
+        #[cfg(any(feature = "testing-mocks", test))]
         if internal_user_token.starts_with("demo_token_")
             || internal_user_token.starts_with("uber_token_")
             || internal_user_token.starts_with("emp_")
@@ -50,7 +73,33 @@ impl ThirdPartyAuthExchange {
                 now_epoch_millis()
             ));
         }
+
         None
+    }
+
+    fn perform_rfc8693_exchange(
+        &self,
+        endpoint: &str,
+        subject_token: &str,
+        provider: &str,
+    ) -> Option<String> {
+        let client = crate::data_plane::HttpDownstreamClient::new();
+        let payload = json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": subject_token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "audience": provider
+        });
+        let resp = client
+            .post_json(endpoint, payload.to_string_compact().as_bytes(), None)
+            .ok()?;
+        let resp_str = std::str::from_utf8(&resp).ok()?;
+        let parsed = crate::json::JsonValue::parse(resp_str).ok()?;
+        parsed
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
     }
 
     pub fn create_third_party_server(

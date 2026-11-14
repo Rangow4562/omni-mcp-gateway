@@ -2,6 +2,32 @@
 
 All notable changes to Omni MCP. Per-release narrative notes live in [`docs/`](docs/).
 
+## [6.0.0] - 2026-11-13
+
+### Added
+- **Feature-Gated Hybrid Runtime (`Cargo.toml`)**:
+  - Added `os-csprng` (`getrandom`) in default features for OS CSPRNG entropy in `gather_entropy()`.
+  - Added optional `tls-rustls` (`rustls` + `webpki-roots`) for native HTTPS upstream/downstream TLS without breaking cross-compilation.
+  - Gated synthetic 3P demo token minting behind `#[cfg(any(feature = "testing-mocks", test))]` and added RFC 8693 OAuth token exchange (`OMNI_3P_TOKEN_ENDPOINT`).
+- **Storage & Audit v2**:
+  - Pluggable `RegistryStorageBackend` trait in `src/storage/wal_store.rs` with `ToolGroupRecord` WAL & snapshot persistence.
+  - Bounded `VecDeque` sliding-window Merkle audit log with automatic segment rotation and HMAC-SHA256 signed `.ckpt` checkpoints verified by `verify_chain()`.
+- **Full MCP Aggregation & Tool Groups**:
+  - Virtual Tool Groups (`/api/v1/groups`, `POST /groups/<slug>/mcp`).
+  - External `resources/*` (`ext://<slug>/<uri>`) and `prompts/*` (`<slug>:<prompt>`) aggregation in `OmniMCPServer`.
+  - Concurrent ID-multiplexed stdio reader (`src/upstream/stdio.rs`) with per-tool `timeout_ms`.
+  - Streamable HTTP SSE (`text/event-stream`) client response parsing and `Last-Event-ID` tracking (`src/upstream/http.rs`).
+  - Opt-in background `AutoSyncScheduler` when `sync_interval_sec` is set.
+- **Auth & Live Events**:
+  - HS256 JWT validation with `exp`, `nbf`, `iss`, and RFC 8707 `aud` checks (`OMNI_JWT_SECRET`).
+  - `GET /api/v1/events` SSE endpoint and CIMD metadata in `/.well-known/oauth-protected-resource`.
+- **Code Mode v2 & Modularization**:
+  - Split monolithic `codemode.rs` into `src/data_plane/codemode/{mod,typegen,parser,parallelizer,columnar,vm,tests}.rs`.
+  - Recursive `$ref`/`$defs`, `enum`, `oneOf`/`anyOf`, typed arrays, and JSDoc comments in `CodeModeTypeGenerator`.
+  - `try/catch/finally`, `throw`, object/array destructuring, template literals, and `Promise.all` parallel batching in the Code Mode VM.
+- **CLI Onboarding**:
+  - `omni import <mcp.json>` (converting plaintext `env` secrets to `{env:KEY}` refs) and `omni migrate --to-v6`.
+
 ## [5.0.0] - 2026-11-01
 
 ### Added

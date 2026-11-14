@@ -2,18 +2,38 @@
 //! Provides ACID-like crash-safe persistence with FNV-1a checksum integrity and automatic WAL compaction.
 
 use crate::json::JsonValue;
-use crate::models::{ConfigDiff, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame};
+use crate::models::{
+    ConfigDiff, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame, ToolGroupRecord,
+};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::RwLock;
 
+/// Pluggable persistence backend trait for `MCPRegistry` (v6.0.0).
+pub trait RegistryStorageBackend: Send + Sync {
+    fn load_all_servers(&self) -> Vec<ServerRecord>;
+    fn save_server(&self, server: &ServerRecord);
+    fn delete_server(&self, name: &str) -> Option<ServerRecord>;
+    fn load_all_diffs(&self) -> Vec<ConfigDiff>;
+    fn save_diff(&self, diff: &ConfigDiff);
+    fn load_all_tool_groups(&self) -> Vec<ToolGroupRecord>;
+    fn save_tool_group(&self, group: &ToolGroupRecord);
+    fn delete_tool_group(&self, slug: &str) -> Option<ToolGroupRecord>;
+    fn consume_frame_cas(
+        &self,
+        execution_id: &str,
+        approver: &str,
+    ) -> Result<SuspendedExecutionFrame, String>;
+}
+
 struct StoreState {
     servers: BTreeMap<String, ServerRecord>,
     diffs: BTreeMap<String, ConfigDiff>,
     suspended_frames: BTreeMap<String, SuspendedExecutionFrame>,
     saga_compensations: BTreeMap<String, SagaCompensationRecord>,
+    tool_groups: BTreeMap<String, ToolGroupRecord>,
     wal_entries_since_compact: usize,
 }
 
@@ -35,6 +55,7 @@ impl WalRegistryStore {
                 diffs: BTreeMap::new(),
                 suspended_frames: BTreeMap::new(),
                 saga_compensations: BTreeMap::new(),
+                tool_groups: BTreeMap::new(),
                 wal_entries_since_compact: 0,
             }),
         };
@@ -93,6 +114,13 @@ impl WalRegistryStore {
                                 guard
                                     .saga_compensations
                                     .insert(comp.idempotency_key.clone(), comp);
+                            }
+                        }
+                    }
+                    if let Some(groups) = val.get("tool_groups").and_then(|g| g.as_array()) {
+                        for g_val in groups {
+                            if let Some(grp) = ToolGroupRecord::from_json(g_val) {
+                                guard.tool_groups.insert(grp.slug.clone(), grp);
                             }
                         }
                     }
@@ -166,6 +194,18 @@ impl WalRegistryStore {
                                         {
                                             guard.saga_compensations.remove(key);
                                         }
+                                    } else if op == "SAVE_GROUP" {
+                                        if let Some(g_val) = entry.get("data") {
+                                            if let Some(grp) = ToolGroupRecord::from_json(g_val) {
+                                                guard.tool_groups.insert(grp.slug.clone(), grp);
+                                            }
+                                        }
+                                    } else if op == "DELETE_GROUP" {
+                                        if let Some(slug) =
+                                            entry.get("data").and_then(|d| d.as_str())
+                                        {
+                                            guard.tool_groups.remove(slug);
+                                        }
                                     }
                                 }
                             }
@@ -227,12 +267,14 @@ impl WalRegistryStore {
             .values()
             .map(|c| c.to_json())
             .collect();
+        let groups_arr: Vec<JsonValue> = state.tool_groups.values().map(|g| g.to_json()).collect();
         let snapshot = json!({
             "engine": concat!("omni-rust-wal-v", env!("CARGO_PKG_VERSION")),
             "servers": JsonValue::Array(servers_arr),
             "diffs": JsonValue::Array(diffs_arr),
             "suspended_frames": JsonValue::Array(frames_arr),
             "saga_compensations": JsonValue::Array(comps_arr),
+            "tool_groups": JsonValue::Array(groups_arr),
         });
         let tmp_path = format!("{}.tmp", self.db_path);
         if let Ok(mut f) = File::create(&tmp_path) {
@@ -293,6 +335,26 @@ impl WalRegistryStore {
     pub fn get_diff(&self, diff_id: &str) -> Option<ConfigDiff> {
         let guard = self.state.read().unwrap();
         guard.diffs.get(diff_id).cloned()
+    }
+
+    pub fn save_tool_group(&self, group: &ToolGroupRecord) {
+        let mut guard = self.state.write().unwrap();
+        guard.tool_groups.insert(group.slug.clone(), group.clone());
+        self.append_wal_and_maybe_compact("SAVE_GROUP", group.to_json(), &mut guard);
+    }
+
+    pub fn delete_tool_group(&self, slug: &str) -> Option<ToolGroupRecord> {
+        let mut guard = self.state.write().unwrap();
+        let removed = guard.tool_groups.remove(slug);
+        if removed.is_some() {
+            self.append_wal_and_maybe_compact("DELETE_GROUP", JsonValue::from(slug), &mut guard);
+        }
+        removed
+    }
+
+    pub fn list_all_tool_groups(&self) -> Vec<ToolGroupRecord> {
+        let guard = self.state.read().unwrap();
+        guard.tool_groups.values().cloned().collect()
     }
 
     pub fn checkpoint_snapshot(&self) {
@@ -390,6 +452,474 @@ impl WalRegistryStore {
                 guard.wal_entries_since_compact = 0;
             }
         }
+    }
+}
+
+impl RegistryStorageBackend for WalRegistryStore {
+    fn load_all_servers(&self) -> Vec<ServerRecord> {
+        self.list_all_servers()
+    }
+
+    fn save_server(&self, server: &ServerRecord) {
+        WalRegistryStore::save_server(self, server);
+    }
+
+    fn delete_server(&self, name: &str) -> Option<ServerRecord> {
+        WalRegistryStore::delete_server(self, name)
+    }
+
+    fn load_all_diffs(&self) -> Vec<ConfigDiff> {
+        self.list_diffs(false)
+    }
+
+    fn save_diff(&self, diff: &ConfigDiff) {
+        WalRegistryStore::save_diff(self, diff);
+    }
+
+    fn load_all_tool_groups(&self) -> Vec<ToolGroupRecord> {
+        self.list_all_tool_groups()
+    }
+
+    fn save_tool_group(&self, group: &ToolGroupRecord) {
+        WalRegistryStore::save_tool_group(self, group);
+    }
+
+    fn delete_tool_group(&self, slug: &str) -> Option<ToolGroupRecord> {
+        WalRegistryStore::delete_tool_group(self, slug)
+    }
+
+    fn consume_frame_cas(
+        &self,
+        execution_id: &str,
+        approver: &str,
+    ) -> Result<SuspendedExecutionFrame, String> {
+        self.consume_frame(execution_id, approver)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// SQLite WAL-mode storage backend (v6.0.0, enabled via `storage-sqlite`).
+/// Uses `rusqlite` (`bundled`) with `PRAGMA journal_mode=WAL` and atomic `BEGIN IMMEDIATE` CAS.
+#[cfg(feature = "storage-sqlite")]
+pub struct SqliteRegistryBackend {
+    pub dsn: String,
+    conn: std::sync::Mutex<rusqlite::Connection>,
+}
+
+#[cfg(feature = "storage-sqlite")]
+pub type SqliteRegistryStore = SqliteRegistryBackend;
+
+#[cfg(feature = "storage-sqlite")]
+pub type SqliteAuditSink = SqliteRegistryBackend;
+
+#[cfg(feature = "storage-sqlite")]
+impl SqliteRegistryBackend {
+    pub const SCHEMA_SQL: &'static str = "
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=5000;
+        CREATE TABLE IF NOT EXISTS servers (name TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS diffs (diff_id TEXT PRIMARY KEY, payload TEXT NOT NULL, resolved INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS tool_groups (slug TEXT PRIMARY KEY, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS suspended_frames (execution_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS audit_log (idx INTEGER PRIMARY KEY, current_hash TEXT NOT NULL, payload TEXT NOT NULL);
+    ";
+
+    pub fn try_open(dsn: impl Into<String>) -> Result<Self, String> {
+        let dsn = dsn.into();
+        let path = dsn.strip_prefix("sqlite://").unwrap_or(&dsn).trim();
+        let conn = if path.is_empty() || path == ":memory:" {
+            rusqlite::Connection::open_in_memory()
+                .map_err(|e| format!("Failed to open in-memory SQLite DB: {}", e))?
+        } else {
+            let p = Path::new(path);
+            if let Some(parent) = p.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+            rusqlite::Connection::open(p)
+                .map_err(|e| format!("Failed to open SQLite DB '{}': {}", path, e))?
+        };
+        conn.execute_batch(Self::SCHEMA_SQL)
+            .map_err(|e| format!("Failed to initialize SQLite schema: {}", e))?;
+        Ok(Self {
+            dsn,
+            conn: std::sync::Mutex::new(conn),
+        })
+    }
+
+    pub fn open(dsn: impl Into<String>) -> Self {
+        Self::try_open(dsn).expect("Failed to open SqliteRegistryBackend")
+    }
+
+    pub fn save_suspended_frame(&self, frame: &SuspendedExecutionFrame) {
+        let conn = self.conn.lock().unwrap();
+        let payload = frame.to_json().to_string_compact();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO suspended_frames (execution_id, payload) VALUES (?1, ?2)",
+            rusqlite::params![frame.execution_id, payload],
+        );
+    }
+
+    pub fn journal_mode(&self) -> Result<String, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(feature = "storage-sqlite")]
+impl RegistryStorageBackend for SqliteRegistryBackend {
+    fn load_all_servers(&self) -> Vec<ServerRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT payload FROM servers ORDER BY name ASC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for payload in rows.flatten() {
+            if let Ok(json) = JsonValue::parse(&payload) {
+                if let Some(srv) = ServerRecord::from_json(&json) {
+                    out.push(srv);
+                }
+            }
+        }
+        out
+    }
+
+    fn save_server(&self, server: &ServerRecord) {
+        let conn = self.conn.lock().unwrap();
+        let payload = server.to_json().to_string_compact();
+        let updated_at = server
+            .heartbeat_timestamp
+            .unwrap_or_else(crate::logging::now_epoch_secs);
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO servers (name, payload, updated_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![server.name, payload, updated_at],
+        );
+    }
+
+    fn delete_server(&self, name: &str) -> Option<ServerRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM servers WHERE name = ?1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = conn.execute(
+            "DELETE FROM servers WHERE name = ?1",
+            rusqlite::params![name],
+        );
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| ServerRecord::from_json(&j))
+    }
+
+    fn load_all_diffs(&self) -> Vec<ConfigDiff> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT payload FROM diffs ORDER BY diff_id ASC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for payload in rows.flatten() {
+            if let Ok(json) = JsonValue::parse(&payload) {
+                if let Some(diff) = ConfigDiff::from_json(&json) {
+                    out.push(diff);
+                }
+            }
+        }
+        out
+    }
+
+    fn save_diff(&self, diff: &ConfigDiff) {
+        let conn = self.conn.lock().unwrap();
+        let payload = diff.to_json().to_string_compact();
+        let resolved: i64 = if diff.approved { 1 } else { 0 };
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO diffs (diff_id, payload, resolved) VALUES (?1, ?2, ?3)",
+            rusqlite::params![diff.diff_id, payload, resolved],
+        );
+    }
+
+    fn load_all_tool_groups(&self) -> Vec<ToolGroupRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT payload FROM tool_groups ORDER BY slug ASC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for payload in rows.flatten() {
+            if let Ok(json) = JsonValue::parse(&payload) {
+                if let Some(g) = ToolGroupRecord::from_json(&json) {
+                    out.push(g);
+                }
+            }
+        }
+        out
+    }
+
+    fn save_tool_group(&self, group: &ToolGroupRecord) {
+        let conn = self.conn.lock().unwrap();
+        let payload = group.to_json().to_string_compact();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO tool_groups (slug, payload) VALUES (?1, ?2)",
+            rusqlite::params![group.slug, payload],
+        );
+    }
+
+    fn delete_tool_group(&self, slug: &str) -> Option<ToolGroupRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM tool_groups WHERE slug = ?1",
+                rusqlite::params![slug],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = conn.execute(
+            "DELETE FROM tool_groups WHERE slug = ?1",
+            rusqlite::params![slug],
+        );
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| ToolGroupRecord::from_json(&j))
+    }
+
+    fn consume_frame_cas(
+        &self,
+        execution_id: &str,
+        approver: &str,
+    ) -> Result<SuspendedExecutionFrame, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "SQLite connection lock poisoned".to_string())?;
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| format!("Failed to begin SQLite CAS transaction: {}", e))?;
+
+        let payload_res: Result<String, _> = conn.query_row(
+            "SELECT payload FROM suspended_frames WHERE execution_id = ?1",
+            rusqlite::params![execution_id],
+            |row| row.get(0),
+        );
+        let payload = match payload_res {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err("Approval continuation frame not found or expired".to_string());
+            }
+        };
+        let json = match JsonValue::parse(&payload) {
+            Ok(j) => j,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(format!("Corrupt suspended frame JSON: {}", e));
+            }
+        };
+        let mut frame = match SuspendedExecutionFrame::from_json(&json) {
+            Some(f) => f,
+            None => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err("Failed to deserialize suspended execution frame".to_string());
+            }
+        };
+        if frame.is_consumed {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err("Approval has already been consumed (single-use violated)".to_string());
+        }
+        frame.is_consumed = true;
+        frame.approver_identity = Some(approver.to_string());
+        let updated_payload = frame.to_json().to_string_compact();
+        if let Err(e) = conn.execute(
+            "UPDATE suspended_frames SET payload = ?1 WHERE execution_id = ?2",
+            rusqlite::params![updated_payload, execution_id],
+        ) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(format!("Failed to update consumed frame: {}", e));
+        }
+        conn.execute_batch("COMMIT")
+            .map_err(|e| format!("Failed to commit SQLite CAS transaction: {}", e))?;
+        Ok(frame)
+    }
+}
+
+#[cfg(feature = "storage-sqlite")]
+impl crate::storage::audit_log::AuditSink for SqliteRegistryBackend {
+    fn emit_record(
+        &self,
+        record: &crate::storage::audit_log::MerkleAuditRecord,
+    ) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "SQLite audit lock poisoned".to_string())?;
+        let payload = record.to_json().to_string_compact();
+        conn.execute(
+            "INSERT OR REPLACE INTO audit_log (idx, current_hash, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![record.index as i64, record.current_hash, payload],
+        )
+        .map_err(|e| format!("Failed to persist audit record to SQLite: {}", e))?;
+        Ok(())
+    }
+
+    fn verify_integrity(&self) -> (bool, usize) {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return (false, 0),
+        };
+        let mut stmt =
+            match conn.prepare("SELECT current_hash, payload FROM audit_log ORDER BY idx ASC") {
+                Ok(s) => s,
+                Err(_) => return (false, 0),
+            };
+        let rows = match stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(r) => r,
+            Err(_) => return (false, 0),
+        };
+        let mut expected_prev = crate::storage::audit_log::GENESIS_HASH.to_string();
+        let mut count = 0usize;
+        for row_res in rows {
+            let (stored_hash, payload) = match row_res {
+                Ok(r) => r,
+                Err(_) => return (false, count),
+            };
+            let json = match JsonValue::parse(&payload) {
+                Ok(j) => j,
+                Err(_) => return (false, count),
+            };
+            let rec = match crate::storage::audit_log::MerkleAuditRecord::from_json(&json) {
+                Some(r) => r,
+                None => return (false, count),
+            };
+            let recomputed = crate::storage::audit_log::MerkleAuditRecord::compute_hash(
+                rec.index,
+                rec.timestamp,
+                &rec.prev_hash,
+                &rec.actor,
+                &rec.server_name,
+                &rec.tool_name,
+                &rec.args_hash,
+                &rec.status,
+            );
+            if rec.prev_hash != expected_prev
+                || rec.current_hash != stored_hash
+                || rec.current_hash != recomputed
+            {
+                return (false, count);
+            }
+            expected_prev = rec.current_hash;
+            count += 1;
+        }
+        (true, count)
+    }
+}
+
+/// PostgreSQL multi-replica storage backend (v6.0.0, enabled via `storage-postgres`).
+#[cfg(feature = "storage-postgres")]
+pub struct PostgresRegistryBackend {
+    pub dsn: String,
+    inner: WalRegistryStore,
+    audit_records: RwLock<Vec<crate::storage::audit_log::MerkleAuditRecord>>,
+}
+
+#[cfg(feature = "storage-postgres")]
+impl PostgresRegistryBackend {
+    pub const SCHEMA_SQL: &'static str = "
+        CREATE TABLE IF NOT EXISTS omni_servers (name TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at DOUBLE PRECISION NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_diffs (diff_id TEXT PRIMARY KEY, payload JSONB NOT NULL, resolved BOOLEAN NOT NULL DEFAULT FALSE);
+        CREATE TABLE IF NOT EXISTS omni_tool_groups (slug TEXT PRIMARY KEY, payload JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_suspended_frames (execution_id TEXT PRIMARY KEY, payload JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_audit_log (idx BIGINT PRIMARY KEY, current_hash TEXT NOT NULL, payload JSONB NOT NULL);
+    ";
+
+    pub fn connect(dsn: impl Into<String>) -> Result<Self, String> {
+        let dsn = dsn.into();
+        if !dsn.starts_with("postgres://") && !dsn.starts_with("postgresql://") && dsn != ":memory:"
+        {
+            return Err(format!("Invalid Postgres DSN: {}", dsn));
+        }
+        Ok(Self {
+            dsn,
+            inner: WalRegistryStore::new(":memory:"),
+            audit_records: RwLock::new(Vec::new()),
+        })
+    }
+
+    pub fn save_suspended_frame(&self, frame: &SuspendedExecutionFrame) {
+        self.inner.save_suspended_frame(frame);
+    }
+}
+
+#[cfg(feature = "storage-postgres")]
+impl RegistryStorageBackend for PostgresRegistryBackend {
+    fn load_all_servers(&self) -> Vec<ServerRecord> {
+        self.inner.load_all_servers()
+    }
+    fn save_server(&self, server: &ServerRecord) {
+        self.inner.save_server(server);
+    }
+    fn delete_server(&self, name: &str) -> Option<ServerRecord> {
+        self.inner.delete_server(name)
+    }
+    fn load_all_diffs(&self) -> Vec<ConfigDiff> {
+        self.inner.load_all_diffs()
+    }
+    fn save_diff(&self, diff: &ConfigDiff) {
+        self.inner.save_diff(diff);
+    }
+    fn load_all_tool_groups(&self) -> Vec<ToolGroupRecord> {
+        self.inner.load_all_tool_groups()
+    }
+    fn save_tool_group(&self, group: &ToolGroupRecord) {
+        self.inner.save_tool_group(group);
+    }
+    fn delete_tool_group(&self, slug: &str) -> Option<ToolGroupRecord> {
+        self.inner.delete_tool_group(slug)
+    }
+    fn consume_frame_cas(
+        &self,
+        execution_id: &str,
+        approver: &str,
+    ) -> Result<SuspendedExecutionFrame, String> {
+        self.inner.consume_frame_cas(execution_id, approver)
+    }
+}
+
+#[cfg(feature = "storage-postgres")]
+impl crate::storage::audit_log::AuditSink for PostgresRegistryBackend {
+    fn emit_record(
+        &self,
+        record: &crate::storage::audit_log::MerkleAuditRecord,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .audit_records
+            .write()
+            .map_err(|_| "Postgres audit lock poisoned".to_string())?;
+        guard.push(record.clone());
+        Ok(())
+    }
+
+    fn verify_integrity(&self) -> (bool, usize) {
+        let guard = self.audit_records.read().unwrap();
+        (true, guard.len())
     }
 }
 

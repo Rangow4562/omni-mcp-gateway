@@ -7,6 +7,8 @@ import { TestConsole } from './components/TestConsole';
 import { OmniSearchModal } from './components/OmniSearchModal';
 import { RegisterExternalServerModal } from './components/RegisterExternalServerModal';
 import { ExternalServerInspector } from './components/ExternalServerInspector';
+import { ToolGroupsStudio } from './components/ToolGroupsStudio';
+import { CodeModeStudio } from './components/CodeModeStudio';
 import {
   ServerSummary,
   ServerDetail,
@@ -14,7 +16,7 @@ import {
   PlatformStats,
   ToolItem,
 } from './types';
-import { apiFetch, ApiError } from './api';
+import { apiFetch, ApiError, getToken } from './api';
 
 export const App: React.FC = () => {
   const [servers, setServers] = useState<ServerSummary[]>([]);
@@ -29,6 +31,9 @@ export const App: React.FC = () => {
   const [isDiffModalOpen, setIsDiffModalOpen] = useState(false);
   const [isOmniModalOpen, setIsOmniModalOpen] = useState(false);
   const [isRegisterExternalOpen, setIsRegisterExternalOpen] = useState(false);
+  const [isToolGroupsOpen, setIsToolGroupsOpen] = useState(false);
+  const [isCodeModeOpen, setIsCodeModeOpen] = useState(false);
+  const [sseConnected, setSseConnected] = useState(false);
   const [inspectServerTarget, setInspectServerTarget] = useState<ServerSummary | null>(null);
   const [testConsoleTarget, setTestConsoleTarget] = useState<{
     serverName: string;
@@ -108,6 +113,53 @@ export const App: React.FC = () => {
   useEffect(() => {
     refreshAll();
   }, []);
+
+  // Live SSE telemetry subscription to /api/v1/events
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+
+    const connectSse = async () => {
+      try {
+        const resp = await fetch('/api/v1/events', {
+          headers: { Authorization: `Bearer ${getToken()}` },
+          signal: controller.signal,
+        });
+        if (!resp.ok || !resp.body) {
+          setSseConnected(false);
+          return;
+        }
+        setSseConnected(true);
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (active) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split('\n\n');
+          buffer = frames.pop() || '';
+          for (const frame of frames) {
+            if (frame.includes('event: server.health') || frame.includes('event: approval.')) {
+              fetchServers();
+              fetchStats();
+              fetchDiffs();
+            }
+          }
+        }
+      } catch {
+        // Abort or reconnect
+      } finally {
+        if (active) setSseConnected(false);
+      }
+    };
+
+    connectSse();
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [fetchServers, fetchStats, fetchDiffs]);
 
   useEffect(() => {
     if (selectedServerName) {
@@ -212,6 +264,9 @@ export const App: React.FC = () => {
         onOpenOmni={() => setIsOmniModalOpen(true)}
         onOpenDiffs={() => setIsDiffModalOpen(true)}
         onOpenRegisterExternal={() => setIsRegisterExternalOpen(true)}
+        onOpenToolGroups={() => setIsToolGroupsOpen(true)}
+        onOpenCodeMode={() => setIsCodeModeOpen(true)}
+        sseConnected={sseConnected}
         pendingDiffCount={diffs.length}
         onTokenChanged={refreshAll}
       />
@@ -282,6 +337,17 @@ export const App: React.FC = () => {
           fetchServers();
           fetchStats();
         }}
+      />
+
+      <ToolGroupsStudio
+        isOpen={isToolGroupsOpen}
+        onClose={() => setIsToolGroupsOpen(false)}
+        servers={servers}
+      />
+
+      <CodeModeStudio
+        isOpen={isCodeModeOpen}
+        onClose={() => setIsCodeModeOpen(false)}
       />
 
       {inspectServerTarget && (

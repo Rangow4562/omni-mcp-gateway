@@ -5,6 +5,7 @@ use crate::json::JsonValue;
 use crate::logging::{now_epoch_millis, now_epoch_secs};
 use crate::models::ProtocolType;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -23,6 +24,7 @@ pub struct CallLogRecord {
 pub struct MuttleyMeshClient {
     mock_responses: Arc<RwLock<HashMap<String, JsonValue>>>,
     call_log: Arc<RwLock<Vec<CallLogRecord>>>,
+    allow_synthetic_mocks: Arc<AtomicBool>,
 }
 
 impl MuttleyMeshClient {
@@ -30,7 +32,12 @@ impl MuttleyMeshClient {
         Self {
             mock_responses: Arc::new(RwLock::new(HashMap::new())),
             call_log: Arc::new(RwLock::new(Vec::new())),
+            allow_synthetic_mocks: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_allow_synthetic_mocks(&self, allow: bool) {
+        self.allow_synthetic_mocks.store(allow, Ordering::Relaxed);
     }
 
     pub fn register_mock_service(&self, service_route: &str, response_payload: JsonValue) {
@@ -56,8 +63,15 @@ impl MuttleyMeshClient {
             let guard = self.mock_responses.read().unwrap();
             if let Some(mock) = guard.get(&route_key) {
                 mock.clone()
-            } else {
+            } else if cfg!(any(feature = "testing-mocks", test))
+                || self.allow_synthetic_mocks.load(Ordering::Relaxed)
+            {
                 Self::synthesize_default_downstream_response(service_name, method_name, protocol)
+            } else {
+                return Err(format!(
+                    "MuttleyMeshClient mock responder for '{}' is disabled in production builds (enable 'testing-mocks' feature or configure a live downstream endpoint)",
+                    route_key
+                ));
             }
         };
 

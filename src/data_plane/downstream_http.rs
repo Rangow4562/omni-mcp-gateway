@@ -42,11 +42,24 @@ impl HttpDownstreamClient {
     /// Parses URL into (host, port, path)
     pub fn parse_url(url: &str) -> Result<(String, u16, String), String> {
         let trimmed = url.trim();
-        let rest = if let Some(stripped) = trimmed.strip_prefix("http://") {
-            stripped
+        let (default_port, rest) = if let Some(stripped) = trimmed.strip_prefix("http://") {
+            (80u16, stripped)
+        } else if let Some(stripped) = trimmed.strip_prefix("https://") {
+            #[cfg(not(feature = "tls-rustls"))]
+            {
+                let _ = stripped;
+                return Err(format!(
+                    "Error -32014 UPSTREAM_TLS_UNSUPPORTED: Downstream HTTPS URL '{}' requires the 'tls-rustls' feature.",
+                    url
+                ));
+            }
+            #[cfg(feature = "tls-rustls")]
+            {
+                (443u16, stripped)
+            }
         } else {
             return Err(format!(
-                "Unsupported protocol or invalid URL in downstream endpoint: '{}'. Only http:// is supported.",
+                "Unsupported protocol or invalid URL in downstream endpoint: '{}'. Must start with http:// or https://.",
                 url
             ));
         };
@@ -64,7 +77,7 @@ impl HttpDownstreamClient {
                     .map_err(|e| format!("Invalid port in '{}': {}", host_port, e))?;
                 (h.to_string(), p)
             }
-            None => (host_port.to_string(), 80),
+            None => (host_port.to_string(), default_port),
         };
 
         Ok((host, port, path.to_string()))
@@ -85,6 +98,7 @@ impl HttpDownstreamClient {
             ));
         }
 
+        let is_https = endpoint_url.trim().starts_with("https://");
         let (host, port, path) = Self::parse_url(endpoint_url)?;
         let addr_key = format!("{}:{}", host, port);
 
@@ -94,7 +108,8 @@ impl HttpDownstreamClient {
                 std::thread::sleep(Duration::from_millis(10 * (1 << attempt)));
             }
 
-            match self.execute_roundtrip(&addr_key, &host, &path, payload, extra_headers) {
+            match self.execute_roundtrip(is_https, &addr_key, &host, &path, payload, extra_headers)
+            {
                 Ok(resp_bytes) => return Ok(resp_bytes),
                 Err(e) => {
                     last_err = e;
@@ -106,6 +121,64 @@ impl HttpDownstreamClient {
             "Downstream HTTP call to '{}' failed after {} retries: {}",
             endpoint_url, self.max_retries, last_err
         ))
+    }
+
+    /// Executes an HTTP GET request to an endpoint (used for OIDC JWKS / CIMD metadata fetching).
+    pub fn get_raw(
+        &self,
+        endpoint_url: &str,
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> Result<String, String> {
+        let is_https = endpoint_url.trim().starts_with("https://");
+        let (host, port, path) = Self::parse_url(endpoint_url)?;
+        let addr_key = format!("{}:{}", host, port);
+        if is_https {
+            #[cfg(not(feature = "tls-rustls"))]
+            {
+                let _ = (addr_key, host, path, extra_headers);
+                return Err("HTTPS GET requires 'tls-rustls' feature".to_string());
+            }
+            #[cfg(feature = "tls-rustls")]
+            {
+                let stream = self.get_connection(&addr_key)?;
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let cfg = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+                let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                    .map_err(|_| format!("Invalid TLS server name '{}'", host))?;
+                let conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), server_name)
+                    .map_err(|e| format!("TLS connection init failed: {}", e))?;
+                let mut tls = rustls::StreamOwned::new(conn, stream);
+                let mut req = format!(
+                    "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: close\r\n",
+                    path, host
+                );
+                if let Some(hdrs) = extra_headers {
+                    for (k, v) in hdrs {
+                        req.push_str(&format!("{}: {}\r\n", k, v));
+                    }
+                }
+                req.push_str("\r\n");
+                let (resp, _) = self.exchange_on_stream(&mut tls, &req, &[])?;
+                return String::from_utf8(resp)
+                    .map_err(|e| format!("Invalid UTF-8 in HTTPS GET response: {}", e));
+            }
+        }
+        let mut stream = self.get_connection(&addr_key)?;
+        let mut req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: close\r\n",
+            path, host
+        );
+        if let Some(hdrs) = extra_headers {
+            for (k, v) in hdrs {
+                req.push_str(&format!("{}: {}\r\n", k, v));
+            }
+        }
+        req.push_str("\r\n");
+        let (resp, _) = self.exchange_on_stream(&mut stream, &req, &[])?;
+        String::from_utf8(resp).map_err(|e| format!("Invalid UTF-8 in HTTP GET response: {}", e))
     }
 
     fn get_connection(&self, addr_key: &str) -> Result<TcpStream, String> {
@@ -152,23 +225,23 @@ impl HttpDownstreamClient {
 
     fn execute_roundtrip(
         &self,
+        is_https: bool,
         addr_key: &str,
         host: &str,
         path: &str,
         payload: &[u8],
         extra_headers: Option<&HashMap<String, String>>,
     ) -> Result<Vec<u8>, String> {
-        let mut stream = self.get_connection(addr_key)?;
-
         let mut req_header = format!(
             "POST {} HTTP/1.1\r\n\
              Host: {}\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
-             Connection: keep-alive\r\n",
+             Connection: {}\r\n",
             path,
             host,
-            payload.len()
+            payload.len(),
+            if is_https { "close" } else { "keep-alive" }
         );
 
         if let Some(hdrs) = extra_headers {
@@ -183,6 +256,49 @@ impl HttpDownstreamClient {
         }
         req_header.push_str("\r\n");
 
+        #[cfg(feature = "tls-rustls")]
+        if is_https {
+            let socket_addrs: Vec<_> = addr_key
+                .to_socket_addrs()
+                .map_err(|e| format!("DNS resolution failed for '{}': {}", addr_key, e))?
+                .collect();
+            if socket_addrs.is_empty() {
+                return Err(format!("No socket addresses resolved for '{}'", addr_key));
+            }
+            let tcp = TcpStream::connect_timeout(&socket_addrs[0], self.connect_timeout)
+                .map_err(|e| format!("Connection to '{}' failed: {}", addr_key, e))?;
+            let _ = tcp.set_read_timeout(Some(self.read_timeout));
+            let _ = tcp.set_write_timeout(Some(self.connect_timeout));
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| format!("Invalid TLS SNI hostname '{}': {}", host, e))?;
+            let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+                .map_err(|e| format!("Failed to initialize TLS session: {}", e))?;
+            let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+            let (body, _keep_alive) =
+                self.exchange_on_stream(&mut tls_stream, &req_header, payload)?;
+            return Ok(body);
+        }
+
+        let _ = is_https;
+        let mut stream = self.get_connection(addr_key)?;
+        let (body, keep_alive) = self.exchange_on_stream(&mut stream, &req_header, payload)?;
+        if keep_alive {
+            self.release_connection(addr_key, stream);
+        }
+        Ok(body)
+    }
+
+    fn exchange_on_stream<S: Read + Write>(
+        &self,
+        stream: &mut S,
+        req_header: &str,
+        payload: &[u8],
+    ) -> Result<(Vec<u8>, bool), String> {
         stream
             .write_all(req_header.as_bytes())
             .map_err(|e| format!("Failed to write HTTP request headers: {}", e))?;
@@ -195,7 +311,7 @@ impl HttpDownstreamClient {
             .flush()
             .map_err(|e| format!("Failed to flush stream: {}", e))?;
 
-        let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        let mut reader = BufReader::new(stream);
         let mut status_line = String::new();
         reader
             .read_line(&mut status_line)
@@ -277,10 +393,6 @@ impl HttpDownstreamClient {
             buf
         };
 
-        if keep_alive {
-            self.release_connection(addr_key, stream);
-        }
-
         if status_code >= 400 {
             return Err(format!(
                 "Downstream HTTP {} error: {}",
@@ -289,6 +401,6 @@ impl HttpDownstreamClient {
             ));
         }
 
-        Ok(body)
+        Ok((body, keep_alive))
     }
 }

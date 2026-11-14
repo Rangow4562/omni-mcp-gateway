@@ -6,7 +6,7 @@ use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
     ChangeOrigin, ConfigDiff, HistoryEntry, ProtocolType, SchemaSource, ServerRecord,
-    SuspendedExecutionFrame, ToolRecord, ToolStatus,
+    SuspendedExecutionFrame, ToolGroupRecord, ToolRecord, ToolStatus,
 };
 use crate::storage::WalRegistryStore;
 use std::collections::{BTreeMap, HashMap};
@@ -58,6 +58,7 @@ struct RegistryInner {
     servers: BTreeMap<String, ServerRecord>,
     diffs: BTreeMap<String, ConfigDiff>,
     suspended_frames: BTreeMap<String, SuspendedExecutionFrame>,
+    tool_groups: BTreeMap<String, ToolGroupRecord>,
     version_history: HashMap<String, Vec<JsonValue>>,
 }
 
@@ -78,6 +79,7 @@ impl MCPRegistry {
         let mut servers = BTreeMap::new();
         let mut diffs = BTreeMap::new();
         let mut suspended_frames = BTreeMap::new();
+        let mut tool_groups = BTreeMap::new();
         let mut version_history: HashMap<String, Vec<JsonValue>> = HashMap::new();
 
         if let Some(store) = &persistent_store {
@@ -92,6 +94,9 @@ impl MCPRegistry {
             for f in store.list_suspended_frames() {
                 suspended_frames.insert(f.execution_id.clone(), f);
             }
+            for g in store.list_all_tool_groups() {
+                tool_groups.insert(g.slug.clone(), g);
+            }
         }
 
         Self {
@@ -99,6 +104,7 @@ impl MCPRegistry {
                 servers,
                 diffs,
                 suspended_frames,
+                tool_groups,
                 version_history,
             })),
             store: persistent_store,
@@ -221,6 +227,45 @@ impl MCPRegistry {
             store.save_server(&target);
         }
         target
+    }
+
+    /// Update external sync telemetry (`health`, `status`, `external_resources`, `external_prompts`,
+    /// `heartbeat_timestamp`) for an existing server and persist to WAL/snapshot.
+    pub fn update_server_sync_state(
+        &self,
+        name: &str,
+        health: crate::models::ServerHealth,
+        status: Option<ToolStatus>,
+        external_resources: Option<Vec<crate::models::ExternalResourceRecord>>,
+        external_prompts: Option<Vec<crate::models::ExternalPromptRecord>>,
+        heartbeat_timestamp: Option<f64>,
+    ) {
+        let updated = {
+            let mut guard = self.inner.write().unwrap();
+            if let Some(existing) = guard.servers.get_mut(name) {
+                existing.health = health;
+                if let Some(st) = status {
+                    existing.status = st;
+                }
+                if let Some(res) = external_resources {
+                    existing.external_resources = res;
+                }
+                if let Some(prm) = external_prompts {
+                    existing.external_prompts = prm;
+                }
+                if heartbeat_timestamp.is_some() {
+                    existing.heartbeat_timestamp = heartbeat_timestamp;
+                }
+                Some(existing.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(srv) = updated {
+            if let Some(store) = &self.store {
+                store.save_server(&srv);
+            }
+        }
     }
 
     pub fn get_server(&self, name: &str) -> Option<ServerRecord> {
@@ -968,6 +1013,38 @@ impl MCPRegistry {
             .filter(|f| !f.is_consumed)
             .cloned()
             .collect()
+    }
+
+    pub fn save_tool_group(&self, group: ToolGroupRecord) -> ToolGroupRecord {
+        {
+            let mut guard = self.inner.write().unwrap();
+            guard.tool_groups.insert(group.slug.clone(), group.clone());
+        }
+        if let Some(store) = &self.store {
+            store.save_tool_group(&group);
+        }
+        group
+    }
+
+    pub fn get_tool_group(&self, slug: &str) -> Option<ToolGroupRecord> {
+        let guard = self.inner.read().unwrap();
+        guard.tool_groups.get(slug).cloned()
+    }
+
+    pub fn list_tool_groups(&self) -> Vec<ToolGroupRecord> {
+        let guard = self.inner.read().unwrap();
+        guard.tool_groups.values().cloned().collect()
+    }
+
+    pub fn delete_tool_group(&self, slug: &str) -> Option<ToolGroupRecord> {
+        let removed = {
+            let mut guard = self.inner.write().unwrap();
+            guard.tool_groups.remove(slug)
+        };
+        if let Some(store) = &self.store {
+            let _ = store.delete_tool_group(slug);
+        }
+        removed
     }
 
     fn snapshot_server(server: &ServerRecord) -> JsonValue {

@@ -10,6 +10,9 @@ interface HeaderProps {
   onOpenOmni: () => void;
   onOpenDiffs: () => void;
   onOpenRegisterExternal?: () => void;
+  onOpenToolGroups?: () => void;
+  onOpenCodeMode?: () => void;
+  sseConnected?: boolean;
   pendingDiffCount: number;
   onTokenChanged?: () => void;
 }
@@ -22,6 +25,9 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenOmni,
   onOpenDiffs,
   onOpenRegisterExternal,
+  onOpenToolGroups,
+  onOpenCodeMode,
+  sseConnected = false,
   pendingDiffCount,
   onTokenChanged,
 }) => {
@@ -92,7 +98,20 @@ export const Header: React.FC<HeaderProps> = ({
               borderRadius: '12px',
               fontWeight: 600,
             }}>
-              v5.5.0 FLEET READY
+              v6.0.0 FLEET READY
+            </span>
+            <span
+              data-testid="sse-status"
+              style={{
+                fontSize: '10px',
+                backgroundColor: sseConnected ? '#122b22' : '#252630',
+                color: sseConnected ? '#00e575' : '#888',
+                padding: '2px 7px',
+                borderRadius: '10px',
+                fontWeight: 600,
+              }}
+            >
+              {sseConnected ? '● LIVE SSE' : '○ SSE IDLE'}
             </span>
           </div>
           <div style={{ fontSize: '11px', color: '#7c7f8e' }}>
@@ -236,6 +255,42 @@ export const Header: React.FC<HeaderProps> = ({
             }}
           >
             ➕ Register External MCP
+          </button>
+        )}
+
+        {onOpenToolGroups && (
+          <button
+            onClick={onOpenToolGroups}
+            style={{
+              backgroundColor: '#1e2235',
+              color: '#a5d6ff',
+              border: '1px solid #303652',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+            }}
+          >
+            🧩 Tool Groups
+          </button>
+        )}
+
+        {onOpenCodeMode && (
+          <button
+            onClick={onOpenCodeMode}
+            style={{
+              backgroundColor: '#1e2235',
+              color: '#d2a8ff',
+              border: '1px solid #303652',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+            }}
+          >
+            ⚡ Code Mode
           </button>
         )}
 

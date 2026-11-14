@@ -41,6 +41,12 @@ fn temp_test_path(prefix: &str) -> String {
 }
 
 fn find_omni_binary() -> std::path::PathBuf {
+    if let Some(bin_path) = option_env!("CARGO_BIN_EXE_omni") {
+        let p = std::path::PathBuf::from(bin_path);
+        if p.exists() {
+            return std::fs::canonicalize(&p).unwrap_or(p);
+        }
+    }
     let current_exe = std::env::current_exe().expect("Must have current exe");
     let mut dir = current_exe.parent().unwrap();
     if dir.file_name().and_then(|n| n.to_str()) == Some("deps") {
@@ -289,6 +295,7 @@ fn test_data_plane_routing_and_protocol_translation() {
     let registry = MCPRegistry::new(None);
     let cache = InMemoryConfigCache::new(registry.clone(), 5.0);
     let mesh = MuttleyMeshClient::new();
+    mesh.set_allow_synthetic_mocks(true);
     let translator = ProtocolTranslator::new(Some(mesh.clone()), None);
     let gateway = MCPProxyGateway::new(cache.clone(), Some(translator));
 
@@ -471,6 +478,10 @@ fn test_response_projection_and_omni_mcp_discovery() {
     let registry = MCPRegistry::new(None);
     let cache = InMemoryConfigCache::new(registry.clone(), 5.0);
     let gateway = MCPProxyGateway::new(cache.clone(), None);
+    gateway
+        .translator
+        .mesh_client
+        .set_allow_synthetic_mocks(true);
     let omni = OmniMCPServer::new(cache.clone(), gateway);
 
     let mut srv = ServerRecord::new(
@@ -545,6 +556,7 @@ fn test_circuit_breaker_and_semantic_cache_and_batch_rpc() {
     let registry = MCPRegistry::new(None);
     let cache = InMemoryConfigCache::new(registry.clone(), 5.0);
     let mesh = MuttleyMeshClient::new();
+    mesh.set_allow_synthetic_mocks(true);
     let translator = ProtocolTranslator::new(Some(mesh.clone()), None);
     let cb = CircuitBreakerRegistry::new(2, 60.0);
     let sem_cache = SemanticResponseCache::new(30.0);
@@ -608,16 +620,23 @@ fn test_third_party_oauth_token_exchange_and_unauthorized_rpc() {
         auth.exchange_token("emp_alice", "jira").as_deref(),
         Some("jira_secret_oauth_xyz")
     );
-    // Sandbox fallback for uber_token_*
+    // Sandbox fallback for uber_token_* is gated behind `testing-mocks`
+    #[cfg(feature = "testing-mocks")]
     assert!(auth
         .exchange_token("uber_token_bob", "jira")
         .unwrap()
         .starts_with("oauth_3p_jira_"));
+    #[cfg(not(feature = "testing-mocks"))]
+    assert_eq!(auth.exchange_token("uber_token_bob", "jira"), None);
 
     // Verify UNAUTHORIZED RPC error when actor is disallowed on gateway
     let registry = MCPRegistry::new(None);
     let cache = InMemoryConfigCache::new(registry.clone(), 5.0);
     let gateway = MCPProxyGateway::new(cache.clone(), None);
+    gateway
+        .translator
+        .mesh_client
+        .set_allow_synthetic_mocks(true);
 
     let mut srv = auth.create_third_party_server("jira", "eng-prod");
     srv.status = ToolStatus::Enabled;
@@ -645,6 +664,10 @@ fn test_omni_mcp_batch_invoke_tools() {
     let registry = MCPRegistry::new(None);
     let cache = InMemoryConfigCache::new(registry.clone(), 5.0);
     let gateway = MCPProxyGateway::new(cache.clone(), None);
+    gateway
+        .translator
+        .mesh_client
+        .set_allow_synthetic_mocks(true);
     let omni = OmniMCPServer::new(cache.clone(), gateway);
 
     let mut srv = ServerRecord::new("fleet-svc", "Fleet", "Fleet ops", "fleet");
@@ -689,6 +712,10 @@ fn test_aifx_cli_and_http_gateway_endpoints() {
 
     // Test CLI list, search, call to file, and benchmark
     let cli = AifxCLI::new(Some(ctx.registry.clone()), None);
+    cli.gateway
+        .translator
+        .mesh_client
+        .set_allow_synthetic_mocks(true);
     let list_out = cli.list_servers("json");
     let parsed_list = JsonValue::parse(&list_out).unwrap();
     assert!(parsed_list.as_array().unwrap().len() >= 3);
@@ -892,6 +919,10 @@ fn test_v3_opentelemetry_w3c_tracing_and_canary_routing() {
     let traces = Arc::new(RwLock::new(VecDeque::new()));
     let gateway =
         MCPProxyGateway::new(cache, None).with_observability(audit_store.clone(), traces.clone());
+    gateway
+        .translator
+        .mesh_client
+        .set_allow_synthetic_mocks(true);
 
     // Incoming standard W3C traceparent header
     let incoming_traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -975,6 +1006,10 @@ fn test_v3_resilient_fallback_execution() {
     cache.refresh_now();
 
     let gateway = MCPProxyGateway::new(cache, None);
+    gateway
+        .translator
+        .mesh_client
+        .set_allow_synthetic_mocks(true);
     let req = RPCRequest::new(
         2002i64,
         "tools/call",
@@ -2979,7 +3014,10 @@ fn test_v5_0_protocol_conformance_2026_07_28() {
     assert_eq!(oapi_status, 200);
     let oapi_json = JsonValue::parse(&String::from_utf8(oapi_body).unwrap()).unwrap();
     assert_eq!(oapi_json["openapi"].as_str(), Some("3.0.3"));
-    assert_eq!(oapi_json["info"]["version"].as_str(), Some("5.0.0"));
+    assert_eq!(
+        oapi_json["info"]["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
 
     // 8. Real CLI subcommand execution (C1)
     assert!(!AifxCLI::new(None, None).list_servers("table").is_empty());
@@ -3799,9 +3837,18 @@ fn test_v5_5_ac8_rbac_and_allowlist_enforcement() {
         &admin_h,
         &https_req.to_string_compact().into_bytes(),
     );
-    assert_eq!(st_tls, 400);
-    let tls_json = JsonValue::parse(&String::from_utf8(body_tls).unwrap()).unwrap();
-    assert_eq!(tls_json["code"].as_i64(), Some(-32014));
+    #[cfg(not(feature = "tls-rustls"))]
+    {
+        assert_eq!(st_tls, 400);
+        let tls_json = JsonValue::parse(&String::from_utf8(body_tls).unwrap()).unwrap();
+        assert_eq!(tls_json["code"].as_i64(), Some(-32014));
+    }
+    #[cfg(feature = "tls-rustls")]
+    {
+        let _ = st_tls;
+        let tls_json = JsonValue::parse(&String::from_utf8(body_tls).unwrap()).unwrap();
+        assert_ne!(tls_json["code"].as_i64(), Some(-32014));
+    }
 
     ctx.store.close();
     let _ = fs::remove_dir_all(&dir);
@@ -4243,4 +4290,1604 @@ fn test_percent_decode_unit() {
     assert_eq!(omni_mcp::server::percent_decode("%%%"), "%%%");
     assert_eq!(omni_mcp::server::percent_decode("test%1"), "test%1");
     assert_eq!(omni_mcp::server::percent_decode("%E2%9C%93"), "\u{2713}");
+}
+
+fn b64url_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i] as u32;
+        let b1 = if i + 1 < data.len() {
+            data[i + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if i + 2 < data.len() {
+            data[i + 2] as u32
+        } else {
+            0
+        };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if i + 1 < data.len() {
+            out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        }
+        if i + 2 < data.len() {
+            out.push(TABLE[(triple & 0x3f) as usize] as char);
+        }
+        i += 3;
+    }
+    out
+}
+
+#[test]
+fn test_v6_tool_groups_and_mcp_virtual_endpoint() {
+    let dir = temp_test_path("omni_v6_groups_test");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut hdrs = HashMap::new();
+    hdrs.insert(
+        "authorization".to_string(),
+        "Bearer admin_dev_token".to_string(),
+    );
+
+    // 1. Create group via POST /api/v1/groups
+    let create_body = json!({
+        "slug": "ops-kit",
+        "display_name": "Ops Kit",
+        "description": "Curated operational tools",
+        "entries": [
+            {"server_name": "uber_rides", "tool_name": "list_recent"}
+        ]
+    });
+    let (status, _, _, resp) = ctx.handle_http(
+        "POST",
+        "/api/v1/groups",
+        &hdrs,
+        create_body.to_string_compact().as_bytes(),
+    );
+    assert_eq!(
+        status,
+        200,
+        "Create group failed: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // 2. List tools via virtual endpoint POST /groups/ops-kit/mcp
+    let list_rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    let (lstatus, _, _, lresp) = ctx.handle_http(
+        "POST",
+        "/groups/ops-kit/mcp",
+        &hdrs,
+        list_rpc.to_string_compact().as_bytes(),
+    );
+    assert_eq!(lstatus, 200);
+    let ljson = JsonValue::parse(&String::from_utf8_lossy(&lresp)).unwrap();
+    let tools = ljson["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"].as_str(), Some("uber_rides_list_recent"));
+
+    // 3. Delete group
+    let (dstatus, _, _, _) = ctx.handle_http("DELETE", "/api/v1/groups/ops-kit", &hdrs, &[]);
+    assert_eq!(dstatus, 200);
+    assert!(ctx.registry.get_tool_group("ops-kit").is_none());
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v6_jwt_hs256_and_rfc8707_aud_validation() {
+    let secret = b"super-secret-v6-key";
+    let h = b64url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+    let future_exp = (omni_mcp::logging::now_epoch_secs() as i64) + 3600;
+    let claims = format!(
+        r#"{{"sub":"alice","role":"admin","iss":"https://auth.omni.local","aud":"https://mcp.omni.local","exp":{}}}"#,
+        future_exp
+    );
+    let p = b64url_encode(claims.as_bytes());
+    let signing_input = format!("{}.{}", h, p);
+    let sig = omni_mcp::storage::audit_log::hmac_sha256(secret, signing_input.as_bytes());
+    let jwt = format!("{}.{}", signing_input, b64url_encode(&sig));
+
+    let ok = omni_mcp::server::validate_jwt_hs256(
+        &jwt,
+        secret,
+        Some("https://auth.omni.local"),
+        Some("https://mcp.omni.local"),
+    );
+    assert!(ok.is_ok());
+    let principal = ok.unwrap();
+    assert_eq!(principal.id, "alice");
+
+    // Wrong audience must fail RFC 8707 check
+    let bad_aud = omni_mcp::server::validate_jwt_hs256(
+        &jwt,
+        secret,
+        Some("https://auth.omni.local"),
+        Some("https://other.local"),
+    );
+    assert_eq!(bad_aud.err(), Some(401));
+}
+
+#[test]
+fn test_v6_streamable_http_sse_client_parsing() {
+    let url = "http://127.0.0.1:19999/mcp";
+    omni_mcp::upstream::http::register_mock_http(url, |_path, body, _hdrs| {
+        let req = JsonValue::parse(&String::from_utf8_lossy(body)).unwrap();
+        let id = req.get("id").and_then(|x| x.as_u64()).unwrap_or(1);
+        let method = req.get("method").and_then(|x| x.as_str()).unwrap_or("");
+        let mut hdrs = std::collections::BTreeMap::new();
+        hdrs.insert("content-type".to_string(), "text/event-stream".to_string());
+        let resp_json = if method == "initialize" {
+            json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-11-25"}})
+        } else {
+            json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "ping", "description": "pong", "inputSchema": {"type": "object"}}]}})
+        };
+        let sse = format!("id: ev-42\ndata: {}\n\n", resp_json.to_string_compact());
+        (200, hdrs, sse.into_bytes())
+    });
+
+    let session = omni_mcp::upstream::http::HttpUpstreamSession::new(
+        "mock-sse-v6",
+        url,
+        None,
+        std::collections::BTreeMap::new(),
+        omni_mcp::models::SessionMode::Stateless,
+        std::env::temp_dir(),
+        5000,
+        true,
+    );
+    let tools = session.fetch_tools().expect("SSE fetch_tools failed");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "ping");
+    omni_mcp::upstream::http::clear_mock_http(url);
+}
+
+#[test]
+fn test_v6_import_mcp_config_json() {
+    let reg = MCPRegistry::new(None);
+    let raw = r#"{
+        "mcpServers": {
+            "github": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": { "GITHUB_TOKEN": "ghp_plaintext_should_become_env_ref" }
+            },
+            "remote": {
+                "url": "http://127.0.0.1:9090/mcp"
+            }
+        }
+    }"#;
+    let imported = omni_mcp::extension::aifx::import_mcp_config_json(raw, &reg).unwrap();
+    assert_eq!(imported.len(), 2);
+    let gh = reg.get_server("external-mcp:github").unwrap();
+    if let Some(omni_mcp::models::UpstreamTransportConfig::Stdio { env_refs, .. }) =
+        gh.upstream_config
+    {
+        assert_eq!(
+            env_refs.get("GITHUB_TOKEN").map(|s| s.as_str()),
+            Some("{env:GITHUB_TOKEN}")
+        );
+    } else {
+        panic!("Expected Stdio upstream config");
+    }
+}
+
+#[test]
+fn test_v6_events_sse_and_well_known_cimd() {
+    let dir = temp_test_path("omni_v6_sse_events_test");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut hdrs = HashMap::new();
+    hdrs.insert(
+        "authorization".to_string(),
+        "Bearer agent_dev_token".to_string(),
+    );
+
+    let (status, ctype, _, body) = ctx.handle_http("GET", "/api/v1/events", &hdrs, &[]);
+    assert_eq!(status, 200);
+    assert!(ctype.contains("text/event-stream"));
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: gateway.snapshot"));
+
+    let (wstatus, _, _, wbody) =
+        ctx.handle_http("GET", "/.well-known/oauth-protected-resource", &hdrs, &[]);
+    assert_eq!(wstatus, 200);
+    let wjson = JsonValue::parse(&String::from_utf8_lossy(&wbody)).unwrap();
+    assert_eq!(
+        wjson["client_id_metadata_document_supported"].as_bool(),
+        Some(true)
+    );
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v6_external_resources_prompts_federation_rbac_and_pii_redaction() {
+    let dir = temp_test_path("omni_v6_ext_fed_rbac");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        allow_loopback_upstream: true,
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let url = "http://127.0.0.1:19991/mcp";
+    omni_mcp::upstream::http::register_mock_http(url, |_path, body, _hdrs| {
+        let req = JsonValue::parse(&String::from_utf8_lossy(body)).unwrap_or(JsonValue::Null);
+        let id = req.get("id").cloned().unwrap_or(JsonValue::from(1i64));
+        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let resp = match method {
+            "initialize" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "mock-fed", "version": "1.0"}}
+            }),
+            "resources/read" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "contents": [{
+                        "uri": "doc://secret",
+                        "mimeType": "text/plain",
+                        "text": "Contact alice@example.com or SSN 123-45-6789"
+                    }]
+                }
+            }),
+            "prompts/get" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "messages": [{
+                        "role": "user",
+                        "content": {"type": "text", "text": "User email bob@example.com"}
+                    }]
+                }
+            }),
+            "resources/templates/list" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "resourceTemplates": [{
+                        "uriTemplate": "doc://{id}",
+                        "name": "Doc Template",
+                        "mimeType": "text/plain"
+                    }]
+                }
+            }),
+            _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+        };
+        let mut h = std::collections::BTreeMap::new();
+        h.insert("content-type".to_string(), "application/json".to_string());
+        (200, h, resp.to_string_compact().into_bytes())
+    });
+
+    let mut srv = ServerRecord::new("ext-fed", "External Fed", "Mock fed server", "platform");
+    srv.protocol = ProtocolType::ExternalMcp;
+    srv.status = ToolStatus::Enabled;
+    srv.charter_policy.allowed_actors = vec![omni_mcp::models::ActorType::Human];
+    srv.charter_policy.require_redaction = true;
+    srv.upstream_config = Some(omni_mcp::models::UpstreamTransportConfig::StreamableHttp {
+        url: url.to_string(),
+        bearer_ref: None,
+        header_refs: std::collections::BTreeMap::new(),
+        session_mode: omni_mcp::models::SessionMode::Stateless,
+    });
+    ctx.registry.register_server(srv);
+    ctx.cache.refresh_now();
+
+    let read_req = RPCRequest::new(
+        10i64,
+        "resources/read",
+        json!({"uri": "ext://ext-fed/doc://secret"}),
+    );
+    let denied = ctx.omni_mcp.handle_request(&read_req, "agent", None);
+    assert!(denied.error.is_some());
+
+    let allowed = ctx.omni_mcp.handle_request(&read_req, "human", None);
+    assert!(allowed.error.is_none());
+    let text = allowed.result.unwrap().to_string_compact();
+    assert!(!text.contains("123-45-6789"));
+    assert!(!text.contains("alice@example.com"));
+
+    let prompt_req = RPCRequest::new(
+        11i64,
+        "prompts/get",
+        json!({"name": "ext-fed:triage", "arguments": {}}),
+    );
+    let p_denied = ctx.omni_mcp.handle_request(&prompt_req, "agent", None);
+    assert!(p_denied.error.is_some());
+    let p_allowed = ctx.omni_mcp.handle_request(&prompt_req, "human", None);
+    assert!(p_allowed.error.is_none());
+    assert!(!p_allowed
+        .result
+        .unwrap()
+        .to_string_compact()
+        .contains("bob@example.com"));
+
+    let tpl_req = RPCRequest::new(12i64, "resources/templates/list", json!({}));
+    let tpl_resp = ctx.omni_mcp.handle_request(&tpl_req, "human", None);
+    assert!(tpl_resp.error.is_none());
+    assert!(tpl_resp
+        .result
+        .unwrap()
+        .to_string_compact()
+        .contains("ext://ext-fed/doc://{id}"));
+
+    omni_mcp::upstream::http::clear_mock_http(url);
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v6_security_no_substring_admin_and_import_headers_redaction() {
+    let dir = temp_test_path("omni_v6_sec_hardening");
+    let cfg = OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut evil_hdrs = HashMap::new();
+    evil_hdrs.insert(
+        "authorization".to_string(),
+        "Bearer my_evil_admin_token".to_string(),
+    );
+    assert_eq!(ctx.handle_http("GET", "/api/stats", &evil_hdrs, &[]).0, 401);
+
+    let raw_cfg = r#"{
+      "mcpServers": {
+        "github": {
+          "url": "https://mcp.github.com/mcp",
+          "headers": { "Authorization": "Bearer ghp_secret123" }
+        },
+        "fs": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+        }
+      }
+    }"#;
+    let dry_report =
+        omni_mcp::extension::aifx::import_mcp_config_with_options(raw_cfg, &ctx.registry, true)
+            .unwrap();
+    assert!(dry_report.dry_run);
+    assert_eq!(dry_report.imported.len(), 2);
+    assert_eq!(dry_report.allowlist_commands, vec!["npx".to_string()]);
+    assert!(!dry_report.converted_secrets.is_empty());
+    assert!(ctx.registry.get_server("external-mcp:github").is_none());
+
+    let real_report =
+        omni_mcp::extension::aifx::import_mcp_config_with_options(raw_cfg, &ctx.registry, false)
+            .unwrap();
+    assert_eq!(real_report.imported.len(), 2);
+    let gh = ctx.registry.get_server("external-mcp:github").unwrap();
+    let json_str = gh.to_json().to_string_compact();
+    assert!(!json_str.contains("ghp_secret123"));
+    assert!(json_str.contains("{env:OMNI_GITHUB_AUTHORIZATION}"));
+
+    let token_store = omni_mcp::upstream::http::UpstreamOAuthTokenStore::new(
+        std::path::Path::new(&dir).join("oauth"),
+        Some("test_key"),
+    );
+    let (verifier, challenge) =
+        omni_mcp::upstream::http::UpstreamOAuthTokenStore::generate_pkce_pair();
+    assert!(!verifier.is_empty() && !challenge.is_empty());
+    token_store.save_token("github", "access_tok_999").unwrap();
+    assert_eq!(token_store.load_token("github").unwrap(), "access_tok_999");
+
+    let otlp = omni_mcp::telemetry::OtlpExporter::new("http://127.0.0.1:4318/v1/traces");
+    let otlp_payload = otlp.build_otlp_payload(&[], &[("omni.requests_total", 42)]);
+    assert!(otlp_payload.get("resourceSpans").is_some());
+    assert!(otlp_payload.get("resourceMetrics").is_some());
+
+    ctx.store.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "tls-rustls")]
+#[test]
+fn test_v6_rustls_inbound_tls_config_validation() {
+    // Verify build_inbound_tls_config returns Ok(None) when OMNI_TLS_CERT is unset
+    let prev = std::env::var("OMNI_TLS_CERT").ok();
+    std::env::remove_var("OMNI_TLS_CERT");
+    assert!(omni_mcp::server::build_inbound_tls_config()
+        .unwrap()
+        .is_none());
+    if let Some(v) = prev {
+        std::env::set_var("OMNI_TLS_CERT", v);
+    }
+}
+
+#[cfg(not(feature = "testing-mocks"))]
+#[test]
+fn test_muttley_production_mode_rejects_unregistered_routes() {
+    let mesh = omni_mcp::data_plane::muttley::MuttleyMeshClient::new();
+    let err = mesh
+        .execute_downstream(
+            "unregistered_service",
+            "DoWork",
+            ProtocolType::Grpc,
+            b"{}",
+            None,
+            1000,
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("disabled in production builds"),
+        "expected production rejection error, got: {}",
+        err
+    );
+
+    // Explicitly registered mock route still succeeds even with synthetic mocks disabled
+    mesh.register_mock_service("unregistered_service/DoWork", json!({"ok": true}));
+    let registered = mesh
+        .execute_downstream(
+            "unregistered_service",
+            "DoWork",
+            ProtocolType::Grpc,
+            b"{}",
+            None,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(
+        JsonValue::parse(&String::from_utf8(registered).unwrap()).unwrap()["ok"].as_bool(),
+        Some(true)
+    );
+
+    // Enabling synthetic mocks allows unregistered routes
+    mesh.set_allow_synthetic_mocks(true);
+    let synth = mesh
+        .execute_downstream(
+            "another_unregistered_service",
+            "OtherMethod",
+            ProtocolType::Grpc,
+            b"{}",
+            None,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(
+        JsonValue::parse(&String::from_utf8(synth).unwrap()).unwrap()["status"].as_str(),
+        Some("SUCCESS")
+    );
+}
+
+#[test]
+fn test_v6_sampling_elicitation_policy_and_group_mcp_parity() {
+    use omni_mcp::models::{
+        ExternalPromptRecord, ExternalResourceRecord, ProtocolType, SamplingElicitationPolicy,
+        ServerRecord, ToolGroupEntry, ToolGroupRecord, ToolRecord, ToolStatus,
+    };
+    use omni_mcp::server::ProductionGatewayContext;
+
+    let dir = std::env::temp_dir().join(format!(
+        "omni_v6_sampling_group_{}",
+        omni_mcp::logging::now_epoch_millis()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let cfg = OmniConfig {
+        data_dir: dir.to_string_lossy().to_string(),
+        auth_secret: "test_secret_v6".to_string(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut srv_deny = ServerRecord::new("srv_deny", "Deny Srv", "desc", "core");
+    srv_deny.protocol = ProtocolType::ExternalMcp;
+    srv_deny.status = ToolStatus::Enabled;
+    srv_deny.sampling_elicitation_policy = SamplingElicitationPolicy::Deny;
+    srv_deny.external_resources.push(ExternalResourceRecord {
+        uri: "docs://readme".to_string(),
+        name: "readme".to_string(),
+        description: Some("Readme".to_string()),
+        mime_type: Some("text/plain".to_string()),
+    });
+    srv_deny.external_prompts.push(ExternalPromptRecord {
+        name: "summarize".to_string(),
+        description: Some("Summarize".to_string()),
+        arguments: JsonValue::Array(vec![]),
+    });
+    let mut t1 = ToolRecord::new("ping_tool", "Ping", json!({"type": "object"}));
+    t1.status = ToolStatus::Enabled;
+    srv_deny.add_tool(t1);
+    ctx.registry.register_server(srv_deny);
+
+    let mut srv_gate = ServerRecord::new("srv_gate", "Gate Srv", "desc", "core");
+    srv_gate.protocol = ProtocolType::ExternalMcp;
+    srv_gate.status = ToolStatus::Enabled;
+    srv_gate.sampling_elicitation_policy = SamplingElicitationPolicy::ApprovalGate;
+    ctx.registry.register_server(srv_gate);
+
+    let mut srv_relay = ServerRecord::new("srv_relay", "Relay Srv", "desc", "core");
+    srv_relay.protocol = ProtocolType::ExternalMcp;
+    srv_relay.status = ToolStatus::Enabled;
+    srv_relay.sampling_elicitation_policy = SamplingElicitationPolicy::RelayToClient;
+    ctx.registry.register_server(srv_relay);
+
+    ctx.registry.save_tool_group(ToolGroupRecord {
+        slug: "triage".to_string(),
+        display_name: "Triage".to_string(),
+        description: "Triage group".to_string(),
+        entries: vec![
+            ToolGroupEntry {
+                server_name: "srv_deny".to_string(),
+                tool_name: None,
+            },
+            ToolGroupEntry {
+                server_name: "srv_gate".to_string(),
+                tool_name: None,
+            },
+        ],
+        created_at: 1.0,
+    });
+    ctx.cache.refresh_now();
+
+    let server = ctx;
+    let mut auth_headers = std::collections::HashMap::new();
+    auth_headers.insert(
+        "authorization".to_string(),
+        "Bearer test_secret_v6".to_string(),
+    );
+
+    // 1. /groups/triage/mcp initialize -> returns Mcp-Session-Id header
+    let init_body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        .to_string_compact();
+    let (status, _ct, resp_hdrs, resp_body) = server.handle_http(
+        "POST",
+        "/groups/triage/mcp",
+        &auth_headers,
+        init_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let sid = resp_hdrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
+        .map(|(_, v)| v.clone())
+        .expect("Mcp-Session-Id header must be returned on initialize");
+    let init_json = JsonValue::parse(&String::from_utf8(resp_body).unwrap()).unwrap();
+    assert_eq!(
+        init_json["result"]["serverInfo"]["name"].as_str(),
+        Some("omni-group:triage")
+    );
+
+    // 2. ping with Mcp-Session-Id propagation
+    let mut sid_headers = auth_headers.clone();
+    sid_headers.insert("mcp-session-id".to_string(), sid.clone());
+    let ping_body =
+        json!({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}}).to_string_compact();
+    let (status, _ct, ping_hdrs, ping_resp) = server.handle_http(
+        "POST",
+        "/groups/triage/mcp",
+        &sid_headers,
+        ping_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    assert!(ping_hdrs
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("mcp-session-id") && v == &sid));
+    let ping_json = JsonValue::parse(&String::from_utf8(ping_resp).unwrap()).unwrap();
+    assert!(ping_json["result"].is_object());
+
+    // 3. resources/list & prompts/list on /groups/triage/mcp
+    let rlist_body = json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}})
+        .to_string_compact();
+    let (_, _, _, rlist_resp) = server.handle_http(
+        "POST",
+        "/groups/triage/mcp",
+        &sid_headers,
+        rlist_body.as_bytes(),
+    );
+    let rlist_json = JsonValue::parse(&String::from_utf8(rlist_resp).unwrap()).unwrap();
+    assert_eq!(
+        rlist_json["result"]["resources"].as_array().unwrap().len(),
+        1
+    );
+
+    let plist_body = json!({"jsonrpc": "2.0", "id": 4, "method": "prompts/list", "params": {}})
+        .to_string_compact();
+    let (_, _, _, plist_resp) = server.handle_http(
+        "POST",
+        "/groups/triage/mcp",
+        &sid_headers,
+        plist_body.as_bytes(),
+    );
+    let plist_json = JsonValue::parse(&String::from_utf8(plist_resp).unwrap()).unwrap();
+    assert_eq!(plist_json["result"]["prompts"].as_array().unwrap().len(), 1);
+
+    // 4. Sampling/elicitation policies across endpoints
+    let samp_body = json!({"jsonrpc": "2.0", "id": 5, "method": "sampling/createMessage", "params": {"messages": []}})
+        .to_string_compact();
+    let (_, _, _, deny_resp) =
+        server.handle_http("POST", "/srv_deny/mcp", &auth_headers, samp_body.as_bytes());
+    let deny_json = JsonValue::parse(&String::from_utf8(deny_resp).unwrap()).unwrap();
+    assert_eq!(deny_json["error"]["code"].as_i64(), Some(-32003));
+
+    let elicit_body = json!({"jsonrpc": "2.0", "id": 6, "method": "elicitation/create", "params": {"message": "confirm?"}})
+        .to_string_compact();
+    let (_, _, _, gate_resp) = server.handle_http(
+        "POST",
+        "/srv_gate/mcp",
+        &auth_headers,
+        elicit_body.as_bytes(),
+    );
+    let gate_json = JsonValue::parse(&String::from_utf8(gate_resp).unwrap()).unwrap();
+    assert_eq!(
+        gate_json["result"]["resultType"].as_str(),
+        Some("input_required")
+    );
+    assert_eq!(
+        gate_json["result"]["relayPolicy"].as_str(),
+        Some("approval_gate")
+    );
+
+    let (_, _, _, relay_resp) = server.handle_http(
+        "POST",
+        "/srv_relay/mcp",
+        &auth_headers,
+        samp_body.as_bytes(),
+    );
+    let relay_json = JsonValue::parse(&String::from_utf8(relay_resp).unwrap()).unwrap();
+    assert_eq!(
+        relay_json["result"]["resultType"].as_str(),
+        Some("relay_to_client")
+    );
+
+    // 5. Group boundary enforcement: /groups/triage/mcp must reject sampling targeting a server outside the group
+    let cross_grp_body = json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "sampling/createMessage",
+        "params": {"server": "srv_relay", "messages": []}
+    })
+    .to_string_compact();
+    let (_, _, _, cross_resp) = server.handle_http(
+        "POST",
+        "/groups/triage/mcp",
+        &sid_headers,
+        cross_grp_body.as_bytes(),
+    );
+    let cross_json = JsonValue::parse(&String::from_utf8(cross_resp).unwrap()).unwrap();
+    assert_eq!(cross_json["error"]["code"].as_i64(), Some(-32601));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v6_autosync_scheduler_health_and_backoff() {
+    use omni_mcp::models::{ProtocolType, ServerHealth, ServerRecord, UpstreamTransportConfig};
+    use omni_mcp::server::{AutoSyncScheduler, ProductionGatewayContext};
+
+    let dir = std::env::temp_dir().join(format!(
+        "omni_v6_autosync_{}",
+        omni_mcp::logging::now_epoch_millis()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let cfg = OmniConfig {
+        data_dir: dir.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let ctx = ProductionGatewayContext::new(Some(cfg));
+
+    let mut srv = ServerRecord::new("ext_fail", "Ext Fail", "desc", "core");
+    srv.protocol = ProtocolType::ExternalMcp;
+    srv.sync_interval_sec = Some(10);
+    srv.upstream_config = Some(UpstreamTransportConfig::StreamableHttp {
+        url: "http://127.0.0.1:1/unreachable".to_string(),
+        bearer_ref: None,
+        header_refs: std::collections::BTreeMap::new(),
+        session_mode: omni_mcp::models::SessionMode::Stateful,
+    });
+    ctx.registry.register_server(srv);
+    ctx.cache.refresh_now();
+
+    let mut sched = AutoSyncScheduler::new();
+    // Failure 1 -> Degraded
+    sched.tick(&ctx, 100.0);
+    assert_eq!(
+        ctx.registry.get_server("ext_fail").unwrap().health,
+        ServerHealth::Degraded
+    );
+    // Backoff: interval * 2^1 = 20s, so at 110.0 it should NOT retry
+    sched.tick(&ctx, 110.0);
+    assert_eq!(sched.backoff_failures.get("ext_fail").copied(), Some(1));
+
+    // At 120.0 -> Failure 2 -> still Degraded
+    sched.tick(&ctx, 120.0);
+    assert_eq!(
+        ctx.registry.get_server("ext_fail").unwrap().health,
+        ServerHealth::Degraded
+    );
+    // Backoff: 10 * 2^2 = 40s -> at 160.0 -> Failure 3 -> Unreachable & Disabled
+    sched.tick(&ctx, 160.0);
+    let after = ctx.registry.get_server("ext_fail").unwrap();
+    assert_eq!(after.health, ServerHealth::Unreachable);
+    assert_eq!(after.status, omni_mcp::models::ToolStatus::Disabled);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_v6_codemode_nested_interface_and_output_schema() {
+    use omni_mcp::data_plane::codemode::CodeModeTypeGenerator;
+    use omni_mcp::models::{ServerRecord, ToolRecord, ToolStatus};
+
+    let mut srv = ServerRecord::new("jira", "Jira", "Jira", "eng");
+    srv.status = ToolStatus::Enabled;
+    let mut tool = ToolRecord::new(
+        "create_issue",
+        "Create issue",
+        json!({
+            "type": "object",
+            "required": ["project_key"],
+            "properties": {
+                "project_key": { "type": "string", "description": "Target Jira project key" },
+                "metadata": {
+                    "type": "object",
+                    "required": ["priority"],
+                    "properties": {
+                        "priority": { "enum": ["low", "medium", "high"] },
+                        "assignee": { "type": "string" }
+                    }
+                }
+            }
+        }),
+    );
+    tool.output_schema = json!({
+        "type": "object",
+        "required": ["issue_id"],
+        "properties": {
+            "issue_id": { "type": "string" }
+        }
+    });
+    tool.status = ToolStatus::Enabled;
+    srv.add_tool(tool);
+
+    let res = CodeModeTypeGenerator::generate_declarations(&[srv], None, None);
+    let dts = res.typescript_declarations;
+    assert!(
+        dts.contains("interface CreateIssueInput_Metadata"),
+        "dts:\n{}",
+        dts
+    );
+    assert!(
+        dts.contains("metadata?: CreateIssueInput_Metadata;"),
+        "dts:\n{}",
+        dts
+    );
+    assert!(dts.contains("interface CreateIssueResult"), "dts:\n{}", dts);
+    assert!(dts.contains("Promise<CreateIssueResult>"), "dts:\n{}", dts);
+
+    // Nested $ref and circular $ref must resolve against root without infinite recursion
+    let mut circular_srv = ServerRecord::new("graph", "Graph", "Graph", "eng");
+    circular_srv.status = ToolStatus::Enabled;
+    let mut node_tool = ToolRecord::new(
+        "traverse",
+        "Traverse node",
+        json!({
+            "$defs": {
+                "Tag": {
+                    "type": "object",
+                    "properties": { "label": { "type": "string" } }
+                },
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "tag": { "$ref": "#/$defs/Tag" },
+                        "next": { "$ref": "#/$defs/Node" }
+                    }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "root": { "$ref": "#/$defs/Node" }
+            }
+        }),
+    );
+    node_tool.status = ToolStatus::Enabled;
+    circular_srv.add_tool(node_tool);
+    let circ_res = CodeModeTypeGenerator::generate_declarations(&[circular_srv], None, None);
+    assert!(
+        circ_res
+            .typescript_declarations
+            .contains("interface TraverseInput_Root_Tag"),
+        "dts:\n{}",
+        circ_res.typescript_declarations
+    );
+}
+
+#[test]
+fn test_v6_cli_import_dry_run_and_migrate_v5_to_v6() {
+    let dir = std::env::temp_dir().join(format!(
+        "omni_v6_cli_mig_{}",
+        omni_mcp::logging::now_epoch_millis()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let data_dir = dir.to_string_lossy().to_string();
+
+    // Seed v5-like WAL + audit log
+    let db_path = dir.join("registry.db").to_string_lossy().to_string();
+    let wal = omni_mcp::storage::WalRegistryStore::new(&db_path);
+    let mut srv = omni_mcp::models::ServerRecord::new("legacy_srv", "Legacy", "desc", "eng");
+    srv.status = omni_mcp::models::ToolStatus::Enabled;
+    wal.save_server(&srv);
+    wal.close();
+
+    let audit_path = dir.join("audit.jsonl").to_string_lossy().to_string();
+    let audit = omni_mcp::storage::MerkleAuditStore::new(Some(audit_path));
+    audit.record_invocation("alice", "legacy_srv", "t1", &json!({}), "ok", 5);
+
+    let dry = omni_mcp::extension::aifx::migrate_v5_to_v6(&data_dir, true);
+    assert!(dry.ok);
+    assert!(dry.audit_verified);
+    assert_eq!(dry.audit_records, 1);
+    assert_eq!(dry.servers_migrated, 1);
+
+    let real = omni_mcp::extension::aifx::migrate_v5_to_v6(&data_dir, false);
+    assert!(real.ok);
+    assert!(real.audit_verified);
+    assert_eq!(real.servers_migrated, 1);
+
+    // Test import --dry-run
+    let cfg_json = r#"{"mcpServers":{"fs":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"],"env":{"API_KEY":"secret123"}}}}"#;
+    let reg = omni_mcp::control_plane::registry::MCPRegistry::new(None);
+    let report =
+        omni_mcp::extension::aifx::import_mcp_config_with_options(cfg_json, &reg, true).unwrap();
+    assert_eq!(report.imported, vec!["external-mcp:fs"]);
+    assert!(report.allowlist_commands.contains(&"npx".to_string()));
+    assert!(!report.converted_secrets.is_empty());
+    assert!(
+        reg.get_server("external-mcp:fs").is_none(),
+        "dry-run must not mutate registry"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "process-containment")]
+#[test]
+fn test_v6_process_containment_job_object_no_orphans() {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "ping -n 30 127.0.0.1 >nul"]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "sleep 30"]);
+        c
+    };
+    omni_process_guard::ProcessGuard::configure_command(&mut cmd);
+    let mut child = cmd.spawn().expect("spawn child process");
+    let mut guard =
+        omni_process_guard::ProcessGuard::attach_child(&child).expect("attach ProcessGuard");
+    assert!(
+        matches!(child.try_wait(), Ok(None)),
+        "child should still be running before terminate"
+    );
+    guard.terminate();
+    let status = child.wait().expect("wait for terminated child");
+    assert!(!status.success(), "terminated child should not exit 0");
+}
+
+#[cfg(feature = "tls-rustls")]
+fn der_len(len: usize) -> Vec<u8> {
+    if len < 128 {
+        vec![len as u8]
+    } else if len < 256 {
+        vec![0x81, len as u8]
+    } else {
+        vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
+    }
+}
+
+#[cfg(feature = "tls-rustls")]
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend_from_slice(&der_len(content.len()));
+    out.extend_from_slice(content);
+    out
+}
+
+#[cfg(feature = "tls-rustls")]
+fn der_bit_string(bytes: &[u8]) -> Vec<u8> {
+    let mut content = Vec::with_capacity(1 + bytes.len());
+    content.push(0x00);
+    content.extend_from_slice(bytes);
+    der_tlv(0x03, &content)
+}
+
+#[cfg(feature = "tls-rustls")]
+fn pem_encode(label: &str, der: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::new();
+    let mut i = 0;
+    while i < der.len() {
+        let b0 = der[i] as u32;
+        let b1 = if i + 1 < der.len() {
+            der[i + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if i + 2 < der.len() {
+            der[i + 2] as u32
+        } else {
+            0
+        };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        b64.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        b64.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        b64.push(if i + 1 < der.len() {
+            TABLE[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        b64.push(if i + 2 < der.len() {
+            TABLE[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        i += 3;
+    }
+    format!(
+        "-----BEGIN {}-----\n{}\n-----END {}-----\n",
+        label, b64, label
+    )
+}
+
+#[cfg(feature = "tls-rustls")]
+fn generate_self_signed_ed25519_pem() -> (String, String, Vec<u8>) {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let pub_bytes = kp.public_key().as_ref();
+
+    // OID 1.3.101.112 (Ed25519): 06 03 2B 65 70
+    let alg_id = der_tlv(0x30, &[0x06, 0x03, 0x2b, 0x65, 0x70]);
+    // Name: CN=localhost
+    let cn_attr = der_tlv(
+        0x30,
+        &[
+            &[0x06, 0x03, 0x55, 0x04, 0x03][..],
+            &der_tlv(0x0c, b"localhost"),
+        ]
+        .concat(),
+    );
+    let rdn = der_tlv(0x31, &cn_attr);
+    let name = der_tlv(0x30, &rdn);
+    // Validity: 2020-01-01 to 2035-01-01 UTCTime
+    let validity = der_tlv(
+        0x30,
+        &[
+            der_tlv(0x17, b"200101000000Z"),
+            der_tlv(0x17, b"350101000000Z"),
+        ]
+        .concat(),
+    );
+    let spki = der_tlv(0x30, &[alg_id.clone(), der_bit_string(pub_bytes)].concat());
+    // SAN extension: dNSName "localhost" (tag 0x82)
+    let san_seq = der_tlv(0x30, &der_tlv(0x82, b"localhost"));
+    let san_ext = der_tlv(
+        0x30,
+        &[
+            &[0x06, 0x03, 0x55, 0x1d, 0x11][..], // OID 2.5.29.17
+            &der_tlv(0x04, &san_seq),
+        ]
+        .concat(),
+    );
+    let exts = der_tlv(0xa3, &der_tlv(0x30, &san_ext));
+    let version = der_tlv(0xa0, &der_tlv(0x02, &[0x02])); // v3
+    let serial = der_tlv(0x02, &[0x01]);
+
+    let tbs = der_tlv(
+        0x30,
+        &[
+            version,
+            serial,
+            alg_id.clone(),
+            name.clone(),
+            validity,
+            name,
+            spki,
+            exts,
+        ]
+        .concat(),
+    );
+    let sig = kp.sign(&tbs);
+    let cert_der = der_tlv(0x30, &[tbs, alg_id, der_bit_string(sig.as_ref())].concat());
+    (
+        pem_encode("CERTIFICATE", &cert_der),
+        pem_encode("PRIVATE KEY", pkcs8.as_ref()),
+        cert_der,
+    )
+}
+
+#[cfg(feature = "tls-rustls")]
+#[test]
+fn test_v6_live_rustls_inbound_tls_handshake() {
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+
+    type PipeBuf = Arc<(Mutex<(VecDeque<u8>, bool)>, Condvar)>;
+
+    struct PipeEnd {
+        rx_buf: PipeBuf,
+        tx_buf: PipeBuf,
+    }
+
+    impl Read for PipeEnd {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let (lock, cvar) = &*self.rx_buf;
+            let mut guard = lock.lock().unwrap();
+            while guard.0.is_empty() && !guard.1 {
+                guard = cvar.wait(guard).unwrap();
+            }
+            if guard.0.is_empty() {
+                return Ok(0);
+            }
+            let n = buf.len().min(guard.0.len());
+            for b in buf.iter_mut().take(n) {
+                *b = guard.0.pop_front().unwrap();
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for PipeEnd {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (lock, cvar) = &*self.tx_buf;
+            let mut guard = lock.lock().unwrap();
+            guard.0.extend(buf);
+            cvar.notify_all();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for PipeEnd {
+        fn drop(&mut self) {
+            let (lock, cvar) = &*self.tx_buf;
+            let mut guard = lock.lock().unwrap();
+            guard.1 = true;
+            cvar.notify_all();
+        }
+    }
+
+    let c2s = Arc::new((Mutex::new((VecDeque::new(), false)), Condvar::new()));
+    let s2c = Arc::new((Mutex::new((VecDeque::new(), false)), Condvar::new()));
+    let server_pipe = PipeEnd {
+        rx_buf: c2s.clone(),
+        tx_buf: s2c.clone(),
+    };
+    let client_pipe = PipeEnd {
+        rx_buf: s2c,
+        tx_buf: c2s,
+    };
+
+    let (cert_pem, key_pem, cert_der) = generate_self_signed_ed25519_pem();
+    let cert_der_mtls = cert_der.clone();
+    let server_cfg = omni_mcp::server::build_inbound_tls_config_from_pem(&cert_pem, &key_pem, None)
+        .expect("build_inbound_tls_config_from_pem");
+
+    let dir = temp_test_path("omni_v6_live_tls");
+    let ctx = ProductionGatewayContext::new(Some(OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    }));
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let srv_handle = std::thread::spawn(move || {
+        let conn = rustls::ServerConnection::new(server_cfg).unwrap();
+        let tls_stream = rustls::StreamOwned::new(conn, server_pipe);
+        omni_mcp::server::handle_stream(tls_stream, &ctx);
+        let _ = done_tx.send(());
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(cert_der))
+        .unwrap();
+    let client_cfg = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    let mut tls_client = rustls::StreamOwned::new(conn, client_pipe);
+    tls_client
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    tls_client.flush().unwrap();
+    let mut resp = String::new();
+    let _ = tls_client.read_to_string(&mut resp);
+    drop(tls_client);
+    let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK"),
+        "Expected 200 OK over live rustls TLS, got: {}",
+        resp
+    );
+    let _ = srv_handle.join();
+
+    // mTLS: server configured with client CA must reject client without a client certificate
+    let mtls_cfg =
+        omni_mcp::server::build_inbound_tls_config_from_pem(&cert_pem, &key_pem, Some(&cert_pem))
+            .expect("build mTLS ServerConfig");
+    let c2s2 = Arc::new((Mutex::new((VecDeque::new(), false)), Condvar::new()));
+    let s2c2 = Arc::new((Mutex::new((VecDeque::new(), false)), Condvar::new()));
+    let srv_pipe2 = PipeEnd {
+        rx_buf: c2s2.clone(),
+        tx_buf: s2c2.clone(),
+    };
+    let cli_pipe2 = PipeEnd {
+        rx_buf: s2c2,
+        tx_buf: c2s2,
+    };
+    let ctx2 = ProductionGatewayContext::new(Some(OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    }));
+    let srv_handle2 = std::thread::spawn(move || {
+        let conn = rustls::ServerConnection::new(mtls_cfg).unwrap();
+        let tls_stream = rustls::StreamOwned::new(conn, srv_pipe2);
+        omni_mcp::server::handle_stream(tls_stream, &ctx2);
+    });
+    let mut roots2 = rustls::RootCertStore::empty();
+    roots2
+        .add(rustls::pki_types::CertificateDer::from(cert_der_mtls))
+        .unwrap();
+    let client_cfg2 = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots2)
+            .with_no_client_auth(),
+    );
+    let server_name2 = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn2 = rustls::ClientConnection::new(client_cfg2, server_name2).unwrap();
+    let mut tls_client2 = rustls::StreamOwned::new(conn2, cli_pipe2);
+    let _ = tls_client2
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let _ = tls_client2.flush();
+    let mut resp2 = String::new();
+    let read_res2 = tls_client2.read_to_string(&mut resp2);
+    drop(tls_client2);
+    let _ = srv_handle2.join();
+    assert!(
+        read_res2.is_err() || !resp2.starts_with("HTTP/1.1 200 OK"),
+        "mTLS server must reject client without client cert, got: {}",
+        resp2
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "tls-rustls")]
+fn b64url(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i] as u32;
+        let b1 = if i + 1 < data.len() {
+            data[i + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if i + 2 < data.len() {
+            data[i + 2] as u32
+        } else {
+            0
+        };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if i + 1 < data.len() {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        }
+        if i + 2 < data.len() {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        }
+        i += 3;
+    }
+    out
+}
+
+#[cfg(feature = "tls-rustls")]
+#[test]
+fn test_v6_oidc_jwks_eddsa_es256_and_cimd_validation() {
+    use ring::signature::{EcdsaKeyPair, Ed25519KeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    let rng = ring::rand::SystemRandom::new();
+
+    // 1. EdDSA (Ed25519) JWT + JWKS
+    let ed_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let ed_kp = Ed25519KeyPair::from_pkcs8(ed_pkcs8.as_ref()).unwrap();
+    let ed_x = b64url(ed_kp.public_key().as_ref());
+
+    // 2. ES256 (P-256) JWT + JWKS
+    let ec_pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    let ec_kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, ec_pkcs8.as_ref(), &rng)
+        .unwrap();
+    let ec_pub = ec_kp.public_key().as_ref(); // 0x04 || x(32) || y(32)
+    assert_eq!(ec_pub.len(), 65);
+    let ec_x = b64url(&ec_pub[1..33]);
+    let ec_y = b64url(&ec_pub[33..65]);
+
+    let jwks = json!({
+        "keys": [
+            { "kty": "OKP", "crv": "Ed25519", "kid": "ed-1", "alg": "EdDSA", "x": ed_x },
+            { "kty": "EC", "crv": "P-256", "kid": "ec-1", "alg": "ES256", "x": ec_x, "y": ec_y }
+        ]
+    })
+    .to_string_compact();
+
+    let exp = omni_mcp::logging::now_epoch_secs() + 600.0;
+    let claims = json!({
+        "sub": "svc-agent-1",
+        "iss": "https://idp.omni.test",
+        "aud": "https://gateway.omni.test/mcp",
+        "roles": ["operator", "admin"],
+        "scope": "mcp:tools",
+        "exp": exp
+    })
+    .to_string_compact();
+
+    let ed_hdr = b64url(br#"{"alg":"EdDSA","kid":"ed-1","typ":"JWT"}"#);
+    let payload_b64 = b64url(claims.as_bytes());
+    let ed_input = format!("{}.{}", ed_hdr, payload_b64);
+    let ed_sig = ed_kp.sign(ed_input.as_bytes());
+    let ed_jwt = format!("{}.{}", ed_input, b64url(ed_sig.as_ref()));
+
+    let principal = omni_mcp::server::validate_jwt_oidc_jwks(
+        &ed_jwt,
+        &jwks,
+        Some("https://idp.omni.test"),
+        Some("https://gateway.omni.test/mcp"),
+    )
+    .expect("valid EdDSA JWT");
+    assert_eq!(principal.id, "svc-agent-1");
+    assert_eq!(principal.role, omni_mcp::server::AuthRole::Admin);
+
+    // Tampered signature must fail with 401
+    let tampered = format!("{}.AAAA", ed_input);
+    assert_eq!(
+        omni_mcp::server::validate_jwt_oidc_jwks(&tampered, &jwks, None, None).unwrap_err(),
+        401
+    );
+
+    // Wrong audience must fail with 401
+    assert_eq!(
+        omni_mcp::server::validate_jwt_oidc_jwks(
+            &ed_jwt,
+            &jwks,
+            Some("https://idp.omni.test"),
+            Some("https://wrong.example/mcp"),
+        )
+        .unwrap_err(),
+        401
+    );
+
+    // ES256 verification
+    let ec_hdr = b64url(br#"{"alg":"ES256","kid":"ec-1","typ":"JWT"}"#);
+    let ec_input = format!("{}.{}", ec_hdr, payload_b64);
+    let ec_sig = ec_kp.sign(&rng, ec_input.as_bytes()).unwrap();
+    let ec_jwt = format!("{}.{}", ec_input, b64url(ec_sig.as_ref()));
+    let ec_principal = omni_mcp::server::validate_jwt_oidc_jwks(
+        &ec_jwt,
+        &jwks,
+        Some("https://idp.omni.test"),
+        Some("https://gateway.omni.test/mcp"),
+    )
+    .expect("valid ES256 JWT");
+    assert_eq!(ec_principal.id, "svc-agent-1");
+
+    // 3. RS256 (RSA-2048) JWT + JWKS verification
+    let rs_jwks = json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": "rsa-test-1",
+            "alg": "RS256",
+            "n": "s_gyYfkRDos8pF52mdqHcfe7qv4KaubBYzvTYYTf_CuIDZr4Km86aDIQfLn1C5MpqKPwAkmnzgBgkTlo34Xbb8yFQWbGiaR-lt5v-Tzlncoaq--4ozZNE6ChztH24ngyGaAL6uCMgiBaRo1xALsdfczIAdv3j97DmnKuimBNDGQ0qjog-4jmvXRhxXQ7oOUNVhcNalbGtrRx_DxEC7m36dQh3vREQgx1PkKmwwv0Qe_RFjC8Jkx3F8ZWmlV91IF7EUsiNZVvmS5CFKABnM7D_T94rDncVPAsOq3jaLNdbFAsg7u302hGWfpxz3HRT_N1jbunhqguuJpZFe_D2aUFCw",
+            "e": "AQAB"
+        }]
+    })
+    .to_string_compact();
+    let rs_jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYS10ZXN0LTEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0Iiwic3ViIjoicnNhLWFkbWluIiwiYXVkIjoiaHR0cHM6Ly9vbW5pLnRlc3QiLCJyb2xlcyI6WyJhZG1pbiJdLCJleHAiOjQxMDI0NDQ4MDB9.BWc1oqeOll5rp4ptWOHzzfIvUZU8R817pwNDOzN_DjM6oDOVlQJrTX9YnoHEpLKA3Vu6QDJlaCDqBApwovisbXK_3B0tZMSOuy6NdWLVecr0Op5NnstCFHcKeD_tNFOk6aV3xjdbCayCo0lwqeAX9otDbu5yR3fnN-X667IplEt7N8a-AT5m3grtN3RFVWqEoXGY1Fpqp7j9miTeaVcH_3SQc5GMdMYZsY0Nf3XhvnSVLY-0apMenhubmLR2JekQzdXb-WW4UVSLFxU2Am2PjMSAuOGOpbvSrXYCzFSyf1T1ycA4ijwKIOT2ENf3cp-GxCfsIlWdH_uUD8soqI7pMA";
+    let rs_principal = omni_mcp::server::validate_jwt_oidc_jwks(
+        rs_jwt,
+        &rs_jwks,
+        Some("https://issuer.test"),
+        Some("https://omni.test"),
+    )
+    .expect("valid RS256 JWT");
+    assert_eq!(rs_principal.id, "rsa-admin");
+    assert_eq!(rs_principal.role, omni_mcp::server::AuthRole::Admin);
+
+    let rs_tampered = rs_jwt.replacen(".BWc1", ".CWc1", 1);
+    assert_eq!(
+        omni_mcp::server::validate_jwt_oidc_jwks(
+            &rs_tampered,
+            &rs_jwks,
+            Some("https://issuer.test"),
+            Some("https://omni.test"),
+        )
+        .unwrap_err(),
+        401
+    );
+
+    // CIMD validation
+    let cimd_ok = json!({
+        "client_id": "https://client.example.com/oauth.json",
+        "client_name": "Example Client",
+        "redirect_uris": ["http://127.0.0.1:8080/callback"]
+    });
+    omni_mcp::server::validate_cimd_metadata(&cimd_ok, "https://client.example.com/oauth.json")
+        .expect("valid CIMD");
+    assert!(omni_mcp::server::validate_cimd_metadata(
+        &cimd_ok,
+        "https://other.example.com/oauth.json"
+    )
+    .is_err());
+}
+
+#[cfg(feature = "async-runtime")]
+#[test]
+fn test_v6_tokio_async_listener_http_and_sse_graceful_drain() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = temp_test_path("omni_v6_tokio_async");
+    let ctx = std::sync::Arc::new(ProductionGatewayContext::new(Some(OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    })));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // 1. Async HTTP/1.1 GET /healthz via handle_async_stream
+        let (mut client_http, server_http) = tokio::io::duplex(65536);
+        let h1 = tokio::spawn(omni_mcp::server::handle_async_stream(
+            server_http,
+            ctx.clone(),
+            shutdown_rx.clone(),
+        ));
+        client_http
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        client_http.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {}", resp);
+        let _ = h1.await;
+
+        // 2. Async SSE /api/v1/events + graceful shutdown drain
+        let (mut client_sse, server_sse) = tokio::io::duplex(65536);
+        let h2 = tokio::spawn(omni_mcp::server::handle_async_stream(
+            server_sse,
+            ctx.clone(),
+            shutdown_rx,
+        ));
+        client_sse
+            .write_all(
+                b"GET /api/v1/events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin_dev_token\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut chunk = vec![0u8; 1024];
+        let n = client_sse.read(&mut chunk).await.unwrap();
+        let sse_head = String::from_utf8_lossy(&chunk[..n]);
+        assert!(
+            sse_head.contains("text/event-stream"),
+            "expected SSE headers, got: {}",
+            sse_head
+        );
+
+        let _ = shutdown_tx.send(true);
+        drop(client_sse);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), h2).await;
+    });
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "async-runtime")]
+#[test]
+#[ignore = "requires OS TCP socket bind outside sandbox"]
+fn test_v6_tokio_async_listener_real_tcp_bind() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = temp_test_path("omni_v6_tokio_real_tcp");
+    let ctx = std::sync::Arc::new(ProductionGatewayContext::new(Some(OmniConfig {
+        data_dir: dir.clone(),
+        ..Default::default()
+    })));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 127.0.0.1:0");
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let srv = tokio::spawn(omni_mcp::server::serve_async_listener(
+            listener,
+            ctx,
+            None,
+            shutdown_rx,
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {}", resp);
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), srv).await;
+    });
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "storage-sqlite")]
+#[test]
+fn test_v6_sqlite_registry_wal_cas_and_audit_sink() {
+    use omni_mcp::storage::{AuditSink, RegistryStorageBackend, SqliteRegistryBackend};
+    let dir = temp_test_path("omni_v6_sqlite");
+    let _ = fs::create_dir_all(&dir);
+    let db_path = std::path::Path::new(&dir).join("omni_test.db");
+    let dsn = format!("sqlite://{}", db_path.to_string_lossy());
+
+    let backend = std::sync::Arc::new(SqliteRegistryBackend::try_open(&dsn).unwrap());
+    assert_eq!(backend.journal_mode().unwrap().to_lowercase(), "wal");
+
+    // Server CRUD
+    let mut srv = ServerRecord::new("sql-srv", "SQL Server", "desc", "platform");
+    srv.status = ToolStatus::Enabled;
+    backend.save_server(&srv);
+    assert_eq!(backend.load_all_servers().len(), 1);
+    assert!(backend.delete_server("sql-srv").is_some());
+    assert!(backend.load_all_servers().is_empty());
+
+    // Atomic CAS across 4 concurrent threads
+    let frame = omni_mcp::models::SuspendedExecutionFrame {
+        execution_id: "exec_cas_1".to_string(),
+        script_hash: "h".to_string(),
+        script_source: "1 + 1".to_string(),
+        instruction_ptr: 0,
+        target_var: None,
+        serialized_scope: json!({}),
+        pending_server: "s".to_string(),
+        pending_tool: "t".to_string(),
+        pending_arguments: json!({}),
+        pending_reason: "mutation".to_string(),
+        policy_context_hash: "p".to_string(),
+        caller_actor: "alice".to_string(),
+        logs: Vec::new(),
+        completed_mutations: Vec::new(),
+        created_at: 1.0,
+        pending_arguments_hash: "ah".to_string(),
+        expires_at: 9999999999.0,
+        approver_identity: None,
+        is_consumed: false,
+        frame_hmac: "hmac".to_string(),
+    };
+    backend.save_suspended_frame(&frame);
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let b = backend.clone();
+        handles.push(std::thread::spawn(move || {
+            b.consume_frame_cas("exec_cas_1", &format!("approver_{}", i))
+        }));
+    }
+    let ok_count = handles
+        .into_iter()
+        .map(|h| h.join().unwrap().is_ok())
+        .filter(|ok| *ok)
+        .count();
+    assert_eq!(ok_count, 1, "exactly one concurrent CAS must succeed");
+
+    // AuditSink persistence & integrity
+    let audit = omni_mcp::storage::MerkleAuditStore::new(None);
+    let r1 = audit.record_invocation("alice", "s", "t1", &json!({}), "ok", 1);
+    let r2 = audit.record_invocation("bob", "s", "t2", &json!({}), "ok", 2);
+    backend.emit_record(&r1).unwrap();
+    backend.emit_record(&r2).unwrap();
+    assert_eq!(backend.verify_integrity(), (true, 2));
+
+    // Tampering with payload JSON (even with current_hash intact) must fail verify_integrity
+    {
+        let mut tampered_r2 = r2.clone();
+        tampered_r2.actor = "mallory".to_string();
+        backend.emit_record(&tampered_r2).unwrap();
+        assert_eq!(backend.verify_integrity(), (false, 1));
+    }
+
+    drop(backend);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "sandbox-wasm")]
+#[test]
+fn test_v6_wasm_sandbox_execution_and_fuel_exhaustion() {
+    use omni_mcp::data_plane::codemode::WasmSandboxExecutor;
+    // Minimal valid .wasm module: (module (func (export "add") (param i64 i64) (result i64) local.get 0 local.get 1 i64.add))
+    let add_wasm: Vec<u8> = vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7e, 0x7e, 0x01,
+        0x7e, // type section: (i64, i64) -> i64
+        0x03, 0x02, 0x01, 0x00, // function section
+        0x07, 0x07, 0x01, 0x03, b'a', b'd', b'd', 0x00, 0x00, // export "add"
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x7c,
+        0x0b, // code: local.get 0, local.get 1, i64.add, end
+    ];
+    let exec = WasmSandboxExecutor::new(10_000, 1024 * 1024);
+    let out = exec.execute_wasm(&add_wasm, "add", &[19, 23]);
+    assert_eq!(out.status, "OK", "err: {:?}", out.error);
+    assert_eq!(out.result.as_f64(), Some(42.0));
+    assert!(out.ops_consumed > 0);
+
+    // Infinite loop module: (module (func (export "spin") (loop (br 0))))
+    let spin_wasm: Vec<u8> = vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section: () -> ()
+        0x03, 0x02, 0x01, 0x00, // function section
+        0x07, 0x08, 0x01, 0x04, b's', b'p', b'i', b'n', 0x00, 0x00, // export "spin"
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b, // loop br 0 end end
+    ];
+    let limited = WasmSandboxExecutor::new(50, 1024 * 1024);
+    let fuel_out = limited.execute_wasm(&spin_wasm, "spin", &[]);
+    assert_eq!(fuel_out.status, "ERROR");
+    assert_eq!(
+        fuel_out.error_code,
+        Some(omni_mcp::models::FUEL_EXHAUSTED),
+        "err: {:?}",
+        fuel_out.error
+    );
+    assert_eq!(
+        fuel_out.feature_status,
+        omni_mcp::models::FeatureStatus::FuelExhausted
+    );
+
+    // Memory limit exceeded on instantiation: (module (memory 2)) = 128 KiB > 64 KiB cap
+    let mem_wasm: Vec<u8> = vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x05, 0x03, 0x01, 0x00, 0x02, // memory section: 1 memory, min=2 pages (128 KiB)
+    ];
+    let mem_limited = WasmSandboxExecutor::new(10_000, 65_536);
+    let mem_out = mem_limited.execute_wasm(&mem_wasm, "noop", &[]);
+    assert_eq!(mem_out.status, "ERROR");
+    assert_eq!(
+        mem_out.error_code,
+        Some(omni_mcp::models::MEMORY_EXHAUSTED),
+        "err: {:?}",
+        mem_out.error
+    );
+    assert_eq!(
+        mem_out.feature_status,
+        omni_mcp::models::FeatureStatus::MemoryExhausted
+    );
 }

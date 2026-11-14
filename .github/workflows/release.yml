@@ -23,9 +23,17 @@ jobs:
             binary_name: omni-gateway
             asset_name: omni-gateway-linux-x64
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary_name: omni-gateway
+            asset_name: omni-gateway-linux-x64-musl
+          - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             binary_name: omni-gateway
             asset_name: omni-gateway-linux-arm64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            binary_name: omni-gateway
+            asset_name: omni-gateway-linux-arm64-musl
           - os: macos-latest
             target: macos-universal
             binary_name: omni-gateway
@@ -38,41 +46,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cross-linker (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install cross-linker (Linux ARM64 / musl)
+        if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target == 'macos-universal' && 'aarch64-apple-darwin,x86_64-apple-darwin' || (matrix.target == 'windows-universal' && 'x86_64-pc-windows-msvc,aarch64-pc-windows-msvc' || matrix.target) }}
 
-      - name: Build Release Binary
+      - name: Build Release Binaries (omni-gateway, omni, aifx)
         shell: bash
         run: |
           mkdir -p dist
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --release --target ${{ matrix.target }}
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ] || [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target ${{ matrix.target }}
             cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
-            chmod +x dist/${{ matrix.asset_name }}
+            cp target/${{ matrix.target }}/release/omni dist/omni-${{ matrix.target }}
+            cp target/${{ matrix.target }}/release/aifx dist/aifx-${{ matrix.target }}
+            chmod +x dist/*
           elif [ "${{ matrix.target }}" = "macos-universal" ]; then
-            cargo build --release --target aarch64-apple-darwin
-            cargo build --release --target x86_64-apple-darwin
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target aarch64-apple-darwin
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target x86_64-apple-darwin
             cp target/aarch64-apple-darwin/release/omni-gateway dist/omni-gateway-darwin-arm64
             cp target/x86_64-apple-darwin/release/omni-gateway dist/omni-gateway-darwin-x64
-            chmod +x dist/omni-gateway-darwin-*
+            cp target/aarch64-apple-darwin/release/omni dist/omni-darwin-arm64
+            cp target/x86_64-apple-darwin/release/omni dist/omni-darwin-x64
+            cp target/aarch64-apple-darwin/release/aifx dist/aifx-darwin-arm64
+            cp target/x86_64-apple-darwin/release/aifx dist/aifx-darwin-x64
+            chmod +x dist/*
           elif [ "${{ matrix.target }}" = "windows-universal" ]; then
-            cargo build --release --target x86_64-pc-windows-msvc
-            cargo build --release --target aarch64-pc-windows-msvc
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target x86_64-pc-windows-msvc
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target aarch64-pc-windows-msvc
             cp target/x86_64-pc-windows-msvc/release/omni-gateway.exe dist/omni-gateway-win32-x64.exe
             cp target/aarch64-pc-windows-msvc/release/omni-gateway.exe dist/omni-gateway-win32-arm64.exe
+            cp target/x86_64-pc-windows-msvc/release/omni.exe dist/omni-win32-x64.exe
+            cp target/x86_64-pc-windows-msvc/release/aifx.exe dist/aifx-win32-x64.exe
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target ${{ matrix.target }}
             cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
-            chmod +x dist/${{ matrix.asset_name }}
+            cp target/${{ matrix.target }}/release/omni dist/omni-${{ matrix.target }}
+            cp target/${{ matrix.target }}/release/aifx dist/aifx-${{ matrix.target }}
+            chmod +x dist/*
           fi
+
+      - name: Generate Cargo.lock SBOM
+        shell: bash
+        run: |
+          cargo metadata --format-version 1 --locked > dist/sbom-${{ matrix.target }}.json || true
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -80,9 +103,32 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: dist/*
 
+  e2e-playwright:
+    name: UI Build & Playwright E2E Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Rust Workspace Tests
+        run: cargo test --workspace --all-features --locked
+      - name: Build UI & Gateway
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+          cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment"
+      - name: Run Playwright E2E
+        run: |
+          npx --prefix ui playwright install chromium
+          ./target/release/omni-gateway 8080 &
+          sleep 2
+          npx --prefix ui playwright test
+
   release-and-publish:
     name: GitHub Release & NPM Publish
-    needs: build-binaries
+    needs: [build-binaries, e2e-playwright]
     runs-on: ubuntu-latest
     permissions:
       contents: write

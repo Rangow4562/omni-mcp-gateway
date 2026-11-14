@@ -4,7 +4,10 @@
 
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
-use crate::models::{ProtocolType, SchemaSource, ToolRecord, ToolStatus};
+use crate::models::{
+    ExternalPromptRecord, ExternalResourceRecord, ProtocolType, SchemaSource, ToolRecord,
+    ToolStatus,
+};
 use crate::upstream::secrets::resolve_secret_ref;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -12,7 +15,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -94,7 +97,9 @@ pub fn check_stdio_command_allowlist(
 struct StdioProcess {
     child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
-    rx: Receiver<String>,
+    pending: Arc<Mutex<BTreeMap<u64, Sender<String>>>>,
+    #[cfg(feature = "process-containment")]
+    _guard: Option<omni_process_guard::ProcessGuard>,
 }
 
 pub struct StdioUpstreamSession {
@@ -173,6 +178,21 @@ impl StdioUpstreamSession {
         cmd.args(&self.args);
         cmd.env_clear();
 
+        // OS process-tree containment (pure safe std, #![forbid(unsafe_code)] compliant)
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        #[cfg(feature = "process-containment")]
+        omni_process_guard::ProcessGuard::configure_command(&mut cmd);
+
         // Pass resolved secrets
         for (k, v) in resolved_envs {
             cmd.env(k, v);
@@ -218,6 +238,16 @@ impl StdioUpstreamSession {
             )
         })?;
 
+        #[cfg(feature = "process-containment")]
+        let _guard = match omni_process_guard::ProcessGuard::attach_child(&child) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Failed to attach process containment guard: {}", e));
+            }
+        };
+
         let stdin = Arc::new(Mutex::new(
             child
                 .stdin
@@ -256,8 +286,10 @@ impl StdioUpstreamSession {
             }
         });
 
-        // Detached background thread: Stdout reader with server-to-client request rejection
-        let (tx, rx) = mpsc::channel();
+        // Detached background thread: Stdout reader with ID-multiplexing & server-to-client request rejection
+        let pending: Arc<Mutex<BTreeMap<u64, Sender<String>>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let pending_reader = pending.clone();
         let stdin_clone = stdin.clone();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -293,21 +325,29 @@ impl StdioUpstreamSession {
                                 continue;
                             }
 
-                            // RPC Response: forward to receiver channel
-                            if tx.send(trimmed.to_string()).is_err() {
-                                break;
+                            // RPC Response: route by JSON-RPC id to waiting caller
+                            if let Some(id_num) = req_id_opt.and_then(|v| v.as_u64()) {
+                                let sender_opt = pending_reader.lock().unwrap().remove(&id_num);
+                                if let Some(tx) = sender_opt {
+                                    let _ = tx.send(trimmed.to_string());
+                                }
                             }
-                        } else {
-                            // Non-JSON line: ignore
-                            continue;
                         }
                     }
                     Err(_) => break,
                 }
             }
+            // Wake any remaining waiters if stdout closes
+            pending_reader.lock().unwrap().clear();
         });
 
-        Ok(StdioProcess { child, stdin, rx })
+        Ok(StdioProcess {
+            child,
+            stdin,
+            pending,
+            #[cfg(feature = "process-containment")]
+            _guard,
+        })
     }
 
     fn ensure_started(&self) -> Result<(), String> {
@@ -341,6 +381,9 @@ impl StdioUpstreamSession {
             });
 
             let proc_ref = guard.as_mut().unwrap();
+            let (tx, rx) = mpsc::channel();
+            proc_ref.pending.lock().unwrap().insert(1, tx);
+
             let mut wire = init_req.to_string_compact();
             wire.push('\n');
             {
@@ -352,10 +395,13 @@ impl StdioUpstreamSession {
             }
 
             let timeout = Duration::from_millis(self.call_timeout_ms);
-            let resp_str = proc_ref.rx.recv_timeout(timeout).map_err(|e| match e {
-                RecvTimeoutError::Timeout => "Initialize handshake timed out".to_string(),
-                RecvTimeoutError::Disconnected => {
-                    "Child process exited prematurely during initialize".to_string()
+            let resp_str = rx.recv_timeout(timeout).map_err(|e| {
+                proc_ref.pending.lock().unwrap().remove(&1);
+                match e {
+                    RecvTimeoutError::Timeout => "Initialize handshake timed out".to_string(),
+                    RecvTimeoutError::Disconnected => {
+                        "Child process exited prematurely during initialize".to_string()
+                    }
                 }
             })?;
 
@@ -385,6 +431,15 @@ impl StdioUpstreamSession {
     }
 
     pub fn call_rpc(&self, method: &str, params: JsonValue) -> Result<JsonValue, String> {
+        self.call_rpc_with_timeout(method, params, None)
+    }
+
+    pub fn call_rpc_with_timeout(
+        &self,
+        method: &str,
+        params: JsonValue,
+        timeout_override_ms: Option<u64>,
+    ) -> Result<JsonValue, String> {
         self.ensure_started()?;
 
         let req_id = self.next_request_id.fetch_add(1, Ordering::SeqCst) + 2;
@@ -398,23 +453,35 @@ impl StdioUpstreamSession {
         let mut wire = req.to_string_compact();
         wire.push('\n');
 
-        let mut guard = self.process.lock().unwrap();
-        let proc = guard
-            .as_mut()
-            .ok_or_else(|| "Child process is not running".to_string())?;
+        let (stdin_arc, pending_arc, rx) = {
+            let guard = self.process.lock().unwrap();
+            let proc = guard
+                .as_ref()
+                .ok_or_else(|| "Child process is not running".to_string())?;
+            let (tx, rx) = mpsc::channel();
+            proc.pending.lock().unwrap().insert(req_id, tx);
+            (proc.stdin.clone(), proc.pending.clone(), rx)
+        };
 
         {
-            let mut sin = proc.stdin.lock().unwrap();
-            sin.write_all(wire.as_bytes())
-                .map_err(|e| format!("Failed to write request to child: {}", e))?;
-            sin.flush()
-                .map_err(|e| format!("Failed to flush request: {}", e))?;
+            let mut sin = stdin_arc.lock().unwrap();
+            if let Err(e) = sin.write_all(wire.as_bytes()) {
+                pending_arc.lock().unwrap().remove(&req_id);
+                return Err(format!("Failed to write request to child: {}", e));
+            }
+            if let Err(e) = sin.flush() {
+                pending_arc.lock().unwrap().remove(&req_id);
+                return Err(format!("Failed to flush request: {}", e));
+            }
         }
 
-        let timeout = Duration::from_millis(self.call_timeout_ms);
-        let resp_str = proc.rx.recv_timeout(timeout).map_err(|e| match e {
-            RecvTimeoutError::Timeout => format!("Upstream call '{}' timed out", method),
-            RecvTimeoutError::Disconnected => "Child process exited unexpectedly".to_string(),
+        let timeout = Duration::from_millis(timeout_override_ms.unwrap_or(self.call_timeout_ms));
+        let resp_str = rx.recv_timeout(timeout).map_err(|e| {
+            pending_arc.lock().unwrap().remove(&req_id);
+            match e {
+                RecvTimeoutError::Timeout => format!("Upstream call '{}' timed out", method),
+                RecvTimeoutError::Disconnected => "Child process exited unexpectedly".to_string(),
+            }
         })?;
 
         let parsed = JsonValue::parse(&resp_str)
@@ -488,18 +555,109 @@ impl StdioUpstreamSession {
     }
 
     pub fn call_tool(&self, tool_name: &str, arguments: &JsonValue) -> Result<JsonValue, String> {
-        self.call_rpc(
+        self.call_tool_with_timeout(tool_name, arguments, None)
+    }
+
+    pub fn call_tool_with_timeout(
+        &self,
+        tool_name: &str,
+        arguments: &JsonValue,
+        timeout_ms: Option<u64>,
+    ) -> Result<JsonValue, String> {
+        self.call_rpc_with_timeout(
             "tools/call",
             json!({
                 "name": tool_name,
                 "arguments": arguments.clone()
             }),
+            timeout_ms,
         )
+    }
+
+    pub fn fetch_resources(&self) -> Result<Vec<ExternalResourceRecord>, String> {
+        let result = match self.call_rpc("resources/list", JsonValue::object()) {
+            Ok(r) => r,
+            Err(e) if e.contains("-32601") || e.contains("Method not found") => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        if let Some(items) = result.get("resources").and_then(|r| r.as_array()) {
+            for item in items {
+                let uri = item.get("uri").and_then(|x| x.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|x| x.as_str()).unwrap_or(uri);
+                if uri.is_empty() {
+                    continue;
+                }
+                out.push(ExternalResourceRecord {
+                    uri: uri.to_string(),
+                    name: name.to_string(),
+                    description: item
+                        .get("description")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string()),
+                    mime_type: item
+                        .get("mimeType")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string()),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn fetch_prompts(&self) -> Result<Vec<ExternalPromptRecord>, String> {
+        let result = match self.call_rpc("prompts/list", JsonValue::object()) {
+            Ok(r) => r,
+            Err(e) if e.contains("-32601") || e.contains("Method not found") => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        if let Some(items) = result.get("prompts").and_then(|r| r.as_array()) {
+            for item in items {
+                let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let arguments = item
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+                out.push(ExternalPromptRecord {
+                    name: name.to_string(),
+                    description: item
+                        .get("description")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string()),
+                    arguments,
+                });
+            }
+        }
+        Ok(out)
     }
 
     pub fn shutdown(&self) {
         let mut guard = self.process.lock().unwrap();
         if let Some(mut proc) = guard.take() {
+            proc.pending.lock().unwrap().clear();
+            drop(proc.stdin);
+            #[cfg(feature = "process-containment")]
+            if let Some(ref mut g) = proc._guard {
+                g.terminate();
+            }
+            #[cfg(all(unix, not(feature = "process-containment")))]
+            {
+                let pid = proc.child.id();
+                let _ = Command::new("kill")
+                    .args(["-KILL", &format!("-{}", pid)])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             let _ = proc.child.kill();
             let _ = proc.child.wait();
         }

@@ -1,6 +1,10 @@
+[workspace]
+members = [".", "crates/omni-process-guard"]
+resolver = "2"
+
 [package]
 name = "omni-mcp"
-version = "5.5.1"
+version = "6.0.0"
 rust-version = "1.75.0"
 edition = "2021"
 authors = ["Omni MCP Engineering"]
@@ -13,9 +17,27 @@ keywords = ["mcp", "gateway", "model-context-protocol", "json-rpc", "llm"]
 categories = ["web-programming", "network-programming", "command-line-utilities"]
 
 [features]
-default = []
+default = ["os-csprng"]
+os-csprng = ["dep:getrandom"]
+tls-rustls = ["dep:rustls", "dep:webpki-roots", "dep:ring"]
+async-runtime = ["dep:tokio"]
+storage-sqlite = ["dep:rusqlite"]
+storage-postgres = []
+sandbox-wasm = ["dep:wasmi"]
+process-containment = ["dep:omni-process-guard"]
 transport-http = []
 legacy-sse = []
+testing-mocks = []
+
+[dependencies]
+getrandom = { version = "0.2", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+ring = { version = "0.17", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "signal", "sync", "time", "macros"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+wasmi = { version = "0.40", optional = true }
+omni-process-guard = { path = "crates/omni-process-guard", optional = true }
 
 [lib]
 name = "omni_mcp"

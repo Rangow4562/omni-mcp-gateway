@@ -6,14 +6,15 @@ RUN npm ci
 COPY ui/ ./
 RUN npm run build
 
-FROM rust:1.85-slim AS rust-builder
+FROM rust:1-slim AS rust-builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
 COPY src/ ./src/
-RUN cargo build --release --locked
+RUN cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment"
 
-FROM debian:bookworm-slim AS runner
-LABEL org.opencontainers.image.version="5.5.1"
+FROM debian:trixie-slim AS runner
+LABEL org.opencontainers.image.version="6.0.0"
 WORKDIR /app
 
 ENV OMNI_HOST=0.0.0.0 \

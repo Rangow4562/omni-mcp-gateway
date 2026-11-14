@@ -1,0 +1,12 @@
+[package]
+name = "omni-process-guard"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Isolated OS process-tree containment for omni-mcp (Windows Job Objects & Unix process groups)."
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

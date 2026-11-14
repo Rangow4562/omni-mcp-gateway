@@ -164,15 +164,81 @@ impl UpstreamManager {
             .upstream_config
             .as_ref()
             .ok_or_else(|| format!("Server '{}' has no upstream transport config", server.name))?;
+        let timeout_ms = server.tools.get(tool_name).and_then(|t| t.timeout_ms);
 
         match transport {
             UpstreamTransportConfig::Stdio { .. } => {
                 let session = self.get_or_create_stdio_session(server)?;
-                session.call_tool(tool_name, arguments)
+                session.call_tool_with_timeout(tool_name, arguments, timeout_ms)
             }
             UpstreamTransportConfig::StreamableHttp { .. } => {
                 let session = self.get_or_create_http_session(server)?;
                 session.call_tool(tool_name, arguments)
+            }
+        }
+    }
+
+    pub fn call_rpc_for_server(
+        &self,
+        server: &ServerRecord,
+        method: &str,
+        params: JsonValue,
+    ) -> Result<JsonValue, String> {
+        let transport = server
+            .upstream_config
+            .as_ref()
+            .ok_or_else(|| format!("Server '{}' has no upstream transport config", server.name))?;
+
+        match transport {
+            UpstreamTransportConfig::Stdio { .. } => {
+                let session = self.get_or_create_stdio_session(server)?;
+                session.call_rpc(method, params)
+            }
+            UpstreamTransportConfig::StreamableHttp { .. } => {
+                let session = self.get_or_create_http_session(server)?;
+                session.call_rpc(method, params)
+            }
+        }
+    }
+
+    pub fn fetch_resources(
+        &self,
+        server: &ServerRecord,
+    ) -> Result<Vec<crate::models::ExternalResourceRecord>, String> {
+        let transport = server
+            .upstream_config
+            .as_ref()
+            .ok_or_else(|| format!("Server '{}' has no upstream transport config", server.name))?;
+
+        match transport {
+            UpstreamTransportConfig::Stdio { .. } => {
+                let session = self.get_or_create_stdio_session(server)?;
+                session.fetch_resources()
+            }
+            UpstreamTransportConfig::StreamableHttp { .. } => {
+                let session = self.get_or_create_http_session(server)?;
+                session.fetch_resources()
+            }
+        }
+    }
+
+    pub fn fetch_prompts(
+        &self,
+        server: &ServerRecord,
+    ) -> Result<Vec<crate::models::ExternalPromptRecord>, String> {
+        let transport = server
+            .upstream_config
+            .as_ref()
+            .ok_or_else(|| format!("Server '{}' has no upstream transport config", server.name))?;
+
+        match transport {
+            UpstreamTransportConfig::Stdio { .. } => {
+                let session = self.get_or_create_stdio_session(server)?;
+                session.fetch_prompts()
+            }
+            UpstreamTransportConfig::StreamableHttp { .. } => {
+                let session = self.get_or_create_http_session(server)?;
+                session.fetch_prompts()
             }
         }
     }

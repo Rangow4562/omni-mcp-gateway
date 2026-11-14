@@ -3,7 +3,8 @@
 
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
-use std::fs::{File, OpenOptions};
+use std::collections::VecDeque;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::RwLock;
 
@@ -250,22 +251,85 @@ impl MerkleAuditRecord {
     }
 }
 
+struct AuditState {
+    records: VecDeque<MerkleAuditRecord>,
+    total_count: u64,
+    last_hash: String,
+    window_base_prev_hash: String,
+    segment_index: u64,
+    records_in_segment: usize,
+    memory_window: usize,
+    segment_max_records: usize,
+}
+
+/// Pluggable audit sink trait for forwarding immutable audit records (v6.0.0).
+pub trait AuditSink: Send + Sync {
+    fn emit_record(&self, record: &MerkleAuditRecord) -> Result<(), String>;
+    fn verify_integrity(&self) -> (bool, usize);
+}
+
 pub struct MerkleAuditStore {
     log_path: Option<String>,
-    records: RwLock<Vec<MerkleAuditRecord>>,
+    state: RwLock<AuditState>,
 }
 
 impl MerkleAuditStore {
     pub fn new(log_path: Option<String>) -> Self {
+        let memory_window = std::env::var("OMNI_AUDIT_MEMORY_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2_000);
+        let segment_max_records = std::env::var("OMNI_AUDIT_SEGMENT_MAX_RECORDS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(10_000);
+        Self::with_limits(log_path, memory_window, segment_max_records)
+    }
+
+    pub fn with_limits(
+        log_path: Option<String>,
+        memory_window: usize,
+        segment_max_records: usize,
+    ) -> Self {
+        let memory_window = memory_window.max(1);
+        let segment_max_records = segment_max_records.max(1);
         let store = Self {
             log_path: log_path.clone(),
-            records: RwLock::new(Vec::new()),
+            state: RwLock::new(AuditState {
+                records: VecDeque::new(),
+                total_count: 0,
+                last_hash: GENESIS_HASH.to_string(),
+                window_base_prev_hash: GENESIS_HASH.to_string(),
+                segment_index: 0,
+                records_in_segment: 0,
+                memory_window,
+                segment_max_records,
+            }),
         };
 
         if let Some(path) = &log_path {
+            let mut guard = store.state.write().unwrap();
+            // Load checkpoint anchor if present
+            let ckpt_path = format!("{}.ckpt", path);
+            if let Ok(raw_ckpt) = fs::read_to_string(&ckpt_path) {
+                if let Ok(val) = JsonValue::parse(&raw_ckpt) {
+                    if let Some(seg) = val.get("segment_index").and_then(|x| x.as_u64()) {
+                        guard.segment_index = seg;
+                    }
+                    if let Some(cnt) = val.get("total_count").and_then(|x| x.as_u64()) {
+                        guard.total_count = cnt;
+                    }
+                    if let Some(h) = val.get("last_hash").and_then(|x| x.as_str()) {
+                        guard.last_hash = h.to_string();
+                        guard.window_base_prev_hash = h.to_string();
+                    }
+                }
+            }
+
             if let Ok(file) = File::open(path) {
                 let reader = BufReader::new(file);
-                let mut records_guard = store.records.write().unwrap();
                 for line in reader.lines().map_while(Result::ok) {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -273,7 +337,15 @@ impl MerkleAuditStore {
                     }
                     if let Ok(json_val) = JsonValue::parse(trimmed) {
                         if let Some(record) = MerkleAuditRecord::from_json(&json_val) {
-                            records_guard.push(record);
+                            guard.total_count = (record.index + 1).max(guard.total_count);
+                            guard.last_hash = record.current_hash.clone();
+                            guard.records_in_segment += 1;
+                            if guard.records.len() >= guard.memory_window {
+                                if let Some(evicted) = guard.records.pop_front() {
+                                    guard.window_base_prev_hash = evicted.current_hash;
+                                }
+                            }
+                            guard.records.push_back(record);
                         }
                     }
                 }
@@ -281,6 +353,29 @@ impl MerkleAuditStore {
         }
 
         store
+    }
+
+    fn write_signed_checkpoint(path: &str, state: &AuditState) {
+        let ckpt_path = format!("{}.ckpt", path);
+        let sig_payload = format!(
+            "{}:{}:{}",
+            state.segment_index, state.total_count, state.last_hash
+        );
+        let sig = hmac_sha256_hex(
+            crate::models::continuation_key().as_bytes(),
+            sig_payload.as_bytes(),
+        );
+        let ckpt_json = json!({
+            "segment_index": state.segment_index as i64,
+            "total_count": state.total_count as i64,
+            "last_hash": state.last_hash.clone(),
+            "hmac_sha256": sig,
+        });
+        if let Ok(mut f) = File::create(&ckpt_path) {
+            let _ = f.write_all(ckpt_json.to_string_compact().as_bytes());
+            let _ = f.flush();
+            let _ = f.sync_all();
+        }
     }
 
     pub fn record_invocation(
@@ -292,14 +387,10 @@ impl MerkleAuditStore {
         status: &str,
         execution_us: u64,
     ) -> MerkleAuditRecord {
-        let mut guard = self.records.write().unwrap();
-        let index = guard.len() as u64;
+        let mut guard = self.state.write().unwrap();
+        let index = guard.total_count;
         let timestamp = now_epoch_secs();
-        let prev_hash = if let Some(last) = guard.last() {
-            last.current_hash.clone()
-        } else {
-            GENESIS_HASH.to_string()
-        };
+        let prev_hash = guard.last_hash.clone();
 
         let args_compact = arguments_json.to_string_compact();
         let args_hash = sha256_hex(args_compact.as_bytes());
@@ -337,15 +428,90 @@ impl MerkleAuditStore {
             }
         }
 
-        guard.push(record.clone());
+        guard.total_count += 1;
+        guard.last_hash = current_hash;
+        guard.records_in_segment += 1;
+        if guard.records.len() >= guard.memory_window {
+            if let Some(evicted) = guard.records.pop_front() {
+                guard.window_base_prev_hash = evicted.current_hash;
+            }
+        }
+        guard.records.push_back(record.clone());
+
+        if guard.records_in_segment >= guard.segment_max_records {
+            if let Some(path) = &self.log_path {
+                guard.segment_index += 1;
+                let seg_path = format!("{}.seg{:06}.jsonl", path, guard.segment_index);
+                if fs::rename(path, &seg_path).is_ok() {
+                    Self::write_signed_checkpoint(path, &guard);
+                }
+            }
+            guard.records_in_segment = 0;
+        }
+
         record
     }
 
     pub fn verify_chain(&self) -> (bool, usize) {
-        let guard = self.records.read().unwrap();
-        let mut expected_prev = GENESIS_HASH.to_string();
+        let guard = self.state.read().unwrap();
+        if let Some(path) = &self.log_path {
+            let ckpt_path = format!("{}.ckpt", path);
+            let ckpt_exists = std::path::Path::new(&ckpt_path).exists();
+            let segments_exist_on_disk =
+                std::path::Path::new(&format!("{}.seg000001.jsonl", path)).exists();
+            if (guard.segment_index > 0 || segments_exist_on_disk) && !ckpt_exists {
+                return (false, 0);
+            }
+            if ckpt_exists {
+                let raw_ckpt = match fs::read_to_string(&ckpt_path) {
+                    Ok(s) => s,
+                    Err(_) => return (false, 0),
+                };
+                let val = match JsonValue::parse(&raw_ckpt) {
+                    Ok(v) => v,
+                    Err(_) => return (false, 0),
+                };
+                let seg = match val.get("segment_index").and_then(|x| x.as_u64()) {
+                    Some(v) => v,
+                    None => return (false, 0),
+                };
+                let cnt = match val.get("total_count").and_then(|x| x.as_u64()) {
+                    Some(v) => v,
+                    None => return (false, 0),
+                };
+                let lh = match val.get("last_hash").and_then(|x| x.as_str()) {
+                    Some(v) if !v.is_empty() => v,
+                    _ => return (false, 0),
+                };
+                let sig = match val.get("hmac_sha256").and_then(|x| x.as_str()) {
+                    Some(v) if !v.is_empty() => v,
+                    _ => return (false, 0),
+                };
+                let sig_payload = format!("{}:{}:{}", seg, cnt, lh);
+                let expected_sig = hmac_sha256_hex(
+                    crate::models::continuation_key().as_bytes(),
+                    sig_payload.as_bytes(),
+                );
+                if !crate::models::constant_time_eq(sig.as_bytes(), expected_sig.as_bytes()) {
+                    return (false, 0);
+                }
+                if seg != guard.segment_index || cnt > guard.total_count {
+                    return (false, 0);
+                }
+                if guard.records.is_empty() && (cnt != guard.total_count || lh != guard.last_hash) {
+                    return (false, 0);
+                }
+                if (guard.total_count - cnt) as usize == guard.records.len()
+                    && lh != guard.window_base_prev_hash
+                {
+                    return (false, 0);
+                }
+            }
+        }
 
-        for (idx, record) in guard.iter().enumerate() {
+        let mut expected_prev = guard.window_base_prev_hash.clone();
+
+        for (idx, record) in guard.records.iter().enumerate() {
             if record.prev_hash != expected_prev {
                 return (false, idx);
             }
@@ -365,21 +531,39 @@ impl MerkleAuditStore {
             expected_prev = record.current_hash.clone();
         }
 
-        (true, guard.len())
+        (true, guard.total_count as usize)
     }
 
     pub fn list_records(&self, limit: Option<usize>) -> Vec<MerkleAuditRecord> {
-        let guard = self.records.read().unwrap();
+        let guard = self.state.read().unwrap();
         let limit = limit.unwrap_or(50);
-        guard.iter().rev().take(limit).cloned().collect()
+        guard.records.iter().rev().take(limit).cloned().collect()
     }
 
     pub fn get_head_hash(&self) -> String {
-        let guard = self.records.read().unwrap();
-        guard
-            .last()
-            .map(|r| r.current_hash.clone())
-            .unwrap_or_else(|| GENESIS_HASH.to_string())
+        let guard = self.state.read().unwrap();
+        guard.last_hash.clone()
+    }
+}
+
+impl AuditSink for MerkleAuditStore {
+    fn emit_record(&self, record: &MerkleAuditRecord) -> Result<(), String> {
+        if let Some(path) = &self.log_path {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("Failed to open audit log '{}': {}", path, e))?;
+            let line = format!("{}\n", record.to_json().to_string_compact());
+            file.write_all(line.as_bytes())
+                .and_then(|_| file.flush())
+                .map_err(|e| format!("Failed to write audit record: {}", e))?;
+        }
+        Ok(())
+    }
+
+    fn verify_integrity(&self) -> (bool, usize) {
+        self.verify_chain()
     }
 }
 
@@ -397,5 +581,62 @@ mod tests {
             hmac,
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
+    }
+
+    #[test]
+    fn test_segmented_audit_log_rotation_and_signed_checkpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "omni_audit_seg_{}",
+            crate::logging::now_epoch_millis()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let log_path = dir.join("audit.jsonl");
+        let log_path_str = log_path.to_string_lossy().to_string();
+
+        let logger = MerkleAuditStore::new(Some(log_path_str.clone()));
+        {
+            let mut guard = logger.state.write().unwrap();
+            guard.memory_window = 3;
+            guard.segment_max_records = 4;
+        }
+
+        for i in 0..6 {
+            logger.record_invocation(
+                "alice",
+                "srv",
+                &format!("tool_{}", i),
+                &JsonValue::object(),
+                "ok",
+                10,
+            );
+        }
+
+        let seg1 = format!("{}.seg000001.jsonl", log_path_str);
+        let ckpt = format!("{}.ckpt", log_path_str);
+        assert!(std::path::Path::new(&seg1).exists());
+        assert!(std::path::Path::new(&ckpt).exists());
+        assert_eq!(logger.list_records(Some(10)).len(), 3);
+        let (ok, total) = logger.verify_chain();
+        assert!(ok);
+        assert_eq!(total, 6);
+
+        // Tamper with checkpoint signature -> verify_chain must fail
+        fs::write(
+            &ckpt,
+            r#"{"segment_index":1,"total_count":6,"last_hash":"bad","hmac_sha256":"0000"}"#,
+        )
+        .unwrap();
+        let (ok_tampered, _) = logger.verify_chain();
+        assert!(!ok_tampered);
+
+        // Corrupt checkpoint JSON -> verify_chain must fail
+        fs::write(&ckpt, "not-valid-json").unwrap();
+        assert!(!logger.verify_chain().0);
+
+        // Missing checkpoint when segment_index > 0 -> verify_chain must fail
+        fs::remove_file(&ckpt).unwrap();
+        assert!(!logger.verify_chain().0);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

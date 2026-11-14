@@ -21,10 +21,16 @@ use crate::storage::{MerkleAuditStore, WalRegistryStore};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+#[cfg(not(feature = "async-runtime"))]
+use std::net::TcpListener;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+#[cfg(not(feature = "async-runtime"))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
+#[cfg(not(feature = "async-runtime"))]
+use std::sync::{mpsc, Mutex};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -52,6 +58,60 @@ impl Default for GatewayMetrics {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct GatewayEvent {
+    pub seq: u64,
+    pub event_type: String,
+    pub payload: JsonValue,
+}
+
+pub struct EventBus {
+    next_seq: AtomicU64,
+    events: RwLock<VecDeque<GatewayEvent>>,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self {
+            next_seq: AtomicU64::new(1),
+            events: RwLock::new(VecDeque::with_capacity(256)),
+        }
+    }
+
+    pub fn publish(&self, event_type: impl Into<String>, payload: JsonValue) -> u64 {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let ev = GatewayEvent {
+            seq,
+            event_type: event_type.into(),
+            payload,
+        };
+        if let Ok(mut guard) = self.events.write() {
+            if guard.len() >= 256 {
+                guard.pop_front();
+            }
+            guard.push_back(ev);
+        }
+        seq
+    }
+
+    pub fn since(&self, last_seq: u64) -> Vec<GatewayEvent> {
+        self.events
+            .read()
+            .map(|guard| guard.iter().filter(|e| e.seq > last_seq).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn latest_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::Relaxed).saturating_sub(1)
+    }
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct ProductionGatewayContext {
     pub config: OmniConfig,
@@ -69,6 +129,7 @@ pub struct ProductionGatewayContext {
     pub audit_store: Arc<MerkleAuditStore>,
     pub traces: Arc<RwLock<VecDeque<TraceSpan>>>,
     pub upstream_manager: Arc<crate::upstream::UpstreamManager>,
+    pub event_bus: Arc<EventBus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -234,6 +295,9 @@ impl ProductionGatewayContext {
         )));
         let translator = ProtocolTranslator::new(None, Some(auth_exchange.clone()))
             .with_upstream(upstream_manager.clone(), cache.clone());
+        if config.demo_seed {
+            translator.mesh_client.set_allow_synthetic_mocks(true);
+        }
         let cb = CircuitBreakerRegistry::new(
             config.circuit_breaker_threshold,
             config.circuit_breaker_reset_sec,
@@ -268,6 +332,7 @@ impl ProductionGatewayContext {
             audit_store,
             traces,
             upstream_manager,
+            event_bus: Arc::new(EventBus::new()),
         };
 
         if ctx.config.demo_seed && ctx.registry.list_servers(None).is_empty() {
@@ -544,7 +609,13 @@ impl ProductionGatewayContext {
                 | "/api/audit/verify"
                 | "/api/tools/propose_update" => AuthRole::Operator,
                 "/api/stats"
+                | "/api/v1/stats"
+                | "/api/events"
+                | "/api/v1/events"
                 | "/api/servers"
+                | "/api/v1/servers"
+                | "/api/groups"
+                | "/api/v1/groups"
                 | "/api/codemode/types"
                 | "/api/codemode/speculative_types"
                 | "/api/execute"
@@ -597,6 +668,38 @@ impl ProductionGatewayContext {
             return Err(401);
         }
 
+        // 0. If token is a 3-part JWT, check OIDC JWKS (RS256/ES256/EdDSA) or HS256 (OMNI_JWT_SECRET)
+        if token.matches('.').count() == 2 {
+            if let Ok(jwks_uri) = std::env::var("OMNI_OIDC_JWKS_URI") {
+                if !jwks_uri.is_empty() {
+                    let expected_iss = std::env::var("OMNI_OIDC_ISSUER")
+                        .or_else(|_| std::env::var("OMNI_JWT_ISSUER"))
+                        .ok();
+                    let expected_aud = std::env::var("OMNI_OIDC_AUDIENCE")
+                        .or_else(|_| std::env::var("OMNI_JWT_AUDIENCE"))
+                        .ok();
+                    return validate_jwt_oidc_jwks(
+                        token,
+                        &jwks_uri,
+                        expected_iss.as_deref(),
+                        expected_aud.as_deref(),
+                    );
+                }
+            }
+            if let Ok(jwt_secret) = std::env::var("OMNI_JWT_SECRET") {
+                if !jwt_secret.is_empty() {
+                    let expected_iss = std::env::var("OMNI_JWT_ISSUER").ok();
+                    let expected_aud = std::env::var("OMNI_JWT_AUDIENCE").ok();
+                    return validate_jwt_hs256(
+                        token,
+                        jwt_secret.as_bytes(),
+                        expected_iss.as_deref(),
+                        expected_aud.as_deref(),
+                    );
+                }
+            }
+        }
+
         // 1. If auth_secret is configured, strictly validate against it using constant-time comparison
         if !self.config.auth_secret.is_empty() {
             let mut matched = None;
@@ -641,15 +744,27 @@ impl ProductionGatewayContext {
             }
         }
 
-        // 2. Dev/Test mode (auth_secret not configured on loopback)
-        let role = if token.contains("admin") {
-            AuthRole::Admin
-        } else if token.contains("approver") {
-            AuthRole::Approver
-        } else if token.contains("operator") {
-            AuthRole::Operator
-        } else {
-            AuthRole::Agent
+        // 2. Dev/Test mode (only on loopback and non-production, with explicit dev token allowlist — never substring inference)
+        let is_loopback = matches!(
+            self.config.host.as_str(),
+            "127.0.0.1" | "localhost" | "::1" | "[::1]"
+        );
+        let is_prod = std::env::var("OMNI_ENV")
+            .map(|v| v.eq_ignore_ascii_case("production"))
+            .unwrap_or(false);
+        if !is_loopback || is_prod {
+            return Err(401);
+        }
+
+        let role = match token {
+            "admin_dev_token" => AuthRole::Admin,
+            "approver_dev_token" => AuthRole::Approver,
+            "operator_dev_token"
+            | "test_operator_token"
+            | "operator_key"
+            | "operator_secret_token" => AuthRole::Operator,
+            "agent_dev_token" | "agent_token" => AuthRole::Agent,
+            _ => return Err(401),
         };
 
         Ok(AuthPrincipal {
@@ -947,23 +1062,59 @@ impl ProductionGatewayContext {
                     }),
                 )
             }
-            "/.well-known/oauth-protected-resource" => self.json_response(
-                200,
-                json!({
-                    "resource": "http://127.0.0.1:8080",
-                    "authorization_servers": ["http://127.0.0.1:8080/oauth"],
-                    "scopes_supported": ["agent", "operator", "approver", "admin"],
-                    "bearer_methods_supported": ["header"],
-                    "resource_documentation": "https://github.com/Rangow4562/omni-mcp-gateway"
-                }),
-            ),
+            "/.well-known/oauth-protected-resource" => {
+                let resource_url = format!("http://{}:{}", self.config.host, self.config.port);
+                let auth_srv = format!("{}/oauth", resource_url);
+                self.json_response(
+                    200,
+                    json!({
+                        "resource": resource_url,
+                        "authorization_servers": [auth_srv],
+                        "scopes_supported": ["agent", "operator", "approver", "admin"],
+                        "bearer_methods_supported": ["header"],
+                        "client_id_metadata_document_supported": true,
+                        "resource_documentation": "https://github.com/Rangow4562/omni-mcp-gateway"
+                    }),
+                )
+            }
+            "/api/events" | "/api/v1/events" => {
+                let (cache_hits, cache_misses) = self.gateway.semantic_cache.stats();
+                let open_circuits = self.gateway.circuit_breaker.open_circuits_count();
+                let servers = self.registry.list_servers(None);
+                let groups = self.registry.list_tool_groups();
+                let payload = json!({
+                    "type": "gateway.snapshot",
+                    "timestamp": crate::logging::now_epoch_secs(),
+                    "stats": {
+                        "cache_hits": cache_hits as i64,
+                        "cache_misses": cache_misses as i64,
+                        "open_circuits": open_circuits as i64
+                    },
+                    "servers_count": servers.len() as i64,
+                    "groups_count": groups.len() as i64,
+                    "audit_head": self.audit_store.get_head_hash()
+                });
+                let sse_body = format!(
+                    "event: gateway.snapshot\ndata: {}\n\n",
+                    payload.to_string_compact()
+                );
+                (
+                    200,
+                    "text/event-stream; charset=utf-8".to_string(),
+                    vec![
+                        ("Cache-Control".to_string(), "no-cache".to_string()),
+                        ("X-Accel-Buffering".to_string(), "no".to_string()),
+                    ],
+                    sse_body.into_bytes(),
+                )
+            }
             "/openapi.json" | "/api/openapi.json" => self.json_response(
                 200,
                 json!({
                     "openapi": "3.0.3",
                     "info": {
                         "title": "Omni MCP Gateway API",
-                        "version": "5.0.0",
+                        "version": env!("CARGO_PKG_VERSION"),
                         "description": "Governed enterprise MCP proxy and Code Mode sandbox execution runtime"
                     },
                     "paths": {
@@ -1168,6 +1319,21 @@ impl ProductionGatewayContext {
                     }),
                 )
             }
+            "/api/groups" | "/api/v1/groups" => {
+                let groups: Vec<JsonValue> = self
+                    .registry
+                    .list_tool_groups()
+                    .into_iter()
+                    .map(|g| g.to_json())
+                    .collect();
+                self.json_response(
+                    200,
+                    json!({
+                        "total": groups.len() as i64,
+                        "groups": JsonValue::Array(groups)
+                    }),
+                )
+            }
             _ => self.serve_static_or_index(path),
         }
     }
@@ -1177,6 +1343,17 @@ impl ProductionGatewayContext {
         path: &str,
         _headers: &HashMap<String, String>,
     ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
+        if let Some(slug) = path
+            .strip_prefix("/api/groups/")
+            .or_else(|| path.strip_prefix("/api/v1/groups/"))
+        {
+            let slug = percent_decode(slug.trim());
+            if slug.is_empty() {
+                return self.json_response(400, json!({"error": "Group slug is required"}));
+            }
+            let removed = self.registry.delete_tool_group(&slug);
+            return self.json_response(200, json!({"success": removed.is_some(), "slug": slug}));
+        }
         if (path.starts_with("/api/servers/external/")
             || path.starts_with("/api/v1/servers/external/"))
             && !path.ends_with("/inspect")
@@ -1284,6 +1461,323 @@ impl ProductionGatewayContext {
 
         let traceparent = get_header(headers, "traceparent");
 
+        // 0. Virtual Tool Group MCP Route: `/groups/<slug>/mcp`
+        if let Some(slug) = path
+            .strip_prefix("/groups/")
+            .and_then(|s| s.strip_suffix("/mcp"))
+        {
+            let slug = percent_decode(slug.trim());
+            let group = match self.registry.get_tool_group(&slug) {
+                Some(g) => g,
+                None => {
+                    return self.json_response(
+                        404,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32001, "message": format!("Tool group '{}' not found", slug)}
+                        }),
+                    );
+                }
+            };
+            let json_val = match parsed_body {
+                Ok(v) => v,
+                Err(e) => {
+                    return self.json_response(
+                        400,
+                        json!({"jsonrpc": "2.0", "error": {"code": PARSE_ERROR, "message": e}}),
+                    );
+                }
+            };
+            let req_id = json_val.get("id").cloned();
+            let rpc_method = json_val
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            let incoming_sid = get_header(headers, "mcp-session-id").map(|s| s.to_string());
+            let session_id = if rpc_method == "initialize" {
+                Some(incoming_sid.unwrap_or_else(|| {
+                    format!("omni-grp-{}-{}", group.slug, crate::models::generate_ulid())
+                }))
+            } else {
+                incoming_sid
+            };
+            let group_headers = || -> Vec<(String, String)> {
+                session_id
+                    .as_ref()
+                    .map(|sid| vec![("Mcp-Session-Id".to_string(), sid.clone())])
+                    .unwrap_or_default()
+            };
+            if rpc_method == "initialize" {
+                return self.json_response_with_headers(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {
+                                "tools": {"listChanged": false},
+                                "resources": {"listChanged": false},
+                                "prompts": {"listChanged": false}
+                            },
+                            "serverInfo": {
+                                "name": format!("omni-group:{}", group.slug),
+                                "version": env!("CARGO_PKG_VERSION")
+                            }
+                        }
+                    }),
+                    group_headers(),
+                );
+            } else if rpc_method == "notifications/initialized" {
+                return (
+                    202,
+                    "application/json".to_string(),
+                    group_headers(),
+                    Vec::new(),
+                );
+            } else if rpc_method == "ping" {
+                return self.json_response_with_headers(
+                    200,
+                    json!({"jsonrpc": "2.0", "id": req_id, "result": {}}),
+                    group_headers(),
+                );
+            } else if rpc_method == "tools/list" {
+                let mut tools_arr = Vec::new();
+                for entry in &group.entries {
+                    if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
+                        for (t_name, tool) in &srv.tools {
+                            if tool.status != ToolStatus::Enabled {
+                                continue;
+                            }
+                            if let Some(ref only_tool) = entry.tool_name {
+                                if only_tool != t_name {
+                                    continue;
+                                }
+                            }
+                            let exposed = format!("{}_{}", entry.server_name, t_name);
+                            tools_arr.push(json!({
+                                "name": exposed,
+                                "description": tool.description.clone(),
+                                "inputSchema": tool.input_schema.clone()
+                            }));
+                        }
+                    }
+                }
+                return self.json_response_with_headers(
+                    200,
+                    json!({"jsonrpc": "2.0", "id": req_id, "result": {"tools": JsonValue::Array(tools_arr)}}),
+                    group_headers(),
+                );
+            } else if rpc_method == "tools/call" {
+                let params = json_val
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(JsonValue::object);
+                let tool_req = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(JsonValue::object);
+                let mut matched_target: Option<(String, String)> = None;
+                for entry in &group.entries {
+                    if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
+                        for t_name in srv.tools.keys() {
+                            if let Some(ref only_tool) = entry.tool_name {
+                                if only_tool != t_name {
+                                    continue;
+                                }
+                            }
+                            let exposed = format!("{}_{}", entry.server_name, t_name);
+                            if exposed == tool_req {
+                                matched_target = Some((entry.server_name.clone(), t_name.clone()));
+                                break;
+                            }
+                        }
+                    }
+                    if matched_target.is_some() {
+                        break;
+                    }
+                }
+                if let Some((srv_name, t_name)) = matched_target {
+                    let rpc_req = crate::models::RPCRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: req_id.clone().unwrap_or(JsonValue::Null),
+                        method: "tools/call".to_string(),
+                        params: json!({
+                            "name": t_name,
+                            "arguments": args
+                        }),
+                    };
+                    let rpc_resp = self.gateway.handle_request_with_trace(
+                        &srv_name,
+                        &rpc_req,
+                        actor,
+                        Some(token),
+                        traceparent,
+                    );
+                    return self.json_response_with_headers(
+                        200,
+                        rpc_resp.to_json(),
+                        group_headers(),
+                    );
+                }
+                return self.json_response_with_headers(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32601, "message": format!("Tool '{}' not in group '{}'", tool_req, group.slug)}
+                    }),
+                    group_headers(),
+                );
+            } else if rpc_method == "resources/list" {
+                let mut resources = Vec::new();
+                for entry in &group.entries {
+                    if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
+                        for res in &srv.external_resources {
+                            resources.push(json!({
+                                "uri": format!("ext://{}/{}", srv.name, res.uri),
+                                "name": res.name.clone(),
+                                "description": res.description.clone(),
+                                "mimeType": res.mime_type.clone().unwrap_or_else(|| "application/json".to_string())
+                            }));
+                        }
+                    }
+                }
+                return self.json_response_with_headers(
+                    200,
+                    json!({"jsonrpc": "2.0", "id": req_id, "result": {"resources": JsonValue::Array(resources), "resultType": "complete"}}),
+                    group_headers(),
+                );
+            } else if rpc_method == "resources/templates/list"
+                || rpc_method == "resources/read"
+                || rpc_method == "prompts/list"
+                || rpc_method == "prompts/get"
+                || rpc_method == "tasks/get"
+                || rpc_method == "tasks/update"
+            {
+                let allowed_servers: std::collections::HashSet<String> = group
+                    .entries
+                    .iter()
+                    .map(|e| e.server_name.clone())
+                    .collect();
+                if rpc_method == "resources/read" {
+                    let uri = json_val
+                        .get("params")
+                        .and_then(|p| p.get("uri"))
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    if let Some(rest) = uri.strip_prefix("ext://") {
+                        if let Some((srv_name, _)) = rest.split_once('/') {
+                            if !allowed_servers.contains(srv_name) {
+                                return self.json_response(
+                                    200,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "error": {"code": -32601, "message": format!("Resource '{}' not in group '{}'", uri, group.slug)}
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                } else if rpc_method == "prompts/get" {
+                    let pname = json_val
+                        .get("params")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    if let Some((srv_name, _)) = pname.split_once(':') {
+                        if !allowed_servers.contains(srv_name) {
+                            return self.json_response(
+                                200,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "error": {"code": -32601, "message": format!("Prompt '{}' not in group '{}'", pname, group.slug)}
+                                }),
+                            );
+                        }
+                    }
+                }
+                let rpc_req = crate::models::RPCRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: req_id.clone().unwrap_or(JsonValue::Null),
+                    method: rpc_method.to_string(),
+                    params: json_val
+                        .get("params")
+                        .cloned()
+                        .unwrap_or_else(JsonValue::object),
+                };
+                let mut resp = self.omni_mcp.handle_request(&rpc_req, actor, Some(token));
+                if rpc_method == "prompts/list" {
+                    if let Some(res_val) = resp.result.as_mut() {
+                        if let Some(arr) = res_val.get("prompts").and_then(|p| p.as_array()) {
+                            let filtered: Vec<JsonValue> = arr
+                                .iter()
+                                .filter(|item| {
+                                    let n = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    n.split_once(':')
+                                        .map(|(srv, _)| allowed_servers.contains(srv))
+                                        .unwrap_or(false)
+                                })
+                                .cloned()
+                                .collect();
+                            res_val.insert("prompts", JsonValue::Array(filtered));
+                        }
+                    }
+                }
+                return self.json_response_with_headers(200, resp.to_json(), group_headers());
+            } else if rpc_method == "sampling/createMessage" || rpc_method == "elicitation/create" {
+                let params = json_val
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(JsonValue::object);
+                let target_srv = params.get("server").and_then(|s| s.as_str());
+                if let Some(srv_name) = target_srv {
+                    if !group.entries.iter().any(|e| e.server_name == srv_name) {
+                        return self.json_response_with_headers(
+                            200,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "error": {"code": -32601, "message": format!("Server '{}' not in group '{}'", srv_name, group.slug)}
+                            }),
+                            group_headers(),
+                        );
+                    }
+                }
+                let policy = if let Some(srv_name) = target_srv {
+                    self.cache
+                        .get_server_arc(srv_name)
+                        .map(|s| s.sampling_elicitation_policy.clone())
+                        .unwrap_or(crate::models::SamplingElicitationPolicy::Deny)
+                } else {
+                    group
+                        .entries
+                        .iter()
+                        .filter_map(|e| self.cache.get_server_arc(&e.server_name))
+                        .map(|s| s.sampling_elicitation_policy.clone())
+                        .find(|p| *p != crate::models::SamplingElicitationPolicy::Deny)
+                        .unwrap_or(crate::models::SamplingElicitationPolicy::Deny)
+                };
+                let resp = crate::extension::omni_mcp::apply_sampling_elicitation_policy(
+                    req_id.unwrap_or(JsonValue::Null),
+                    rpc_method,
+                    &policy,
+                    target_srv,
+                    Some(&group.slug),
+                    &params,
+                );
+                return self.json_response_with_headers(200, resp.to_json(), group_headers());
+            }
+            return self.json_response_with_headers(
+                200,
+                json!({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": format!("Method '{}' not found", rpc_method)}}),
+                group_headers(),
+            );
+        }
+
         // 1. Dynamic Virtual Server MCP Route: `/<service-name>/mcp`
         if path.ends_with("/mcp") && path != "/omni/mcp" {
             let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -1356,6 +1850,31 @@ impl ProductionGatewayContext {
                             }),
                         );
                     }
+                }
+
+                if matches!(
+                    req_method,
+                    Some("sampling/createMessage") | Some("elicitation/create")
+                ) {
+                    let policy = self
+                        .cache
+                        .get_server_arc(&service_name)
+                        .map(|s| s.sampling_elicitation_policy.clone())
+                        .unwrap_or(crate::models::SamplingElicitationPolicy::Deny);
+                    let req_id = json_val.get("id").cloned().unwrap_or(JsonValue::Null);
+                    let params = json_val
+                        .get("params")
+                        .cloned()
+                        .unwrap_or_else(JsonValue::object);
+                    let resp = crate::extension::omni_mcp::apply_sampling_elicitation_policy(
+                        req_id,
+                        req_method.unwrap_or(""),
+                        &policy,
+                        Some(&service_name),
+                        None,
+                        &params,
+                    );
+                    return self.json_response(200, resp.to_json());
                 }
 
                 match RPCBatchOrSingle::from_json(&json_val) {
@@ -1655,8 +2174,19 @@ impl ProductionGatewayContext {
                 );
                 server.protocol = crate::models::ProtocolType::ExternalMcp;
                 server.upstream_config = Some(transport_config);
+                server.sync_interval_sec = body.get("sync_interval_sec").and_then(|x| x.as_u64());
+                if let Some(pol) = body.get("upstream_policy").and_then(|x| x.as_str()) {
+                    server.upstream_policy = crate::models::UpstreamPolicy::from_str(pol);
+                }
+                if let Some(spol) = body
+                    .get("sampling_elicitation_policy")
+                    .and_then(|x| x.as_str())
+                {
+                    server.sampling_elicitation_policy =
+                        crate::models::SamplingElicitationPolicy::from_str(spol);
+                }
 
-                // Initial tool discovery
+                // Initial tool, resource & prompt discovery
                 let initial_tools = match self.upstream_manager.fetch_tools(&server) {
                     Ok(tools) => {
                         if let Err(coll) = self
@@ -1677,6 +2207,12 @@ impl ProductionGatewayContext {
                     }
                     Err(_) => Vec::new(),
                 };
+                if let Ok(res) = self.upstream_manager.fetch_resources(&server) {
+                    server.external_resources = res;
+                }
+                if let Ok(pr) = self.upstream_manager.fetch_prompts(&server) {
+                    server.external_prompts = pr;
+                }
 
                 let registered = self.registry.register_server(server);
                 if !initial_tools.is_empty() {
@@ -2011,6 +2547,36 @@ impl ProductionGatewayContext {
                     .simulate_codemode(code, None, cfg, actor, Some(token));
                 self.json_response(200, report.to_json())
             }
+            "/api/groups" | "/api/v1/groups" => {
+                let slug = body
+                    .get("slug")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if slug.is_empty() {
+                    return self.json_response(400, json!({"error": "Group 'slug' is required"}));
+                }
+                let mut entries = Vec::new();
+                if let Some(entries_arr) = body.get("entries").and_then(|x| x.as_array()) {
+                    for item in entries_arr {
+                        if let Some(entry) = crate::models::ToolGroupEntry::from_json(item) {
+                            entries.push(entry);
+                        }
+                    }
+                }
+                let group = crate::models::ToolGroupRecord::new(
+                    slug,
+                    body.get("display_name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(slug),
+                    body.get("description")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(""),
+                    entries,
+                );
+                let saved = self.registry.save_tool_group(group);
+                self.json_response(200, json!({"group": saved.to_json()}))
+            }
             _ => self.json_response(404, json!({"error": "Endpoint not found"})),
         }
     }
@@ -2157,67 +2723,592 @@ fn read_line_capped<R: BufRead>(
     Ok(total_read)
 }
 
+/// Opt-in background AutoSyncScheduler for external MCP servers with `sync_interval_sec`.
+/// Updates `ServerHealth` (`Connected` / `Degraded` / `Unreachable`), applies exponential backoff
+/// on failures, and syncs external tools, resources, and prompts.
+#[derive(Default)]
+pub struct AutoSyncScheduler {
+    pub last_synced: HashMap<String, f64>,
+    pub backoff_failures: HashMap<String, u32>,
+}
+
+impl AutoSyncScheduler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn tick(&mut self, ctx: &ProductionGatewayContext, now: f64) {
+        for srv in ctx.registry.list_servers(None) {
+            if srv.protocol != crate::models::ProtocolType::ExternalMcp {
+                continue;
+            }
+            let Some(interval_sec) = srv.sync_interval_sec else {
+                continue;
+            };
+            if interval_sec == 0 {
+                continue;
+            }
+            let failures = self.backoff_failures.get(&srv.name).copied().unwrap_or(0);
+            let effective_interval = interval_sec.saturating_mul(1u64 << failures.min(4));
+            let prev = self.last_synced.get(&srv.name).copied().unwrap_or(0.0);
+            if now - prev >= effective_interval as f64 {
+                self.last_synced.insert(srv.name.clone(), now);
+                match ctx.upstream_manager.fetch_tools(&srv) {
+                    Ok(tools) => {
+                        self.backoff_failures.remove(&srv.name);
+                        let _ = ctx.registry.apply_external_sync(&srv.name, tools);
+                        let ext_resources = ctx.upstream_manager.fetch_resources(&srv).ok();
+                        let ext_prompts = ctx.upstream_manager.fetch_prompts(&srv).ok();
+                        ctx.registry.update_server_sync_state(
+                            &srv.name,
+                            crate::models::ServerHealth::Connected,
+                            Some(ToolStatus::Enabled),
+                            ext_resources,
+                            ext_prompts,
+                            Some(now),
+                        );
+                        ctx.cache.refresh_now();
+                        ctx.event_bus.publish(
+                            "server.health",
+                            json!({
+                                "server": srv.name,
+                                "health": "connected",
+                                "timestamp": now
+                            }),
+                        );
+                    }
+                    Err(err) => {
+                        let new_failures = failures.saturating_add(1);
+                        self.backoff_failures.insert(srv.name.clone(), new_failures);
+                        let health = if new_failures >= 3 {
+                            crate::models::ServerHealth::Unreachable
+                        } else {
+                            crate::models::ServerHealth::Degraded
+                        };
+                        let new_status = if new_failures >= 3 {
+                            Some(ToolStatus::Disabled)
+                        } else {
+                            None
+                        };
+                        ctx.registry.update_server_sync_state(
+                            &srv.name,
+                            health.clone(),
+                            new_status,
+                            None,
+                            None,
+                            None,
+                        );
+                        ctx.cache.refresh_now();
+                        ctx.event_bus.publish(
+                            "server.health",
+                            json!({
+                                "server": srv.name,
+                                "health": health.as_str(),
+                                "error": err,
+                                "timestamp": now
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn run_server(host: &str, port: u16) -> Result<(), String> {
     let ctx = get_gateway_context().clone();
     ctx.config.validate_bind(host)?;
     ctx.cache.start_background_refresh();
 
-    let bind_addr = format!("{}:{}", host, port);
-    let listener = TcpListener::bind(&bind_addr)
-        .map_err(|e| format!("Failed to bind HTTP server on {}: {}", bind_addr, e))?;
-
-    println!("[*] Omni MCP Gateway running at http://{}:{}", host, port);
-    println!("[*] Liveness probe: http://{}:{}/healthz", host, port);
-    println!("[*] Prometheus metrics: http://{}:{}/metrics", host, port);
-    println!(
-        "[*] Omni MCP proxy available at http://{}:{}/omni/mcp",
-        host, port
-    );
-    println!(
-        "[*] Dynamic virtual servers available at http://{}:{}/<service>/mcp",
-        host, port
-    );
-
-    // Bounded worker pool for zero-spawn-overhead request handling
-    let num_workers = ctx.config.worker_threads.max(4);
-    let queue_bound = (num_workers * 16).max(64);
-    let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_bound);
-    let shared_rx = Arc::new(Mutex::new(rx));
-
-    for _ in 0..num_workers {
-        let worker_rx = shared_rx.clone();
-        let worker_ctx = ctx.clone();
-        thread::spawn(move || loop {
-            let stream = {
-                let lock = worker_rx.lock().unwrap();
-                match lock.recv() {
-                    Ok(s) => s,
-                    Err(_) => break,
-                }
-            };
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle_connection(stream, &worker_ctx);
-            }));
+    // Opt-in background AutoSyncScheduler for external MCP servers with sync_interval_sec
+    {
+        let sync_ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut scheduler = AutoSyncScheduler::new();
+            loop {
+                thread::sleep(Duration::from_secs(10));
+                let now = crate::logging::now_epoch_secs();
+                scheduler.tick(&sync_ctx, now);
+            }
         });
     }
 
-    for stream in listener.incoming().flatten() {
-        let _ = stream.set_nodelay(true);
-        match tx.try_send(stream) {
-            Ok(_) => {}
-            Err(mpsc::TrySendError::Full(mut saturated_stream)) => {
-                send_raw_error_response(
-                    &mut saturated_stream,
-                    503,
-                    "Service Unavailable",
-                    "Service Unavailable: Worker accept queue saturated",
-                );
+    let bind_addr = format!("{}:{}", host, port);
+
+    #[cfg(feature = "tls-rustls")]
+    let tls_config = build_inbound_tls_config()?;
+
+    let scheme = {
+        #[cfg(feature = "tls-rustls")]
+        {
+            if tls_config.is_some() {
+                "https"
+            } else {
+                "http"
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => break,
         }
+        #[cfg(not(feature = "tls-rustls"))]
+        {
+            "http"
+        }
+    };
+
+    println!(
+        "[*] Omni MCP Gateway running at {}://{}:{}",
+        scheme, host, port
+    );
+    println!("[*] Liveness probe: {}://{}:{}/healthz", scheme, host, port);
+    println!(
+        "[*] Prometheus metrics: {}://{}:{}/metrics",
+        scheme, host, port
+    );
+    println!(
+        "[*] Omni MCP proxy available at {}://{}:{}/omni/mcp",
+        scheme, host, port
+    );
+    println!(
+        "[*] Dynamic virtual servers available at {}://{}:{}/<service>/mcp",
+        scheme, host, port
+    );
+
+    #[cfg(feature = "async-runtime")]
+    {
+        run_async_server(
+            &bind_addr,
+            Arc::new(ctx),
+            #[cfg(feature = "tls-rustls")]
+            tls_config,
+        )
     }
 
-    Ok(())
+    #[cfg(not(feature = "async-runtime"))]
+    {
+        let listener = TcpListener::bind(&bind_addr)
+            .map_err(|e| format!("Failed to bind HTTP server on {}: {}", bind_addr, e))?;
+        let _ = listener.set_nonblocking(true);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Bounded worker pool for zero-spawn-overhead request handling
+        let num_workers = ctx.config.worker_threads.max(4);
+        let queue_bound = (num_workers * 16).max(64);
+        let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_bound);
+        let shared_rx = Arc::new(Mutex::new(rx));
+        let mut worker_handles = Vec::with_capacity(num_workers);
+
+        for _ in 0..num_workers {
+            let worker_rx = shared_rx.clone();
+            let worker_ctx = ctx.clone();
+            #[cfg(feature = "tls-rustls")]
+            let worker_tls = tls_config.clone();
+            worker_handles.push(thread::spawn(move || loop {
+                let stream = {
+                    let lock = worker_rx.lock().unwrap();
+                    match lock.recv() {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    }
+                };
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(feature = "tls-rustls")]
+                    if let Some(ref cfg) = worker_tls {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+                        if let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) {
+                            let tls_stream = rustls::StreamOwned::new(conn, stream);
+                            handle_stream(tls_stream, &worker_ctx);
+                        }
+                        return;
+                    }
+                    let _ = stream.set_nonblocking(false);
+                    handle_connection(stream, &worker_ctx);
+                }));
+            }));
+        }
+
+        while !shutdown.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    match tx.try_send(stream) {
+                        Ok(_) => {}
+                        Err(mpsc::TrySendError::Full(mut saturated_stream)) => {
+                            let _ = saturated_stream.set_nonblocking(false);
+                            send_raw_error_response(
+                                &mut saturated_stream,
+                                503,
+                                "Service Unavailable",
+                                "Service Unavailable: Worker accept queue saturated",
+                            );
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+
+        drop(tx);
+        for h in worker_handles {
+            let _ = h.join();
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "async-runtime")]
+fn run_async_server(
+    bind_addr: &str,
+    ctx: Arc<ProductionGatewayContext>,
+    #[cfg(feature = "tls-rustls")] tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(ctx.config.worker_threads.max(4))
+        .build()
+        .map_err(|e| format!("Failed to build tokio runtime: {}", e))?;
+
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind async HTTP server on {}: {}", bind_addr, e))?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let ctrl_c_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = ctrl_c_tx.send(true);
+        });
+        serve_async_listener(
+            listener,
+            ctx,
+            #[cfg(feature = "tls-rustls")]
+            tls_config,
+            shutdown_rx,
+        )
+        .await;
+        Ok(())
+    })
+}
+
+#[cfg(feature = "async-runtime")]
+pub async fn serve_async_listener(
+    listener: tokio::net::TcpListener,
+    ctx: Arc<ProductionGatewayContext>,
+    #[cfg(feature = "tls-rustls")] tls_config: Option<Arc<rustls::ServerConfig>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let max_conns = (ctx.config.worker_threads.max(4) * 64).max(256);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_conns));
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        let permit = match semaphore.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                let mut s = stream;
+                                use tokio::io::AsyncWriteExt;
+                                let body = b"Service Unavailable: Worker accept queue saturated";
+                                let resp = format!(
+                                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = s.write_all(resp.as_bytes()).await;
+                                let _ = s.write_all(body).await;
+                                continue;
+                            }
+                        };
+                        let conn_ctx = ctx.clone();
+                        let conn_shutdown = shutdown_rx.clone();
+                        #[cfg(feature = "tls-rustls")]
+                        let conn_tls = tls_config.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            #[cfg(feature = "tls-rustls")]
+                            if let Some(cfg) = conn_tls {
+                                if let Ok(std_stream) = stream.into_std() {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = std_stream.set_nonblocking(false);
+                                        let _ = std_stream.set_read_timeout(Some(Duration::from_secs(10)));
+                                        let _ = std_stream.set_write_timeout(Some(Duration::from_secs(10)));
+                                        if let Ok(conn) = rustls::ServerConnection::new(cfg) {
+                                            let tls_stream = rustls::StreamOwned::new(conn, std_stream);
+                                            handle_stream(tls_stream, &conn_ctx);
+                                        }
+                                    }).await;
+                                }
+                                return;
+                            }
+                            handle_async_stream(stream, conn_ctx, conn_shutdown).await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    // Graceful drain: wait briefly for active connections to finish
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        semaphore.acquire_many(max_conns as u32),
+    )
+    .await;
+}
+
+#[cfg(feature = "async-runtime")]
+pub async fn handle_async_stream<S>(
+    stream: S,
+    ctx: Arc<ProductionGatewayContext>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let mut reader = BufReader::new(stream);
+    let mut request_count = 0usize;
+    let max_requests_per_conn = 100usize;
+
+    loop {
+        if *shutdown_rx.borrow() || request_count >= max_requests_per_conn {
+            break;
+        }
+        let mut request_line = String::new();
+        let read_res =
+            tokio::time::timeout(Duration::from_secs(15), reader.read_line(&mut request_line))
+                .await;
+        match read_res {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(_)) => {}
+        }
+        request_count += 1;
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            break;
+        }
+        let method = parts[0].to_string();
+        let path = parts[1].to_string();
+
+        let mut headers = HashMap::new();
+        let mut content_length: usize = 0;
+        let mut client_wants_close = false;
+        let mut header_count = 0usize;
+
+        loop {
+            let mut h_line = String::new();
+            match reader.read_line(&mut h_line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let trimmed = h_line.trim_end_matches(&['\r', '\n'][..]);
+            if trimmed.is_empty() {
+                break;
+            }
+            header_count += 1;
+            if header_count > 128 {
+                return;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let kl = k.trim().to_ascii_lowercase();
+                let val = v.trim().to_string();
+                if kl == "content-length" {
+                    content_length = val.parse::<usize>().unwrap_or(0);
+                } else if kl == "connection" && val.eq_ignore_ascii_case("close") {
+                    client_wants_close = true;
+                }
+                headers.insert(kl, val);
+            }
+        }
+
+        if content_length > ctx.config.max_body_size_bytes {
+            let w = reader.get_mut();
+            let body = b"Payload Too Large (Exceeds Limit)";
+            let resp = format!(
+                "HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = w.write_all(resp.as_bytes()).await;
+            let _ = w.write_all(body).await;
+            return;
+        }
+
+        let mut body_bytes = vec![0u8; content_length];
+        if content_length > 0 && reader.read_exact(&mut body_bytes).await.is_err() {
+            return;
+        }
+
+        let path_base = path.split('?').next().unwrap_or(&path).to_string();
+        if method == "GET" && (path_base == "/api/events" || path_base == "/api/v1/events") {
+            let ctx_c = ctx.clone();
+            let m_c = method.clone();
+            let p_c = path.clone();
+            let h_c = headers.clone();
+            let b_c = body_bytes.clone();
+            let (status, _ctype, _extra, initial_body) = match tokio::task::spawn_blocking(
+                move || ctx_c.handle_http(&m_c, &p_c, &h_c, &b_c),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => return,
+            };
+            if status == 200 {
+                let mut hdr = String::from(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n",
+                );
+                if let Some(origin) = get_header(&headers, "origin") {
+                    if is_origin_allowed(
+                        origin,
+                        &ctx.config.cors_allowed_origins,
+                        get_header(&headers, "host"),
+                    ) {
+                        if ctx.config.cors_allowed_origins == "*" {
+                            hdr.push_str("Access-Control-Allow-Origin: *\r\n");
+                        } else {
+                            hdr.push_str(&format!(
+                                "Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n",
+                                origin
+                            ));
+                        }
+                    }
+                }
+                hdr.push_str("\r\n");
+                let w = reader.get_mut();
+                if w.write_all(hdr.as_bytes()).await.is_err()
+                    || w.write_all(&initial_body).await.is_err()
+                    || w.flush().await.is_err()
+                {
+                    return;
+                }
+                let mut last_seq = ctx.event_bus.latest_seq();
+                let mut idle_ticks = 0u32;
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                            let new_events = ctx.event_bus.since(last_seq);
+                            if !new_events.is_empty() {
+                                idle_ticks = 0;
+                                for ev in new_events {
+                                    last_seq = ev.seq;
+                                    let frame = format!(
+                                        "id: {}\nevent: {}\ndata: {}\n\n",
+                                        ev.seq,
+                                        ev.event_type,
+                                        ev.payload.to_string_compact()
+                                    );
+                                    if w.write_all(frame.as_bytes()).await.is_err() || w.flush().await.is_err() {
+                                        return;
+                                    }
+                                }
+                            } else {
+                                idle_ticks += 1;
+                                if idle_ticks >= 75 {
+                                    idle_ticks = 0;
+                                    if w.write_all(b": keepalive\n\n").await.is_err() || w.flush().await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let ctx_c = ctx.clone();
+        let m_c = method.clone();
+        let p_c = path.clone();
+        let h_c = headers.clone();
+        let (status, content_type, extra_headers, resp_body) =
+            match tokio::task::spawn_blocking(move || {
+                ctx_c.handle_http(&m_c, &p_c, &h_c, &body_bytes)
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => return,
+            };
+
+        let status_text = match status {
+            200 => "OK",
+            202 => "Accepted",
+            204 => "No Content",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            415 => "Unsupported Media Type",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "OK",
+        };
+        let conn_header = if client_wants_close || request_count >= max_requests_per_conn {
+            "close"
+        } else {
+            "keep-alive"
+        };
+        let mut response_header = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
+            status,
+            status_text,
+            content_type,
+            resp_body.len(),
+            conn_header
+        );
+        for (ek, ev) in extra_headers {
+            response_header.push_str(&format!("{}: {}\r\n", ek, ev));
+        }
+        if let Some(origin) = get_header(&headers, "origin") {
+            if is_origin_allowed(
+                origin,
+                &ctx.config.cors_allowed_origins,
+                get_header(&headers, "host"),
+            ) {
+                if ctx.config.cors_allowed_origins == "*" {
+                    response_header.push_str("Access-Control-Allow-Origin: *\r\n");
+                } else {
+                    response_header.push_str(&format!(
+                        "Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n",
+                        origin
+                    ));
+                }
+                response_header
+                    .push_str("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
+                response_header.push_str(
+                    "Access-Control-Allow-Headers: Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID, traceparent, tracestate\r\n",
+                );
+            }
+        }
+        response_header.push_str("\r\n");
+
+        let w = reader.get_mut();
+        if w.write_all(response_header.as_bytes()).await.is_err()
+            || (!resp_body.is_empty() && w.write_all(&resp_body).await.is_err())
+            || w.flush().await.is_err()
+        {
+            break;
+        }
+        if conn_header == "close" {
+            break;
+        }
+    }
 }
 
 pub fn run_stdio_server(specific_server: Option<&str>) -> i32 {
@@ -2442,6 +3533,70 @@ pub fn handle_stream<S: Read + Write>(stream: S, ctx: &ProductionGatewayContext)
             return;
         }
 
+        let path_base = path.split('?').next().unwrap_or(&path);
+        if method == "GET" && (path_base == "/api/events" || path_base == "/api/v1/events") {
+            let (status, _ctype, _extra, initial_body) =
+                ctx.handle_http(&method, &path, &headers, &body_bytes);
+            if status == 200 {
+                let mut hdr = String::from(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n",
+                );
+                if let Some(origin) = get_header(&headers, "origin") {
+                    if is_origin_allowed(
+                        origin,
+                        &ctx.config.cors_allowed_origins,
+                        get_header(&headers, "host"),
+                    ) {
+                        if ctx.config.cors_allowed_origins == "*" {
+                            hdr.push_str("Access-Control-Allow-Origin: *\r\n");
+                        } else {
+                            hdr.push_str(&format!(
+                                "Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n",
+                                origin
+                            ));
+                        }
+                    }
+                }
+                hdr.push_str("\r\n");
+                let w = reader.get_mut();
+                if w.write_all(hdr.as_bytes()).is_err()
+                    || w.write_all(&initial_body).is_err()
+                    || w.flush().is_err()
+                {
+                    return;
+                }
+                let mut last_seq = ctx.event_bus.latest_seq();
+                let mut idle_ticks = 0u32;
+                loop {
+                    thread::sleep(Duration::from_millis(500));
+                    let new_events = ctx.event_bus.since(last_seq);
+                    if !new_events.is_empty() {
+                        idle_ticks = 0;
+                        for ev in new_events {
+                            last_seq = ev.seq;
+                            let frame = format!(
+                                "id: {}\nevent: {}\ndata: {}\n\n",
+                                ev.seq,
+                                ev.event_type,
+                                ev.payload.to_string_compact()
+                            );
+                            if w.write_all(frame.as_bytes()).is_err() || w.flush().is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        idle_ticks += 1;
+                        if idle_ticks >= 30 {
+                            idle_ticks = 0;
+                            if w.write_all(b": keepalive\n\n").is_err() || w.flush().is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let (status, content_type, extra_headers, resp_body) =
             ctx.handle_http(&method, &path, &headers, &body_bytes);
 
@@ -2517,6 +3672,588 @@ pub fn handle_stream<S: Read + Write>(stream: S, ctx: &ProductionGatewayContext)
             return;
         }
     }
+}
+
+fn base64url_decode(input: &str) -> Result<Vec<u8>, u16> {
+    let mut out = Vec::with_capacity((input.len() * 3) / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for b in input.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => return Err(401),
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
+pub fn validate_jwt_hs256(
+    token: &str,
+    secret: &[u8],
+    expected_iss: Option<&str>,
+    expected_aud: Option<&str>,
+) -> Result<AuthPrincipal, u16> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(401);
+    }
+    let header_bytes = base64url_decode(parts[0])?;
+    let payload_bytes = base64url_decode(parts[1])?;
+    let sig_bytes = base64url_decode(parts[2])?;
+
+    let header_str = std::str::from_utf8(&header_bytes).map_err(|_| 401u16)?;
+    let header_json = JsonValue::parse(header_str).map_err(|_| 401u16)?;
+    let alg = header_json
+        .get("alg")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    if alg != "HS256" {
+        return Err(401);
+    }
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let expected_sig = crate::storage::audit_log::hmac_sha256(secret, signing_input.as_bytes());
+    if !crate::models::constant_time_eq(&sig_bytes, &expected_sig) {
+        return Err(401);
+    }
+
+    let payload_str = std::str::from_utf8(&payload_bytes).map_err(|_| 401u16)?;
+    let claims = JsonValue::parse(payload_str).map_err(|_| 401u16)?;
+    let now = crate::logging::now_epoch_secs();
+
+    if let Some(exp) = claims.get("exp").and_then(|x| x.as_f64()) {
+        if now >= exp {
+            return Err(401);
+        }
+    }
+    if let Some(nbf) = claims.get("nbf").and_then(|x| x.as_f64()) {
+        if now < nbf {
+            return Err(401);
+        }
+    }
+    if let Some(req_iss) = expected_iss {
+        let iss = claims.get("iss").and_then(|x| x.as_str()).unwrap_or("");
+        if iss != req_iss {
+            return Err(401);
+        }
+    }
+    if let Some(req_aud) = expected_aud {
+        let aud_ok = match claims.get("aud") {
+            Some(v) if v.as_str() == Some(req_aud) => true,
+            Some(v) => v
+                .as_array()
+                .map(|arr| arr.iter().any(|x| x.as_str() == Some(req_aud)))
+                .unwrap_or(false),
+            None => false,
+        };
+        if !aud_ok {
+            return Err(401);
+        }
+    }
+
+    let sub = claims
+        .get("sub")
+        .and_then(|x| x.as_str())
+        .unwrap_or("jwt_user")
+        .to_string();
+    let role_str = claims
+        .get("role")
+        .and_then(|x| x.as_str())
+        .or_else(|| claims.get("scope").and_then(|x| x.as_str()))
+        .unwrap_or("agent");
+    let role = if role_str.contains("admin") {
+        AuthRole::Admin
+    } else if role_str.contains("approver") {
+        AuthRole::Approver
+    } else if role_str.contains("operator") {
+        AuthRole::Operator
+    } else {
+        AuthRole::Agent
+    };
+
+    Ok(AuthPrincipal { id: sub, role })
+}
+
+/// Cached JWKS entry: `(fetched_at_epoch_secs, parsed_jwks_json)`.
+#[cfg(feature = "tls-rustls")]
+static JWKS_CACHE: OnceLock<RwLock<HashMap<String, (f64, JsonValue)>>> = OnceLock::new();
+#[cfg(feature = "tls-rustls")]
+const JWKS_CACHE_TTL_SECS: f64 = 300.0;
+
+#[cfg(feature = "tls-rustls")]
+fn fetch_jwks_cached(jwks_uri: &str, force_refresh: bool) -> Result<JsonValue, u16> {
+    if jwks_uri.starts_with('{') {
+        return JsonValue::parse(jwks_uri).map_err(|_| 401u16);
+    }
+    let cache = JWKS_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let now = now_epoch_secs();
+    if !force_refresh {
+        if let Ok(guard) = cache.read() {
+            if let Some((fetched_at, doc)) = guard.get(jwks_uri) {
+                if (now - *fetched_at) < JWKS_CACHE_TTL_SECS {
+                    return Ok(doc.clone());
+                }
+            }
+        }
+    }
+    let jwks_raw = if let Some(path) = jwks_uri.strip_prefix("file://") {
+        fs::read_to_string(path).map_err(|_| 401u16)?
+    } else {
+        let client = crate::data_plane::HttpDownstreamClient::new();
+        client.get_raw(jwks_uri, None).map_err(|_| 401u16)?
+    };
+    let doc = JsonValue::parse(&jwks_raw).map_err(|_| 401u16)?;
+    if let Ok(mut guard) = cache.write() {
+        guard.insert(jwks_uri.to_string(), (now, doc.clone()));
+    }
+    Ok(doc)
+}
+
+#[cfg(feature = "tls-rustls")]
+fn pad_be_32(bytes: &[u8]) -> Option<[u8; 32]> {
+    if bytes.len() > 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let offset = 32 - bytes.len();
+    out[offset..].copy_from_slice(bytes);
+    Some(out)
+}
+
+#[cfg(feature = "tls-rustls")]
+fn verify_jwk_signature(
+    alg: &str,
+    jwk: &JsonValue,
+    signing_input: &[u8],
+    sig_bytes: &[u8],
+) -> bool {
+    match alg {
+        "RS256" => {
+            if jwk.get("kty").and_then(|v| v.as_str()) != Some("RSA") {
+                return false;
+            }
+            let n = match jwk.get("n").and_then(|v| v.as_str()).map(base64url_decode) {
+                Some(Ok(b)) if !b.is_empty() => b,
+                _ => return false,
+            };
+            let e = match jwk.get("e").and_then(|v| v.as_str()).map(base64url_decode) {
+                Some(Ok(b)) if !b.is_empty() => b,
+                _ => return false,
+            };
+            let key = ring::signature::RsaPublicKeyComponents { n: &n, e: &e };
+            key.verify(
+                &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                signing_input,
+                sig_bytes,
+            )
+            .is_ok()
+        }
+        "ES256" => {
+            if jwk.get("kty").and_then(|v| v.as_str()) != Some("EC")
+                || jwk.get("crv").and_then(|v| v.as_str()) != Some("P-256")
+            {
+                return false;
+            }
+            let x = match jwk.get("x").and_then(|v| v.as_str()).map(base64url_decode) {
+                Some(Ok(b)) => match pad_be_32(&b) {
+                    Some(arr) => arr,
+                    None => return false,
+                },
+                _ => return false,
+            };
+            let y = match jwk.get("y").and_then(|v| v.as_str()).map(base64url_decode) {
+                Some(Ok(b)) => match pad_be_32(&b) {
+                    Some(arr) => arr,
+                    None => return false,
+                },
+                _ => return false,
+            };
+            let mut uncompressed = [0u8; 65];
+            uncompressed[0] = 0x04;
+            uncompressed[1..33].copy_from_slice(&x);
+            uncompressed[33..65].copy_from_slice(&y);
+            ring::signature::UnparsedPublicKey::new(
+                &ring::signature::ECDSA_P256_SHA256_FIXED,
+                &uncompressed,
+            )
+            .verify(signing_input, sig_bytes)
+            .is_ok()
+        }
+        "EdDSA" => {
+            if jwk.get("kty").and_then(|v| v.as_str()) != Some("OKP")
+                || jwk.get("crv").and_then(|v| v.as_str()) != Some("Ed25519")
+            {
+                return false;
+            }
+            let x = match jwk.get("x").and_then(|v| v.as_str()).map(base64url_decode) {
+                Some(Ok(b)) if b.len() == 32 => b,
+                _ => return false,
+            };
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &x)
+                .verify(signing_input, sig_bytes)
+                .is_ok()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "tls-rustls")]
+fn extract_role_from_claims(claims: &JsonValue) -> AuthRole {
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(role_s) = claims.get("role").and_then(|x| x.as_str()) {
+        tokens.extend(role_s.split_whitespace().map(|s| s.to_lowercase()));
+    }
+    if let Some(roles_arr) = claims.get("roles").and_then(|x| x.as_array()) {
+        for r in roles_arr {
+            if let Some(s) = r.as_str() {
+                tokens.push(s.to_lowercase());
+            }
+        }
+    } else if let Some(roles_s) = claims.get("roles").and_then(|x| x.as_str()) {
+        tokens.extend(roles_s.split_whitespace().map(|s| s.to_lowercase()));
+    }
+    if let Some(scope_s) = claims.get("scope").and_then(|x| x.as_str()) {
+        tokens.extend(scope_s.split_whitespace().map(|s| s.to_lowercase()));
+    }
+    if let Some(scp_arr) = claims.get("scp").and_then(|x| x.as_array()) {
+        for r in scp_arr {
+            if let Some(s) = r.as_str() {
+                tokens.push(s.to_lowercase());
+            }
+        }
+    } else if let Some(scp_s) = claims.get("scp").and_then(|x| x.as_str()) {
+        tokens.extend(scp_s.split_whitespace().map(|s| s.to_lowercase()));
+    }
+
+    let has = |needle: &str| {
+        tokens
+            .iter()
+            .any(|t| t == needle || t.ends_with(&format!(":{}", needle)))
+    };
+    if has("admin") {
+        AuthRole::Admin
+    } else if has("approver") {
+        AuthRole::Approver
+    } else if has("operator") {
+        AuthRole::Operator
+    } else {
+        AuthRole::Agent
+    }
+}
+
+/// Validates a JWT against a remote/local OIDC JWKS document (`RS256` / `ES256` / `EdDSA`),
+/// enforcing cryptographic signature verification (`ring::signature`), `kid` matching,
+/// `exp`/`nbf`, `iss`, and RFC 8707 `aud` resource indicator.
+pub fn validate_jwt_oidc_jwks(
+    token: &str,
+    jwks_uri: &str,
+    expected_iss: Option<&str>,
+    expected_aud: Option<&str>,
+) -> Result<AuthPrincipal, u16> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(401);
+    }
+    let header_bytes = base64url_decode(parts[0])?;
+    let header_json =
+        JsonValue::parse(&String::from_utf8_lossy(&header_bytes)).map_err(|_| 401u16)?;
+    let alg = header_json
+        .get("alg")
+        .and_then(|a| a.as_str())
+        .unwrap_or("");
+    if !matches!(alg, "RS256" | "ES256" | "EdDSA") {
+        return Err(401);
+    }
+    let kid = header_json.get("kid").and_then(|k| k.as_str());
+    let sig_bytes = base64url_decode(parts[2])?;
+    if sig_bytes.is_empty() {
+        return Err(401);
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+    #[cfg(not(feature = "tls-rustls"))]
+    {
+        let _ = (
+            jwks_uri,
+            expected_iss,
+            expected_aud,
+            kid,
+            signing_input,
+            parts,
+        );
+        Err(401)
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    {
+        let mut verified = false;
+        for attempt in 0..2 {
+            let jwks = fetch_jwks_cached(jwks_uri, attempt == 1)?;
+            let keys = jwks.get("keys").and_then(|k| k.as_array()).ok_or(401u16)?;
+            for k in keys {
+                let k_kid = k.get("kid").and_then(|x| x.as_str());
+                let k_alg = k.get("alg").and_then(|x| x.as_str());
+                let kid_ok = match (kid, k_kid) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, _) => true,
+                    _ => false,
+                };
+                let alg_ok = k_alg.map(|a| a == alg).unwrap_or(true);
+                if kid_ok
+                    && alg_ok
+                    && verify_jwk_signature(alg, k, signing_input.as_bytes(), &sig_bytes)
+                {
+                    verified = true;
+                    break;
+                }
+            }
+            if verified || jwks_uri.starts_with('{') {
+                break;
+            }
+        }
+        if !verified {
+            return Err(401);
+        }
+
+        let claims_bytes = base64url_decode(parts[1])?;
+        let claims =
+            JsonValue::parse(&String::from_utf8_lossy(&claims_bytes)).map_err(|_| 401u16)?;
+        let now = now_epoch_secs();
+        if let Some(exp) = claims.get("exp").and_then(|x| x.as_f64()) {
+            if now > exp {
+                return Err(401);
+            }
+        }
+        if let Some(nbf) = claims.get("nbf").and_then(|x| x.as_f64()) {
+            if now < nbf {
+                return Err(401);
+            }
+        }
+        if let Some(iss_req) = expected_iss {
+            if claims.get("iss").and_then(|x| x.as_str()) != Some(iss_req) {
+                return Err(401);
+            }
+        }
+        if let Some(aud_req) = expected_aud {
+            let aud_ok = match claims.get("aud") {
+                Some(JsonValue::Str(s)) => s == aud_req,
+                Some(JsonValue::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(aud_req)),
+                _ => false,
+            };
+            if !aud_ok {
+                return Err(401);
+            }
+        }
+
+        let sub = claims
+            .get("sub")
+            .and_then(|x| x.as_str())
+            .unwrap_or("oidc_user")
+            .to_string();
+        let role = extract_role_from_claims(&claims);
+        Ok(AuthPrincipal { id: sub, role })
+    }
+}
+
+/// Validates a Client ID Metadata Document (CIMD) per MCP OAuth 2.1 draft.
+pub fn validate_cimd_metadata(doc: &JsonValue, expected_client_id: &str) -> Result<(), String> {
+    let client_id = doc
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "CIMD document missing 'client_id'".to_string())?;
+    if client_id != expected_client_id {
+        return Err(format!(
+            "CIMD 'client_id' mismatch: expected '{}', got '{}'",
+            expected_client_id, client_id
+        ));
+    }
+    let redirect_uris = doc
+        .get("redirect_uris")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "CIMD document missing 'redirect_uris' array".to_string())?;
+    if redirect_uris.is_empty() {
+        return Err("CIMD 'redirect_uris' must not be empty".to_string());
+    }
+    for u in redirect_uris {
+        let s = u
+            .as_str()
+            .ok_or_else(|| "CIMD 'redirect_uris' must contain strings".to_string())?;
+        if !s.contains("://") {
+            return Err(format!("Invalid CIMD redirect_uri '{}'", s));
+        }
+    }
+    Ok(())
+}
+
+/// Fetches and validates a Client ID Metadata Document (CIMD) from an HTTPS/HTTP client_id URL.
+pub fn fetch_cimd_metadata(client_id_url: &str) -> Result<JsonValue, String> {
+    if !client_id_url.starts_with("https://") && !client_id_url.starts_with("http://") {
+        return Err("CIMD client_id must be an http(s) URL".to_string());
+    }
+    let client = crate::data_plane::HttpDownstreamClient::new();
+    let raw = client.get_raw(client_id_url, None)?;
+    let doc = JsonValue::parse(&raw)?;
+    validate_cimd_metadata(&doc, client_id_url)?;
+    Ok(doc)
+}
+
+#[cfg(feature = "tls-rustls")]
+fn decode_pem_blocks(pem: &str, begin_marker: &str, end_marker: &str) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    let mut b64 = String::new();
+    for line in pem.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains(begin_marker) {
+            in_block = true;
+            b64.clear();
+        } else if trimmed.contains(end_marker) {
+            if in_block {
+                if let Some(der) = base64_decode_standard(&b64) {
+                    out.push(der);
+                }
+            }
+            in_block = false;
+            b64.clear();
+        } else if in_block {
+            b64.push_str(trimmed);
+        }
+    }
+    out
+}
+
+#[cfg(feature = "tls-rustls")]
+fn base64_decode_standard(input: &str) -> Option<Vec<u8>> {
+    let cleaned: String = input.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut bytes = Vec::with_capacity(cleaned.len() * 3 / 4);
+    let mut val = 0u32;
+    let mut valb = -8i32;
+    for b in cleaned.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let d = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        val = (val << 6) | d;
+        valb += 6;
+        if valb >= 0 {
+            bytes.push(((val >> valb) & 0xFF) as u8);
+            valb -= 8;
+        }
+    }
+    Some(bytes)
+}
+
+#[cfg(feature = "tls-rustls")]
+pub fn build_inbound_tls_config_from_pem(
+    cert_pem: &str,
+    key_pem: &str,
+    client_ca_pem: Option<&str>,
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        decode_pem_blocks(cert_pem, "BEGIN CERTIFICATE", "END CERTIFICATE")
+            .into_iter()
+            .map(rustls::pki_types::CertificateDer::from)
+            .collect();
+    if certs.is_empty() {
+        return Err("No certificates found in OMNI_TLS_CERT".to_string());
+    }
+
+    let key_der = decode_pem_blocks(key_pem, "BEGIN PRIVATE KEY", "END PRIVATE KEY")
+        .into_iter()
+        .next()
+        .map(rustls::pki_types::PrivatePkcs8KeyDer::from)
+        .map(rustls::pki_types::PrivateKeyDer::Pkcs8)
+        .or_else(|| {
+            decode_pem_blocks(key_pem, "BEGIN RSA PRIVATE KEY", "END RSA PRIVATE KEY")
+                .into_iter()
+                .next()
+                .map(rustls::pki_types::PrivatePkcs1KeyDer::from)
+                .map(rustls::pki_types::PrivateKeyDer::Pkcs1)
+        })
+        .or_else(|| {
+            decode_pem_blocks(key_pem, "BEGIN EC PRIVATE KEY", "END EC PRIVATE KEY")
+                .into_iter()
+                .next()
+                .map(rustls::pki_types::PrivateSec1KeyDer::from)
+                .map(rustls::pki_types::PrivateKeyDer::Sec1)
+        })
+        .ok_or_else(|| "No supported private key found in OMNI_TLS_KEY".to_string())?;
+
+    let builder = rustls::ServerConfig::builder();
+    let mut cfg = if let Some(ca_pem) = client_ca_pem {
+        let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            decode_pem_blocks(ca_pem, "BEGIN CERTIFICATE", "END CERTIFICATE")
+                .into_iter()
+                .map(rustls::pki_types::CertificateDer::from)
+                .collect();
+        if ca_certs.is_empty() {
+            return Err("No CA certificates found in OMNI_TLS_CLIENT_CA".to_string());
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for c in ca_certs {
+            roots
+                .add(c)
+                .map_err(|e| format!("Invalid client CA certificate: {}", e))?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| format!("Failed to build mTLS client verifier: {}", e))?;
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key_der)
+            .map_err(|e| format!("Invalid inbound mTLS certificate/key: {}", e))?
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key_der)
+            .map_err(|e| format!("Invalid inbound TLS certificate/key: {}", e))?
+    };
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+#[cfg(feature = "tls-rustls")]
+pub fn build_inbound_tls_config() -> Result<Option<Arc<rustls::ServerConfig>>, String> {
+    let cert_path = match std::env::var("OMNI_TLS_CERT") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => return Ok(None),
+    };
+    let key_path = std::env::var("OMNI_TLS_KEY")
+        .map_err(|_| "OMNI_TLS_KEY must be set when OMNI_TLS_CERT is configured".to_string())?;
+
+    let cert_pem = fs::read_to_string(&cert_path)
+        .map_err(|e| format!("Failed to read OMNI_TLS_CERT '{}': {}", cert_path, e))?;
+    let key_pem = fs::read_to_string(&key_path)
+        .map_err(|e| format!("Failed to read OMNI_TLS_KEY '{}': {}", key_path, e))?;
+    let client_ca_pem = match std::env::var("OMNI_TLS_CLIENT_CA") {
+        Ok(ca_path) if !ca_path.trim().is_empty() => Some(
+            fs::read_to_string(&ca_path)
+                .map_err(|e| format!("Failed to read OMNI_TLS_CLIENT_CA '{}': {}", ca_path, e))?,
+        ),
+        _ => None,
+    };
+
+    build_inbound_tls_config_from_pem(&cert_pem, &key_pem, client_ca_pem.as_deref()).map(Some)
 }
 
 const EMBEDDED_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>

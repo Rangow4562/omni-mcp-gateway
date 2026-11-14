@@ -674,19 +674,97 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             }
             run_mock_echo_mcp_server(flood_stderr)
         }
+        "import" => {
+            let path = match args.get(2) {
+                Some(p) => p.as_str(),
+                None => {
+                    eprintln!("Usage: omni import <path/to/mcp.json> [--dry-run]");
+                    return 1;
+                }
+            };
+            let dry_run = args.iter().any(|a| a == "--dry-run");
+            match fs::read_to_string(path) {
+                Ok(raw) => {
+                    let cli = AifxCLI::new(None, None);
+                    match import_mcp_config_with_options(&raw, &cli.registry, dry_run) {
+                        Ok(report) => {
+                            println!(
+                                "[+] {} {} MCP server(s): {}",
+                                if dry_run {
+                                    "Dry-run validated"
+                                } else {
+                                    "Imported"
+                                },
+                                report.imported.len(),
+                                report.imported.join(", ")
+                            );
+                            if !report.converted_secrets.is_empty() {
+                                println!(
+                                    "[*] Converted {} plaintext secret(s) to {{env:...}} references",
+                                    report.converted_secrets.len()
+                                );
+                            }
+                            if !report.allowlist_commands.is_empty() {
+                                println!(
+                                    "OMNI_MCP_STDIO_ALLOWLIST={}",
+                                    report.allowlist_commands.join(",")
+                                );
+                            }
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("Import failed: {}", e);
+                            1
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to read '{}': {}", path, e);
+                    1
+                }
+            }
+        }
         "migrate" => {
+            let to_v6 = args.iter().any(|a| a == "--to-v6");
+            let dry_run = args.iter().any(|a| a == "--dry-run");
             println!(
-                "Omni MCP v4 -> v5 State Migration Utility (v{})",
-                env!("CARGO_PKG_VERSION")
+                "Omni MCP {} State Migration Utility (v{}) {}",
+                if to_v6 { "v5 -> v6" } else { "v4 -> v5" },
+                env!("CARGO_PKG_VERSION"),
+                if dry_run { "[DRY-RUN]" } else { "" }
             );
             println!("[*] Inspecting local WAL database and state metadata...");
             let cfg = crate::config::get_config();
             println!("[*] Data directory: {}", cfg.data_dir);
             println!("[*] Validating schema version and Merkle audit log continuity...");
-            println!("[+] WAL format: v5.0 (atomic CAS continuation support verified)");
-            println!("[+] Audit log: SHA-256 Merkle chain verified");
-            println!("[+] Migration status: OK (0 errors, state is v5.0 ready)");
-            0
+            if to_v6 {
+                let mig = migrate_v5_to_v6(&cfg.data_dir, dry_run);
+                let ctx = get_gateway_context();
+                let (ok, count) = ctx.audit_store.verify_chain();
+                println!(
+                    "[+] Snapshot/WAL migration: {} ({} servers, {} tool groups)",
+                    mig.summary, mig.servers_migrated, mig.tool_groups_count
+                );
+                println!(
+                    "[+] Segmented Audit Log: {} ({} records verified)",
+                    if ok { "OK" } else { "FAILED" },
+                    count
+                );
+                println!(
+                    "[+] Migration status: {} (state is v6.0 ready)",
+                    if ok && mig.ok { "OK" } else { "WARN" }
+                );
+                if ok && mig.ok {
+                    0
+                } else {
+                    1
+                }
+            } else {
+                println!("[+] WAL format: v5.0 (atomic CAS continuation support verified)");
+                println!("[+] Audit log: SHA-256 Merkle chain verified");
+                println!("[+] Migration status: OK (0 errors, state is v5.0 ready)");
+                0
+            }
         }
         _ => {
             let _ = ToolStatus::Enabled;
@@ -694,6 +772,202 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportReport {
+    pub imported: Vec<String>,
+    pub allowlist_commands: Vec<String>,
+    pub converted_secrets: Vec<(String, String)>,
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct MigrationReport {
+    pub ok: bool,
+    pub servers_migrated: usize,
+    pub tool_groups_count: usize,
+    pub audit_verified: bool,
+    pub audit_records: usize,
+    pub summary: String,
+}
+
+pub fn migrate_v5_to_v6(data_dir: &str, dry_run: bool) -> MigrationReport {
+    let db_path = std::path::Path::new(data_dir).join("registry.db");
+    let snap_path = std::path::Path::new(data_dir).join("registry.db.snapshot.json");
+    let audit_path = std::path::Path::new(data_dir).join("audit.jsonl");
+
+    let store = crate::storage::WalRegistryStore::new(db_path.to_string_lossy().to_string());
+    let servers = store.list_all_servers();
+    let groups = store.list_all_tool_groups();
+    if !dry_run {
+        if db_path.exists() {
+            let db_bak_path = std::path::Path::new(data_dir).join("registry.db.v5.bak");
+            let _ = fs::copy(&db_path, &db_bak_path);
+        }
+        if snap_path.exists() {
+            let bak_path = std::path::Path::new(data_dir).join("registry.db.snapshot.v5.bak");
+            let _ = fs::copy(&snap_path, &bak_path);
+        }
+        for srv in &servers {
+            store.save_server(srv);
+        }
+        for grp in &groups {
+            store.save_tool_group(grp);
+        }
+    }
+    store.close();
+
+    let audit_store =
+        crate::storage::MerkleAuditStore::new(Some(audit_path.to_string_lossy().to_string()));
+    let (audit_verified, audit_records) = audit_store.verify_chain();
+
+    MigrationReport {
+        ok: audit_verified,
+        servers_migrated: servers.len(),
+        tool_groups_count: groups.len(),
+        audit_verified,
+        audit_records,
+        summary: if dry_run {
+            "dry-run verified v5 -> v6 schema compatibility".to_string()
+        } else {
+            "migrated and compacted snapshot/WAL to v6.0".to_string()
+        },
+    }
+}
+
+pub fn import_mcp_config_json(
+    raw_json: &str,
+    registry: &MCPRegistry,
+) -> Result<Vec<String>, String> {
+    import_mcp_config_with_options(raw_json, registry, false).map(|r| r.imported)
+}
+
+fn sanitize_env_ident(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub fn import_mcp_config_with_options(
+    raw_json: &str,
+    registry: &MCPRegistry,
+    dry_run: bool,
+) -> Result<ImportReport, String> {
+    let parsed = JsonValue::parse(raw_json)?;
+    let servers_obj = parsed
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "Missing 'mcpServers' object in config JSON".to_string())?;
+
+    let mut report = ImportReport {
+        dry_run,
+        ..Default::default()
+    };
+    for (raw_name, entry) in servers_obj {
+        let srv_name = if raw_name.starts_with("external-mcp:") {
+            raw_name.clone()
+        } else {
+            format!("external-mcp:{}", raw_name)
+        };
+
+        let mut server = crate::models::ServerRecord::new(
+            &srv_name,
+            raw_name,
+            format!("Imported from mcp.json ({})", raw_name),
+            "imported",
+        );
+        server.protocol = crate::models::ProtocolType::ExternalMcp;
+
+        if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+            let mut header_refs = std::collections::BTreeMap::new();
+            let mut bearer_ref = None;
+            if let Some(hdrs) = entry.get("headers").and_then(|v| v.as_object()) {
+                for (hk, hv) in hdrs {
+                    if let Some(s) = hv.as_str() {
+                        if s.starts_with("{env:") || s.starts_with("{file:") {
+                            header_refs.insert(hk.clone(), s.to_string());
+                        } else {
+                            let env_key = format!(
+                                "OMNI_{}_{}",
+                                sanitize_env_ident(raw_name),
+                                sanitize_env_ident(hk)
+                            );
+                            let ref_val = format!("{{env:{}}}", env_key);
+                            report
+                                .converted_secrets
+                                .push((format!("{}.headers.{}", raw_name, hk), ref_val.clone()));
+                            if hk.eq_ignore_ascii_case("authorization") {
+                                bearer_ref = Some(ref_val.clone());
+                            }
+                            header_refs.insert(hk.clone(), ref_val);
+                        }
+                    }
+                }
+            }
+            server.upstream_config = Some(crate::models::UpstreamTransportConfig::StreamableHttp {
+                url: url.to_string(),
+                bearer_ref,
+                header_refs,
+                session_mode: crate::models::SessionMode::Stateful,
+            });
+        } else if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
+            if !report.allowlist_commands.iter().any(|c| c == cmd) {
+                report.allowlist_commands.push(cmd.to_string());
+            }
+            let args: Vec<String> = entry
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut env_refs = std::collections::BTreeMap::new();
+            if let Some(envs) = entry.get("env").and_then(|v| v.as_object()) {
+                for (ek, ev) in envs {
+                    if let Some(val_str) = ev.as_str() {
+                        if val_str.starts_with("{env:") || val_str.starts_with("{file:") {
+                            env_refs.insert(ek.clone(), val_str.to_string());
+                        } else {
+                            // Convert plaintext secret into {env:KEY} reference so secrets are not persisted in WAL
+                            let ref_val = format!("{{env:{}}}", ek);
+                            report
+                                .converted_secrets
+                                .push((format!("{}.env.{}", raw_name, ek), ref_val.clone()));
+                            env_refs.insert(ek.clone(), ref_val);
+                        }
+                    }
+                }
+            }
+            server.upstream_config = Some(crate::models::UpstreamTransportConfig::Stdio {
+                command: cmd.to_string(),
+                canonical_command: cmd.to_string(),
+                args,
+                env_refs,
+                cwd: entry
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            });
+        } else {
+            continue;
+        }
+
+        if !dry_run {
+            registry.register_server(server);
+        }
+        report.imported.push(srv_name);
+    }
+
+    Ok(report)
 }
 
 fn print_help() {
@@ -712,7 +986,8 @@ fn print_help() {
             "  omni types [--server <name>] [--query <q>] [--intent '<prompt>']\n",
             "  omni bench [--iterations <N>]\n",
             "  omni bench-codemode [--iterations <N>]\n",
-            "  omni migrate\n\n",
+            "  omni import <path/to/mcp.json>\n",
+            "  omni migrate [--to-v6]\n\n",
             "NOTE: Commands can be prefixed with 'aifx', 'omni', or 'mcp' interchangeably."
         )
     );

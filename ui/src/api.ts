@@ -86,3 +86,32 @@ export async function apiFetch<T = any>(
   }
   return (await response.text()) as unknown as T;
 }
+
+export interface ToolGroupEntry {
+  server_name: string;
+  tool_name?: string | null;
+}
+
+export interface ToolGroupItem {
+  slug: string;
+  display_name: string;
+  description: string;
+  entries: ToolGroupEntry[];
+}
+
+export async function listToolGroups(): Promise<ToolGroupItem[]> {
+  const res = await apiFetch<{ groups: ToolGroupItem[] }>('/api/v1/groups');
+  return res.groups || [];
+}
+
+export async function saveToolGroup(group: ToolGroupItem): Promise<ToolGroupItem> {
+  const res = await apiFetch<{ group: ToolGroupItem }>('/api/v1/groups', {
+    method: 'POST',
+    body: JSON.stringify(group),
+  });
+  return res.group;
+}
+
+export async function deleteToolGroup(slug: string): Promise<void> {
+  await apiFetch(`/api/v1/groups/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+}

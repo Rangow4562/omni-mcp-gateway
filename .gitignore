@@ -8,6 +8,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 ui/node_modules/
+ui/test-results/
+ui/playwright-report/
 /dist/
 !ui/dist/
 .DS_Store

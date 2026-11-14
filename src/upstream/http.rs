@@ -5,7 +5,10 @@
 
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
-use crate::models::{ProtocolType, SchemaSource, SessionMode, ToolRecord, ToolStatus};
+use crate::models::{
+    ExternalPromptRecord, ExternalResourceRecord, ProtocolType, SchemaSource, SessionMode,
+    ToolRecord, ToolStatus,
+};
 use crate::upstream::secrets::resolve_secret_ref;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -70,21 +73,30 @@ pub fn validate_upstream_url_and_resolve(
     url: &str,
     allow_loopback: bool,
 ) -> Result<(SocketAddr, String, String), String> {
-    if url.starts_with("https://") {
+    let (is_https, default_port, without_scheme) = if let Some(rest) = url.strip_prefix("https://")
+    {
+        #[cfg(not(feature = "tls-rustls"))]
+        {
+            let _ = rest;
+            return Err(format!(
+                "Error -32014 UPSTREAM_TLS_UNSUPPORTED: Upstream HTTPS endpoints require the 'tls-rustls' Cargo feature. Rebuild with `--features tls-rustls` or use a local stdio bridge (npx -y supergateway --streamableHttp {}).",
+                url
+            ));
+        }
+        #[cfg(feature = "tls-rustls")]
+        {
+            (true, 443u16, rest)
+        }
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, 80u16, rest)
+    } else {
         return Err(format!(
-            "Error -32014 UPSTREAM_TLS_UNSUPPORTED: Upstream HTTPS endpoints are not supported directly in std-only runtime. Use a local stdio bridge (npx -y supergateway --streamableHttp {}) or a local TLS proxy.",
+            "Invalid URL scheme in '{}'; must start with http:// or https://",
             url
         ));
-    }
+    };
+    let _ = is_https;
 
-    if !url.starts_with("http://") {
-        return Err(format!(
-            "Invalid URL scheme in '{}'; must start with http://",
-            url
-        ));
-    }
-
-    let without_scheme = &url["http://".len()..];
     let (authority, path) = match without_scheme.find('/') {
         Some(idx) => (&without_scheme[..idx], &without_scheme[idx..]),
         None => (without_scheme, "/"),
@@ -98,7 +110,7 @@ pub fn validate_upstream_url_and_resolve(
                 .map_err(|e| format!("Invalid port in URL '{}': {}", url, e))?;
             (h, p)
         }
-        None => (authority, 80),
+        None => (authority, default_port),
     };
 
     if host.is_empty() {
@@ -175,7 +187,10 @@ pub struct HttpUpstreamSession {
     pub call_timeout_ms: u64,
     pub allow_loopback: bool,
     session_id: Mutex<Option<String>>,
+    last_event_id: Mutex<Option<String>>,
     last_initialize: Mutex<Option<f64>>,
+    retry_ms: Mutex<Option<u64>>,
+    progress_notifications: Mutex<Vec<JsonValue>>,
     next_request_id: AtomicU64,
 }
 
@@ -201,9 +216,21 @@ impl HttpUpstreamSession {
             call_timeout_ms,
             allow_loopback,
             session_id: Mutex::new(None),
+            last_event_id: Mutex::new(None),
             last_initialize: Mutex::new(None),
+            retry_ms: Mutex::new(None),
+            progress_notifications: Mutex::new(Vec::new()),
             next_request_id: AtomicU64::new(1),
         }
+    }
+
+    pub fn get_retry_ms(&self) -> Option<u64> {
+        *self.retry_ms.lock().unwrap()
+    }
+
+    pub fn drain_progress_notifications(&self) -> Vec<JsonValue> {
+        let mut guard = self.progress_notifications.lock().unwrap();
+        std::mem::take(&mut *guard)
     }
 
     pub fn get_health(&self) -> &'static str {
@@ -230,11 +257,13 @@ impl HttpUpstreamSession {
         let (pinned_addr, host_header, path) =
             validate_upstream_url_and_resolve(&self.url, self.allow_loopback)?;
 
-        // Resolve bearer token if present
+        // Resolve bearer token if present, or fall back to encrypted OAuth 2.1 token store
         let bearer_val = if let Some(ref b_ref) = self.bearer_ref {
             Some(resolve_secret_ref(b_ref, &self.secrets_dir)?)
         } else {
-            None
+            UpstreamOAuthTokenStore::new(&self.secrets_dir, None)
+                .load_token(&self.server_name)
+                .ok()
         };
 
         // Resolve headers
@@ -266,6 +295,14 @@ impl HttpUpstreamSession {
         if let Some(ref sid) = sid_opt {
             req_headers_map.insert("mcp-session-id".to_string(), sid.clone());
         }
+        req_headers_map.insert(
+            "accept".to_string(),
+            "application/json, text/event-stream".to_string(),
+        );
+        let last_ev_opt = self.last_event_id.lock().unwrap().clone();
+        if let Some(ref ev_id) = last_ev_opt {
+            req_headers_map.insert("last-event-id".to_string(), ev_id.clone());
+        }
 
         if let Some(mock_resp) = invoke_mock_http(&self.url, &path, &req_headers_map, body) {
             let (status_code, headers_map, resp_body) = mock_resp;
@@ -282,7 +319,7 @@ impl HttpUpstreamSession {
         }
 
         let timeout = Duration::from_millis(self.call_timeout_ms);
-        let mut stream = TcpStream::connect_timeout(&pinned_addr, timeout)
+        let stream = TcpStream::connect_timeout(&pinned_addr, timeout)
             .or_else(|_| TcpStream::connect(pinned_addr))
             .map_err(|e| {
                 format!(
@@ -299,7 +336,7 @@ impl HttpUpstreamSession {
             .map_err(|e| format!("Failed to set write timeout: {}", e))?;
 
         let mut req_header = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nUser-Agent: omni-mcp/{}\r\nConnection: close\r\n",
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nUser-Agent: omni-mcp/{}\r\nConnection: close\r\n",
             path,
             host_header,
             body.len(),
@@ -317,9 +354,77 @@ impl HttpUpstreamSession {
         if let Some(ref sid) = sid_opt {
             req_header.push_str(&format!("Mcp-Session-Id: {}\r\n", sid));
         }
+        if let Some(ref ev_id) = last_ev_opt {
+            req_header.push_str(&format!("Last-Event-ID: {}\r\n", ev_id));
+        }
 
         req_header.push_str("\r\n");
 
+        #[cfg(feature = "tls-rustls")]
+        if self.url.starts_with("https://") {
+            let sni_host = host_header
+                .split(':')
+                .next()
+                .unwrap_or(&host_header)
+                .to_string();
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            if let Ok(ca_bundle_path) = std::env::var("OMNI_MCP_UPSTREAM_CA_BUNDLE") {
+                if !ca_bundle_path.trim().is_empty() {
+                    if let Ok(ca_pem) = std::fs::read_to_string(&ca_bundle_path) {
+                        for der in
+                            decode_pem_blocks(&ca_pem, "BEGIN CERTIFICATE", "END CERTIFICATE")
+                        {
+                            let _ = root_store.add(rustls::pki_types::CertificateDer::from(der));
+                        }
+                    }
+                }
+            }
+
+            let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+            let config = if let (Some(cert_ref), Some(key_ref)) = (
+                self.header_refs.get("x-omni-mtls-cert"),
+                self.header_refs.get("x-omni-mtls-key"),
+            ) {
+                let cert_pem = resolve_secret_ref(cert_ref, &self.secrets_dir)?;
+                let key_pem = resolve_secret_ref(key_ref, &self.secrets_dir)?;
+                let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                    decode_pem_blocks(&cert_pem, "BEGIN CERTIFICATE", "END CERTIFICATE")
+                        .into_iter()
+                        .map(rustls::pki_types::CertificateDer::from)
+                        .collect();
+                let key_der = decode_pem_blocks(&key_pem, "BEGIN PRIVATE KEY", "END PRIVATE KEY")
+                    .into_iter()
+                    .next()
+                    .map(rustls::pki_types::PrivatePkcs8KeyDer::from)
+                    .map(rustls::pki_types::PrivateKeyDer::Pkcs8)
+                    .ok_or_else(|| "Invalid mTLS client private key PEM".to_string())?;
+                builder
+                    .with_client_auth_cert(certs, key_der)
+                    .map_err(|e| format!("Invalid upstream mTLS client cert/key: {}", e))?
+            } else {
+                builder.with_no_client_auth()
+            };
+
+            let server_name = rustls::pki_types::ServerName::try_from(sni_host.clone())
+                .map_err(|e| format!("Invalid TLS SNI hostname '{}': {}", sni_host, e))?;
+            let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+                .map_err(|e| format!("Failed to initialize TLS session: {}", e))?;
+            let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+            return self.exchange_http_on_stream(&mut tls_stream, &req_header, body);
+        }
+
+        let mut plain_stream = stream;
+        self.exchange_http_on_stream(&mut plain_stream, &req_header, body)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn exchange_http_on_stream<S: Read + Write>(
+        &self,
+        stream: &mut S,
+        req_header: &str,
+        body: &[u8],
+    ) -> Result<(u16, BTreeMap<String, String>, Vec<u8>), String> {
         stream
             .write_all(req_header.as_bytes())
             .map_err(|e| format!("Write headers failed: {}", e))?;
@@ -328,7 +433,6 @@ impl HttpUpstreamSession {
             .map_err(|e| format!("Write body failed: {}", e))?;
         stream.flush().map_err(|e| format!("Flush failed: {}", e))?;
 
-        // Read response
         let mut reader = BufReader::new(stream);
         let mut status_line = String::new();
         reader
@@ -354,6 +458,7 @@ impl HttpUpstreamSession {
 
         let mut headers_map: BTreeMap<String, String> = BTreeMap::new();
         let mut content_length: Option<usize> = None;
+        let mut is_chunked = false;
 
         loop {
             let mut line = String::new();
@@ -365,6 +470,10 @@ impl HttpUpstreamSession {
                 let val_trimmed = v.trim().to_string();
                 if key_lower == "content-length" {
                     content_length = val_trimmed.parse().ok();
+                } else if key_lower == "transfer-encoding"
+                    && val_trimmed.to_lowercase().contains("chunked")
+                {
+                    is_chunked = true;
                 }
                 headers_map.insert(key_lower, val_trimmed);
             }
@@ -383,11 +492,102 @@ impl HttpUpstreamSession {
             reader
                 .read_exact(&mut resp_body)
                 .map_err(|e| format!("Failed to read HTTP response body: {}", e))?;
+        } else if is_chunked {
+            resp_body = read_chunked_body(&mut reader)?;
         } else {
             let _ = reader.read_to_end(&mut resp_body);
         }
 
         Ok((status_code, headers_map, resp_body))
+    }
+
+    fn decode_response_json(
+        &self,
+        headers: &BTreeMap<String, String>,
+        resp_bytes: &[u8],
+        expected_id: Option<u64>,
+    ) -> Result<JsonValue, String> {
+        let is_sse = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.to_lowercase().contains("text/event-stream"))
+            .unwrap_or(false);
+
+        let resp_str = std::str::from_utf8(resp_bytes)
+            .map_err(|e| format!("Invalid UTF-8 in response from upstream: {}", e))?;
+
+        if is_sse {
+            let mut last_ev_id: Option<String> = None;
+            let mut parsed_retry_ms: Option<u64> = None;
+            let mut current_data: Vec<String> = Vec::new();
+            let mut parsed_msgs: Vec<JsonValue> = Vec::new();
+
+            let flush_event = |data_lines: &mut Vec<String>, msgs: &mut Vec<JsonValue>| {
+                if data_lines.is_empty() {
+                    return;
+                }
+                let joined = data_lines.join("\n");
+                data_lines.clear();
+                if let Ok(v) = JsonValue::parse(joined.trim()) {
+                    msgs.push(v);
+                }
+            };
+
+            for raw_line in resp_str.lines() {
+                let line = raw_line.trim_end_matches('\r');
+                if line.is_empty() {
+                    flush_event(&mut current_data, &mut parsed_msgs);
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    current_data.push(rest.trim_start().to_string());
+                } else if let Some(rest) = line.strip_prefix("id:") {
+                    let ev = rest.trim().to_string();
+                    if !ev.is_empty() {
+                        last_ev_id = Some(ev);
+                    }
+                } else if let Some(rest) = line.strip_prefix("retry:") {
+                    if let Ok(ms) = rest.trim().parse::<u64>() {
+                        parsed_retry_ms = Some(ms);
+                    }
+                }
+            }
+            flush_event(&mut current_data, &mut parsed_msgs);
+
+            if let Some(ev) = last_ev_id {
+                *self.last_event_id.lock().unwrap() = Some(ev);
+            }
+            if let Some(ms) = parsed_retry_ms {
+                *self.retry_ms.lock().unwrap() = Some(ms);
+            }
+
+            // Capture MCP notifications/progress frames for downstream forwarding
+            let mut progress_buf = self.progress_notifications.lock().unwrap();
+            for msg in &parsed_msgs {
+                if msg.get("method").and_then(|m| m.as_str()) == Some("notifications/progress") {
+                    progress_buf.push(msg.clone());
+                }
+            }
+            drop(progress_buf);
+
+            if let Some(eid) = expected_id {
+                if let Some(matched) = parsed_msgs
+                    .iter()
+                    .find(|m| m.get("id").and_then(|x| x.as_u64()) == Some(eid))
+                {
+                    return Ok(matched.clone());
+                }
+            }
+
+            return parsed_msgs
+                .into_iter()
+                .rev()
+                .find(|m| {
+                    m.get("id").is_some() || m.get("result").is_some() || m.get("error").is_some()
+                })
+                .ok_or_else(|| "Empty SSE stream from upstream".to_string());
+        }
+
+        JsonValue::parse(resp_str)
+            .map_err(|e| format!("Invalid JSON response from upstream: {}", e))
     }
 
     pub fn initialize(&self) -> Result<(), String> {
@@ -406,7 +606,7 @@ impl HttpUpstreamSession {
         });
 
         let body = init_req.to_string_compact().into_bytes();
-        let (status, _headers, resp_bytes) = self.send_raw_http(&body)?;
+        let (status, headers, resp_bytes) = self.send_raw_http(&body)?;
 
         if status != 200 {
             return Err(format!(
@@ -416,10 +616,7 @@ impl HttpUpstreamSession {
             ));
         }
 
-        let resp_str = String::from_utf8(resp_bytes)
-            .map_err(|e| format!("Invalid UTF-8 from upstream initialize: {}", e))?;
-        let parsed = JsonValue::parse(&resp_str)
-            .map_err(|e| format!("Invalid JSON from upstream initialize: {}", e))?;
+        let parsed = self.decode_response_json(&headers, &resp_bytes, Some(1))?;
 
         if let Some(err) = parsed.get("error") {
             return Err(format!("Initialize error: {}", err.to_string_compact()));
@@ -450,7 +647,7 @@ impl HttpUpstreamSession {
         });
 
         let body = req.to_string_compact().into_bytes();
-        let (mut status, mut _headers, mut resp_bytes) = self.send_raw_http(&body)?;
+        let (mut status, mut headers, mut resp_bytes) = self.send_raw_http(&body)?;
 
         // Transparent session-expiry recovery:
         // If HTTP 404 in Stateful mode, re-initialize once to get a fresh session ID and retry
@@ -459,7 +656,7 @@ impl HttpUpstreamSession {
             self.initialize()?;
             let retry = self.send_raw_http(&body)?;
             status = retry.0;
-            _headers = retry.1;
+            headers = retry.1;
             resp_bytes = retry.2;
         }
 
@@ -472,10 +669,7 @@ impl HttpUpstreamSession {
             ));
         }
 
-        let resp_str = String::from_utf8(resp_bytes)
-            .map_err(|e| format!("Invalid UTF-8 in response from upstream: {}", e))?;
-        let parsed = JsonValue::parse(&resp_str)
-            .map_err(|e| format!("Invalid JSON response from upstream: {}", e))?;
+        let parsed = self.decode_response_json(&headers, &resp_bytes, Some(req_id))?;
 
         if let Some(err) = parsed.get("error") {
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
@@ -552,5 +746,479 @@ impl HttpUpstreamSession {
                 "arguments": arguments.clone()
             }),
         )
+    }
+
+    pub fn fetch_resources(&self) -> Result<Vec<ExternalResourceRecord>, String> {
+        let result = match self.call_rpc("resources/list", JsonValue::object()) {
+            Ok(r) => r,
+            Err(e) if e.contains("-32601") || e.contains("Method not found") => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        if let Some(items) = result.get("resources").and_then(|r| r.as_array()) {
+            for item in items {
+                let uri = item.get("uri").and_then(|x| x.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|x| x.as_str()).unwrap_or(uri);
+                if uri.is_empty() {
+                    continue;
+                }
+                out.push(ExternalResourceRecord {
+                    uri: uri.to_string(),
+                    name: name.to_string(),
+                    description: item
+                        .get("description")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string()),
+                    mime_type: item
+                        .get("mimeType")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string()),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn fetch_prompts(&self) -> Result<Vec<ExternalPromptRecord>, String> {
+        let result = match self.call_rpc("prompts/list", JsonValue::object()) {
+            Ok(r) => r,
+            Err(e) if e.contains("-32601") || e.contains("Method not found") => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        if let Some(items) = result.get("prompts").and_then(|r| r.as_array()) {
+            for item in items {
+                let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let arguments = item
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+                out.push(ExternalPromptRecord {
+                    name: name.to_string(),
+                    description: item
+                        .get("description")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string()),
+                    arguments,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn read_chunked_body<R: Read>(reader: &mut BufReader<R>) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        let n = reader
+            .read_line(&mut size_line)
+            .map_err(|e| format!("Failed reading chunk size: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        let hex_part = size_line.trim().split(';').next().unwrap_or("").trim();
+        if hex_part.is_empty() {
+            continue;
+        }
+        let chunk_size = usize::from_str_radix(hex_part, 16)
+            .map_err(|e| format!("Invalid chunk size '{}': {}", hex_part, e))?;
+        if chunk_size == 0 {
+            break;
+        }
+        let mut buf = vec![0u8; chunk_size];
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| format!("Failed reading chunk payload: {}", e))?;
+        out.extend_from_slice(&buf);
+        let mut crlf = String::new();
+        let _ = reader.read_line(&mut crlf);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "tls-rustls")]
+fn decode_pem_blocks(pem: &str, begin_marker: &str, end_marker: &str) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    let mut b64 = String::new();
+    for line in pem.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains(begin_marker) {
+            in_block = true;
+            b64.clear();
+        } else if trimmed.contains(end_marker) {
+            if in_block {
+                if let Some(der) = base64_decode_std(&b64) {
+                    out.push(der);
+                }
+            }
+            in_block = false;
+            b64.clear();
+        } else if in_block {
+            b64.push_str(trimmed);
+        }
+    }
+    out
+}
+
+#[cfg(feature = "tls-rustls")]
+fn base64_decode_std(input: &str) -> Option<Vec<u8>> {
+    let cleaned: String = input.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut bytes = Vec::with_capacity(cleaned.len() * 3 / 4);
+    let mut val = 0u32;
+    let mut valb = -8i32;
+    for b in cleaned.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let d = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        val = (val << 6) | d;
+        valb += 6;
+        if valb >= 0 {
+            bytes.push(((val >> valb) & 0xFF) as u8);
+            valb -= 8;
+        }
+    }
+    Some(bytes)
+}
+
+/// Encrypted OAuth 2.1 + PKCE token store for hosted upstream SaaS MCP servers (v6.0.0).
+/// Stores encrypted tokens keyed by server name outside `ServerRecord` JSON/WAL.
+pub struct UpstreamOAuthTokenStore {
+    store_dir: PathBuf,
+    master_key: [u8; 32],
+}
+
+impl UpstreamOAuthTokenStore {
+    pub fn new(store_dir: impl Into<PathBuf>, master_key_str: Option<&str>) -> Self {
+        let key_src = master_key_str
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("OMNI_TOKEN_ENCRYPTION_KEY").ok())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::models::continuation_key().to_string());
+        let master_key = crate::storage::sha256(key_src.as_bytes());
+        Self {
+            store_dir: store_dir.into(),
+            master_key,
+        }
+    }
+
+    pub fn generate_pkce_pair() -> (String, String) {
+        let mut entropy = [0u8; 32];
+        crate::models::gather_entropy(&mut entropy);
+        let verifier = base64url_encode_no_pad(&entropy);
+        let challenge_hash = crate::storage::sha256(verifier.as_bytes());
+        let challenge = base64url_encode_no_pad(&challenge_hash);
+        (verifier, challenge)
+    }
+
+    /// Build an OAuth 2.1 Authorization Code + PKCE (S256) authorization URL.
+    pub fn build_authorization_url(
+        authorize_endpoint: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        scope: &str,
+        state: &str,
+        code_challenge: &str,
+    ) -> String {
+        let sep = if authorize_endpoint.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        format!(
+            "{}{}response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+            authorize_endpoint,
+            sep,
+            url_encode_component(client_id),
+            url_encode_component(redirect_uri),
+            url_encode_component(scope),
+            url_encode_component(state),
+            url_encode_component(code_challenge),
+        )
+    }
+
+    /// Build a `application/x-www-form-urlencoded` body for OAuth 2.1 `client_credentials` grant.
+    pub fn build_client_credentials_body(
+        client_id: &str,
+        client_secret: &str,
+        scope: Option<&str>,
+    ) -> String {
+        let mut body = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}",
+            url_encode_component(client_id),
+            url_encode_component(client_secret),
+        );
+        if let Some(s) = scope.filter(|s| !s.is_empty()) {
+            body.push_str("&scope=");
+            body.push_str(&url_encode_component(s));
+        }
+        body
+    }
+
+    /// Build a `application/x-www-form-urlencoded` body for OAuth 2.1 `authorization_code` + PKCE exchange.
+    pub fn build_auth_code_exchange_body(
+        client_id: &str,
+        code: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> String {
+        format!(
+            "grant_type=authorization_code&client_id={}&code={}&redirect_uri={}&code_verifier={}",
+            url_encode_component(client_id),
+            url_encode_component(code),
+            url_encode_component(redirect_uri),
+            url_encode_component(code_verifier),
+        )
+    }
+
+    pub fn save_token(&self, server_name: &str, access_token: &str) -> Result<(), String> {
+        let _ = std::fs::create_dir_all(&self.store_dir);
+        let mut nonce = [0u8; 16];
+        crate::models::gather_entropy(&mut nonce);
+        let mut ciphertext = Vec::with_capacity(access_token.len());
+        for (counter, chunk) in access_token.as_bytes().chunks(32).enumerate() {
+            let mut block_in = Vec::with_capacity(68);
+            block_in.extend_from_slice(&self.master_key);
+            block_in.extend_from_slice(&nonce);
+            block_in.extend_from_slice(&(counter as u32).to_le_bytes());
+            let keystream = crate::storage::sha256(&block_in);
+            for (i, b) in chunk.iter().enumerate() {
+                ciphertext.push(b ^ keystream[i]);
+            }
+        }
+        let mut blob = Vec::with_capacity(nonce.len() + ciphertext.len());
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&ciphertext);
+        let mac = crate::storage::audit_log::hmac_sha256_hex(&self.master_key, &blob);
+        let payload = json!({
+            "server": server_name,
+            "nonce_hex": hex_encode_bytes(&nonce),
+            "ciphertext_hex": hex_encode_bytes(&ciphertext),
+            "hmac_sha256": mac,
+        });
+        let safe_name: String = server_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = self.store_dir.join(format!("{}.oauth.enc", safe_name));
+        std::fs::write(&path, payload.to_string_compact())
+            .map_err(|e| format!("Failed to write encrypted OAuth token: {}", e))
+    }
+
+    pub fn load_token(&self, server_name: &str) -> Result<String, String> {
+        let safe_name: String = server_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = self.store_dir.join(format!("{}.oauth.enc", safe_name));
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read encrypted OAuth token: {}", e))?;
+        let parsed = JsonValue::parse(&raw)?;
+        let nonce = hex_decode_bytes(
+            parsed
+                .get("nonce_hex")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing nonce_hex")?,
+        )?;
+        let ciphertext = hex_decode_bytes(
+            parsed
+                .get("ciphertext_hex")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing ciphertext_hex")?,
+        )?;
+        let mac = parsed
+            .get("hmac_sha256")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing hmac_sha256")?;
+        let mut blob = Vec::with_capacity(nonce.len() + ciphertext.len());
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&ciphertext);
+        let expected_mac = crate::storage::audit_log::hmac_sha256_hex(&self.master_key, &blob);
+        if !crate::models::constant_time_eq(mac.as_bytes(), expected_mac.as_bytes()) {
+            return Err("OAuth token store HMAC verification failed".to_string());
+        }
+        let mut plaintext = Vec::with_capacity(ciphertext.len());
+        for (counter, chunk) in ciphertext.chunks(32).enumerate() {
+            let mut block_in = Vec::with_capacity(68);
+            block_in.extend_from_slice(&self.master_key);
+            block_in.extend_from_slice(&nonce);
+            block_in.extend_from_slice(&(counter as u32).to_le_bytes());
+            let keystream = crate::storage::sha256(&block_in);
+            for (i, b) in chunk.iter().enumerate() {
+                plaintext.push(b ^ keystream[i]);
+            }
+        }
+        String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8 token: {}", e))
+    }
+}
+
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn hex_decode_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err("Odd hex length".to_string());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+fn base64url_encode_no_pad(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+fn url_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod oauth_tests {
+    use super::*;
+
+    #[test]
+    fn test_upstream_oauth_pkce_and_encrypted_token_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "omni_oauth_test_{}",
+            crate::logging::now_epoch_millis()
+        ));
+        let store = UpstreamOAuthTokenStore::new(&dir, Some("test-master-key-v6"));
+        let (verifier, challenge) = UpstreamOAuthTokenStore::generate_pkce_pair();
+        assert!(!verifier.is_empty());
+        assert!(!challenge.is_empty());
+        assert_ne!(verifier, challenge);
+
+        let auth_url = UpstreamOAuthTokenStore::build_authorization_url(
+            "https://auth.example.com/authorize",
+            "client-123",
+            "https://gw.example.com/callback",
+            "mcp:tools",
+            "st-xyz",
+            &challenge,
+        );
+        assert!(auth_url.contains("code_challenge_method=S256"));
+        assert!(auth_url.contains(&challenge));
+
+        let cc_body = UpstreamOAuthTokenStore::build_client_credentials_body(
+            "cid",
+            "csec",
+            Some("read write"),
+        );
+        assert!(cc_body.contains("grant_type=client_credentials"));
+        assert!(cc_body.contains("scope=read%20write"));
+
+        let ac_body = UpstreamOAuthTokenStore::build_auth_code_exchange_body(
+            "cid",
+            "code123",
+            "https://gw.example.com/callback",
+            &verifier,
+        );
+        assert!(ac_body.contains("grant_type=authorization_code"));
+        assert!(ac_body.contains(&verifier));
+
+        store
+            .save_token("linear-mcp", "tok_secret_value_999")
+            .unwrap();
+        let loaded = store.load_token("linear-mcp").unwrap();
+        assert_eq!(loaded, "tok_secret_value_999");
+
+        // Wrong key must fail HMAC verification
+        let wrong_store = UpstreamOAuthTokenStore::new(&dir, Some("wrong-key"));
+        assert!(wrong_store.load_token("linear-mcp").is_err());
+
+        // Verify HttpUpstreamSession automatically loads encrypted OAuth token when bearer_ref is None
+        let default_store = UpstreamOAuthTokenStore::new(&dir, None);
+        default_store
+            .save_token("linear-mcp", "tok_wire_secret_777")
+            .unwrap();
+        let mock_url = "http://127.0.0.1:59991/mcp";
+        register_mock_http(mock_url, |_path, _body, hdrs| {
+            let auth = hdrs.get("authorization").cloned().unwrap_or_default();
+            let mut resp_hdrs = BTreeMap::new();
+            resp_hdrs.insert("content-type".to_string(), "application/json".to_string());
+            let resp_body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"auth":"{}"}}}}"#,
+                auth
+            );
+            (200, resp_hdrs, resp_body.into_bytes())
+        });
+        let session = HttpUpstreamSession::new(
+            "linear-mcp",
+            mock_url,
+            None,
+            BTreeMap::new(),
+            SessionMode::Stateless,
+            dir.clone(),
+            2000,
+            true,
+        );
+        let (_, _, resp_bytes) = session.send_raw_http(b"{}").unwrap();
+        let resp_str = String::from_utf8(resp_bytes).unwrap();
+        assert!(
+            resp_str.contains("Bearer tok_wire_secret_777"),
+            "expected decrypted OAuth token in Authorization header, got: {}",
+            resp_str
+        );
+        clear_mock_http(mock_url);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

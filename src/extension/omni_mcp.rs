@@ -17,12 +17,53 @@ use crate::data_plane::dst::FaultInjectionConfig;
 use crate::data_plane::gateway::MCPProxyGateway;
 use crate::json::JsonValue;
 use crate::models::{
-    negotiate_protocol_version, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse, ToolStatus,
-    APPROVAL_INVALID, APPROVAL_REQUIRED, CIRCUIT_OPEN, FUEL_EXHAUSTED, INTERNAL_ERROR,
-    INVALID_PARAMS, MEMORY_EXHAUSTED, METHOD_NOT_FOUND, MISSING_REQUIRED_CLIENT_CAPABILITY,
-    OUTBOUND_BLOCKED, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED, TIMEOUT, TOOL_DISABLED,
-    UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
+    negotiate_protocol_version, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse,
+    SamplingElicitationPolicy, ToolStatus, APPROVAL_INVALID, APPROVAL_REQUIRED, CIRCUIT_OPEN,
+    FUEL_EXHAUSTED, INTERNAL_ERROR, INVALID_PARAMS, MEMORY_EXHAUSTED, METHOD_NOT_FOUND,
+    MISSING_REQUIRED_CLIENT_CAPABILITY, OUTBOUND_BLOCKED, SAGA_COMPENSATED,
+    SCHEMA_PREFLIGHT_FAILED, TIMEOUT, TOOL_DISABLED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
 };
+
+pub fn apply_sampling_elicitation_policy(
+    req_id: JsonValue,
+    method: &str,
+    policy: &SamplingElicitationPolicy,
+    server_name: Option<&str>,
+    group_slug: Option<&str>,
+    params: &JsonValue,
+) -> RPCResponse {
+    match policy {
+        SamplingElicitationPolicy::Deny => RPCResponse::err(
+            req_id,
+            RPCError::new(
+                -32003,
+                format!("Method '{}' denied by sampling_elicitation_policy", method),
+            ),
+        ),
+        SamplingElicitationPolicy::RelayToClient => RPCResponse::ok(
+            req_id,
+            json!({
+                "resultType": "relay_to_client",
+                "relayPolicy": "relay_to_client",
+                "method": method,
+                "server": server_name.map(JsonValue::from).unwrap_or(JsonValue::Null),
+                "group": group_slug.map(JsonValue::from).unwrap_or(JsonValue::Null),
+                "params": params.clone(),
+            }),
+        ),
+        SamplingElicitationPolicy::ApprovalGate => RPCResponse::ok(
+            req_id,
+            json!({
+                "resultType": "input_required",
+                "relayPolicy": "approval_gate",
+                "method": method,
+                "server": server_name.map(JsonValue::from).unwrap_or(JsonValue::Null),
+                "group": group_slug.map(JsonValue::from).unwrap_or(JsonValue::Null),
+                "params": params.clone(),
+            }),
+        ),
+    }
+}
 
 #[derive(Clone)]
 pub struct OmniMCPServer {
@@ -497,11 +538,26 @@ impl OmniMCPServer {
             }
             "resources/list" => self.handle_resources_list(request),
             "resources/templates/list" => self.handle_resources_templates_list(request),
-            "resources/read" => self.handle_resources_read(request),
+            "resources/read" => self.handle_resources_read(request, caller_actor),
             "prompts/list" => self.handle_prompts_list(request),
-            "prompts/get" => self.handle_prompts_get(request),
+            "prompts/get" => self.handle_prompts_get(request, caller_actor),
             "tasks/get" => self.handle_tasks_get(request),
             "tasks/update" => self.handle_tasks_update(request, caller_actor, user_token),
+            "sampling/createMessage" | "elicitation/create" => {
+                let server_name = request.params.get("server").and_then(|s| s.as_str());
+                let policy = server_name
+                    .and_then(|name| self.cache.get_server_arc(name))
+                    .map(|srv| srv.sampling_elicitation_policy.clone())
+                    .unwrap_or(SamplingElicitationPolicy::Deny);
+                apply_sampling_elicitation_policy(
+                    request.id.clone(),
+                    &request.method,
+                    &policy,
+                    server_name,
+                    None,
+                    &request.params,
+                )
+            }
             "tools/call" => {
                 let tool_name = request
                     .params
@@ -605,6 +661,14 @@ impl OmniMCPServer {
                 "mimeType": "application/json",
                 "description": format!("Consolidated JSON schemas for all tools provided by {}", s.name)
             }));
+            for ext_res in &s.external_resources {
+                resources.push(json!({
+                    "uri": format!("ext://{}/{}", s.name, ext_res.uri),
+                    "name": format!("{}: {}", s.display_name, ext_res.name),
+                    "mimeType": ext_res.mime_type.clone().unwrap_or_else(|| "text/plain".to_string()),
+                    "description": ext_res.description.clone().unwrap_or_default()
+                }));
+            }
         }
         resources.sort_by(|a, b| {
             a.get("uri")
@@ -625,7 +689,7 @@ impl OmniMCPServer {
     }
 
     fn handle_resources_templates_list(&self, request: &RPCRequest) -> RPCResponse {
-        let templates = vec![
+        let mut templates = vec![
             json!({
                 "uriTemplate": "omni://services/{server_name}/idl",
                 "name": "Service IDL Specification Template",
@@ -639,6 +703,42 @@ impl OmniMCPServer {
                 "description": "Consolidated JSON schemas for all tools provided by a named microservice"
             }),
         ];
+        for s in self.cache.list_servers() {
+            if s.protocol != crate::models::ProtocolType::ExternalMcp {
+                continue;
+            }
+            for ext_res in &s.external_resources {
+                if ext_res.uri.contains('{') && ext_res.uri.contains('}') {
+                    templates.push(json!({
+                        "uriTemplate": format!("ext://{}/{}", s.name, ext_res.uri),
+                        "name": ext_res.name.clone(),
+                        "mimeType": ext_res.mime_type.clone().unwrap_or_else(|| "application/json".to_string()),
+                        "description": ext_res.description.clone()
+                    }));
+                }
+            }
+            if let Some(ref pool) = self.gateway.translator.upstream_manager {
+                if let Ok(resp) =
+                    pool.call_rpc_for_server(&s, "resources/templates/list", json!({}))
+                {
+                    if let Some(arr) = resp.get("resourceTemplates").and_then(|v| v.as_array()) {
+                        for tpl in arr {
+                            if let Some(raw_uri) = tpl.get("uriTemplate").and_then(|u| u.as_str()) {
+                                let namespaced = format!("ext://{}/{}", s.name, raw_uri);
+                                if !templates.iter().any(|existing| {
+                                    existing.get("uriTemplate").and_then(|u| u.as_str())
+                                        == Some(namespaced.as_str())
+                                }) {
+                                    let mut obj = tpl.clone();
+                                    obj.insert("uriTemplate", JsonValue::Str(namespaced));
+                                    templates.push(obj);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         RPCResponse::ok(
             request.id.clone(),
             json!({
@@ -761,7 +861,7 @@ impl OmniMCPServer {
         }
     }
 
-    fn handle_resources_read(&self, request: &RPCRequest) -> RPCResponse {
+    fn handle_resources_read(&self, request: &RPCRequest, caller_actor: &str) -> RPCResponse {
         let uri = match request.params.get("uri").and_then(|u| u.as_str()) {
             Some(u) => u,
             None => {
@@ -886,6 +986,47 @@ impl OmniMCPServer {
             }
         }
 
+        if let Some(rest) = uri.strip_prefix("ext://") {
+            if let Some((srv_name, upstream_uri)) = rest.split_once('/') {
+                if let Some(server) = self.cache.get_server(srv_name) {
+                    if !server.charter_policy.is_actor_allowed(caller_actor) {
+                        return RPCResponse::err(
+                            request.id.clone(),
+                            RPCError::new(
+                                crate::models::UNAUTHORIZED,
+                                format!(
+                                    "Actor '{}' is not authorized to read external resources on server '{}'",
+                                    caller_actor, srv_name
+                                ),
+                            ),
+                        );
+                    }
+                    if let Some(ref pool) = self.gateway.translator.upstream_manager {
+                        let rpc_res = match pool.call_rpc_for_server(
+                            &server,
+                            "resources/read",
+                            json!({"uri": upstream_uri}),
+                        ) {
+                            Ok(r) => {
+                                if server.charter_policy.require_redaction {
+                                    crate::data_plane::PIIRedactor::redact_payload(&r)
+                                } else {
+                                    r
+                                }
+                            }
+                            Err(e) => {
+                                return RPCResponse::err(
+                                    request.id.clone(),
+                                    RPCError::new(crate::models::INTERNAL_ERROR, e),
+                                );
+                            }
+                        };
+                        return RPCResponse::ok(request.id.clone(), rpc_res);
+                    }
+                }
+            }
+        }
+
         let err_code = if let Some(meta) = request.params.get("_meta") {
             if let Some(proto) = meta
                 .get("io.modelcontextprotocol/protocolVersion")
@@ -950,6 +1091,16 @@ impl OmniMCPServer {
             }),
         ];
 
+        for s in self.cache.list_servers() {
+            for p in &s.external_prompts {
+                prompts.push(json!({
+                    "name": format!("{}:{}", s.name, p.name),
+                    "description": p.description.clone().unwrap_or_default(),
+                    "arguments": p.arguments.clone()
+                }));
+            }
+        }
+
         prompts.sort_by(|a, b| {
             a.get("name")
                 .and_then(|n| n.as_str())
@@ -968,7 +1119,7 @@ impl OmniMCPServer {
         )
     }
 
-    fn handle_prompts_get(&self, request: &RPCRequest) -> RPCResponse {
+    fn handle_prompts_get(&self, request: &RPCRequest, caller_actor: &str) -> RPCResponse {
         let prompt_name = match request.params.get("name").and_then(|n| n.as_str()) {
             Some(n) => n,
             None => {
@@ -984,6 +1135,48 @@ impl OmniMCPServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(JsonValue::object);
+
+        if let Some((srv_name, upstream_prompt)) = prompt_name.split_once(':') {
+            if let Some(server) = self.cache.get_server(srv_name) {
+                if !server.charter_policy.is_actor_allowed(caller_actor) {
+                    return RPCResponse::err(
+                        request.id.clone(),
+                        RPCError::new(
+                            crate::models::UNAUTHORIZED,
+                            format!(
+                                "Actor '{}' is not authorized to invoke prompts on server '{}'",
+                                caller_actor, srv_name
+                            ),
+                        ),
+                    );
+                }
+                if let Some(ref pool) = self.gateway.translator.upstream_manager {
+                    match pool.call_rpc_for_server(
+                        &server,
+                        "prompts/get",
+                        json!({
+                            "name": upstream_prompt,
+                            "arguments": args
+                        }),
+                    ) {
+                        Ok(r) => {
+                            let final_res = if server.charter_policy.require_redaction {
+                                crate::data_plane::PIIRedactor::redact_payload(&r)
+                            } else {
+                                r
+                            };
+                            return RPCResponse::ok(request.id.clone(), final_res);
+                        }
+                        Err(e) => {
+                            return RPCResponse::err(
+                                request.id.clone(),
+                                RPCError::new(crate::models::INTERNAL_ERROR, e),
+                            )
+                        }
+                    }
+                }
+            }
+        }
 
         let messages = match prompt_name {
             "incident-investigation" => {

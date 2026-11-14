@@ -36,7 +36,7 @@ fn main() {
         match first.as_str() {
             "mcp" | "aifx" | "omni" | "list" | "search" | "call" | "bench" | "codemode"
             | "exec" | "types" | "resume" | "simulate" | "dst" | "bench-codemode"
-            | "bench-sandbox" | "migrate" => {
+            | "bench-sandbox" | "import" | "migrate" => {
                 process::exit(run_aifx_cli(&args));
             }
             _ => {}

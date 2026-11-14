@@ -48,9 +48,17 @@ pub fn format_traceparent(trace_id: &str, span_id: &str) -> String {
     format!("00-{}-{}-01", trace_id, span_id)
 }
 
-/// Gathers OS/system entropy from system time, thread ID, process ID, monotonic clock, and ASLR pointers.
+/// Gathers OS/system entropy via `getrandom` (BCryptGenRandom / getrandom syscall)
+/// when `os-csprng` is enabled, or falls back to system time / PID / `/dev/urandom` mix.
 /// Never uses the Deterministic Simulation Testing (DST) Xoshiro256StarStar chaos generator.
-fn gather_entropy(dest: &mut [u8]) {
+pub fn gather_entropy(dest: &mut [u8]) {
+    #[cfg(feature = "os-csprng")]
+    {
+        if getrandom::getrandom(dest).is_ok() {
+            return;
+        }
+    }
+
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -68,9 +76,6 @@ fn gather_entropy(dest: &mut [u8]) {
     mixed.extend_from_slice(&stack_addr.to_be_bytes());
     mixed.extend_from_slice(&TRACE_COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
 
-    // Mix in the OS CSPRNG when reachable through `std` (Unix `/dev/urandom`).
-    // On platforms without it (e.g. Windows, which has no std-only CSPRNG path
-    // under `forbid(unsafe_code)`) this falls back to the weaker clock/PID mix.
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         use std::io::Read;
         let mut os_bytes = [0u8; 32];
@@ -1053,6 +1058,7 @@ pub struct ToolRecord {
     pub schema_source: SchemaSource,
     pub retired_at: Option<f64>,
     pub last_seen_in_sync: Option<f64>,
+    pub timeout_ms: Option<u64>,
 }
 
 impl ToolRecord {
@@ -1083,6 +1089,7 @@ impl ToolRecord {
             schema_source: SchemaSource::Upstream,
             retired_at: None,
             last_seen_in_sync: None,
+            timeout_ms: None,
         }
     }
 
@@ -1153,6 +1160,7 @@ impl ToolRecord {
             "schema_source": self.schema_source.as_str(),
             "retired_at": self.retired_at,
             "last_seen_in_sync": self.last_seen_in_sync,
+            "timeout_ms": self.timeout_ms.map(|v| v as i64).map(JsonValue::from).unwrap_or(JsonValue::Null),
         })
     }
 
@@ -1243,6 +1251,7 @@ impl ToolRecord {
             .unwrap_or(SchemaSource::Upstream);
         let retired_at = v.get("retired_at").and_then(|x| x.as_f64());
         let last_seen_in_sync = v.get("last_seen_in_sync").and_then(|x| x.as_f64());
+        let timeout_ms = v.get("timeout_ms").and_then(|x| x.as_u64());
 
         Some(Self {
             name,
@@ -1266,6 +1275,7 @@ impl ToolRecord {
             schema_source,
             retired_at,
             last_seen_in_sync,
+            timeout_ms,
         })
     }
 }
@@ -1382,6 +1392,254 @@ impl HistoryEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpstreamPolicy {
+    Deny,
+    RelayToApproval,
+}
+
+impl UpstreamPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UpstreamPolicy::Deny => "deny",
+            UpstreamPolicy::RelayToApproval => "relay_to_approval",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "relay_to_approval" | "relay" | "approval" => UpstreamPolicy::RelayToApproval,
+            _ => UpstreamPolicy::Deny,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalResourceRecord {
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+impl ExternalResourceRecord {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "uri": self.uri.clone(),
+            "name": self.name.clone(),
+            "description": self.description.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "mime_type": self.mime_type.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let uri = v.get("uri")?.as_str()?.to_string();
+        let name = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&uri)
+            .to_string();
+        let description = v
+            .get("description")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        let mime_type = v
+            .get("mime_type")
+            .or_else(|| v.get("mimeType"))
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        Some(Self {
+            uri,
+            name,
+            description,
+            mime_type,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalPromptRecord {
+    pub name: String,
+    pub description: Option<String>,
+    pub arguments: JsonValue,
+}
+
+impl ExternalPromptRecord {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "name": self.name.clone(),
+            "description": self.description.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "arguments": self.arguments.clone(),
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let name = v.get("name")?.as_str()?.to_string();
+        let description = v
+            .get("description")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        let arguments = v
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+        Some(Self {
+            name,
+            description,
+            arguments,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolGroupEntry {
+    pub server_name: String,
+    pub tool_name: Option<String>, // None means all enabled tools on server_name
+}
+
+impl ToolGroupEntry {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "server_name": self.server_name.clone(),
+            "tool_name": self.tool_name.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let server_name = v.get("server_name")?.as_str()?.to_string();
+        let tool_name = v
+            .get("tool_name")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        Some(Self {
+            server_name,
+            tool_name,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolGroupRecord {
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub entries: Vec<ToolGroupEntry>,
+    pub created_at: f64,
+}
+
+impl ToolGroupRecord {
+    pub fn new(
+        slug: impl Into<String>,
+        display_name: impl Into<String>,
+        description: impl Into<String>,
+        entries: Vec<ToolGroupEntry>,
+    ) -> Self {
+        Self {
+            slug: slug.into(),
+            display_name: display_name.into(),
+            description: description.into(),
+            entries,
+            created_at: now_epoch_secs(),
+        }
+    }
+
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "slug": self.slug.clone(),
+            "display_name": self.display_name.clone(),
+            "description": self.description.clone(),
+            "entries": JsonValue::Array(self.entries.iter().map(|e| e.to_json()).collect()),
+            "created_at": self.created_at,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let slug = v.get("slug")?.as_str()?.to_string();
+        let display_name = v
+            .get("display_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&slug)
+            .to_string();
+        let description = v
+            .get("description")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let entries = v
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(ToolGroupEntry::from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let created_at = v.get("created_at").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        Some(Self {
+            slug,
+            display_name,
+            description,
+            entries,
+            created_at,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum SamplingElicitationPolicy {
+    #[default]
+    Deny,
+    RelayToClient,
+    ApprovalGate,
+}
+
+impl SamplingElicitationPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::RelayToClient => "relay_to_client",
+            Self::ApprovalGate => "approval_gate",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "relay_to_client" | "relaytoclient" | "relay" => Self::RelayToClient,
+            "approval_gate" | "approvalgate" | "approval" => Self::ApprovalGate,
+            _ => Self::Deny,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum ServerHealth {
+    #[default]
+    Connected,
+    Degraded,
+    Unreachable,
+}
+
+impl ServerHealth {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Degraded => "degraded",
+            Self::Unreachable => "unreachable",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "degraded" => Self::Degraded,
+            "unreachable" => Self::Unreachable,
+            _ => Self::Connected,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerRecord {
     pub name: String,
@@ -1399,6 +1657,12 @@ pub struct ServerRecord {
     pub third_party_provider: Option<String>,
     pub history: Vec<HistoryEntry>,
     pub upstream_config: Option<UpstreamTransportConfig>,
+    pub sync_interval_sec: Option<u64>,
+    pub upstream_policy: UpstreamPolicy,
+    pub sampling_elicitation_policy: SamplingElicitationPolicy,
+    pub health: ServerHealth,
+    pub external_resources: Vec<ExternalResourceRecord>,
+    pub external_prompts: Vec<ExternalPromptRecord>,
 }
 
 impl ServerRecord {
@@ -1424,6 +1688,12 @@ impl ServerRecord {
             third_party_provider: None,
             history: Vec::new(),
             upstream_config: None,
+            sync_interval_sec: None,
+            upstream_policy: UpstreamPolicy::Deny,
+            sampling_elicitation_policy: SamplingElicitationPolicy::Deny,
+            health: ServerHealth::Connected,
+            external_resources: Vec::new(),
+            external_prompts: Vec::new(),
         }
     }
 
@@ -1472,6 +1742,12 @@ impl ServerRecord {
                 .as_ref()
                 .map(|c| c.to_json())
                 .unwrap_or(JsonValue::Null),
+            "sync_interval_sec": self.sync_interval_sec.map(|v| v as i64).map(JsonValue::from).unwrap_or(JsonValue::Null),
+            "upstream_policy": self.upstream_policy.as_str(),
+            "sampling_elicitation_policy": self.sampling_elicitation_policy.as_str(),
+            "health": self.health.as_str(),
+            "external_resources": JsonValue::Array(self.external_resources.iter().map(|r| r.to_json()).collect()),
+            "external_prompts": JsonValue::Array(self.external_prompts.iter().map(|p| p.to_json()).collect()),
         })
     }
 
@@ -1549,6 +1825,40 @@ impl ServerRecord {
                 UpstreamTransportConfig::from_json(c)
             }
         });
+        let sync_interval_sec = v.get("sync_interval_sec").and_then(|x| x.as_u64());
+        let upstream_policy = v
+            .get("upstream_policy")
+            .and_then(|x| x.as_str())
+            .map(UpstreamPolicy::from_str)
+            .unwrap_or(UpstreamPolicy::Deny);
+        let sampling_elicitation_policy = v
+            .get("sampling_elicitation_policy")
+            .and_then(|x| x.as_str())
+            .map(SamplingElicitationPolicy::from_str)
+            .unwrap_or(SamplingElicitationPolicy::Deny);
+        let health = v
+            .get("health")
+            .and_then(|x| x.as_str())
+            .map(ServerHealth::from_str)
+            .unwrap_or(ServerHealth::Connected);
+        let external_resources = v
+            .get("external_resources")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(ExternalResourceRecord::from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let external_prompts = v
+            .get("external_prompts")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(ExternalPromptRecord::from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         Some(Self {
             name,
@@ -1566,6 +1876,12 @@ impl ServerRecord {
             third_party_provider,
             history,
             upstream_config,
+            sync_interval_sec,
+            upstream_policy,
+            sampling_elicitation_policy,
+            health,
+            external_resources,
+            external_prompts,
         })
     }
 }
