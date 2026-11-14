@@ -124,7 +124,7 @@ jobs:
           npx --prefix ui playwright install chromium
           ./target/release/omni-gateway 8080 &
           sleep 2
-          npx --prefix ui playwright test
+          (cd ui && npx playwright test)
 
   release-and-publish:
     name: GitHub Release & NPM Publish
