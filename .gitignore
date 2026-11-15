@@ -21,6 +21,7 @@ venv/
 .commandcode/
 *.visual-check.*
 docs/*.html
+!docs/omnimcp-architecture.html
 
 # Data & Durable WAL Storage
 data/
