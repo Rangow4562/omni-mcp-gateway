@@ -12,11 +12,11 @@ export const OmniSearchModal: React.FC<OmniSearchModalProps> = ({
   onClose,
   onSelectServer,
 }) => {
-  if (!isOpen) return null;
-
   const [intentQuery, setIntentQuery] = useState('');
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<any[]>([]);
+
+  if (!isOpen) return null;
 
   const handleSearch = async () => {
     if (!intentQuery.trim()) return;

@@ -1,10 +1,10 @@
 import { test, expect } from '@playwright/test';
 
-test.describe('Omni MCP v6.0.0 Fleet & Studio E2E', () => {
-  test('dashboard loads, connects live SSE, and opens Tool Groups & Code Mode studios', async ({ page }) => {
+test.describe('Omni MCP v6.5.0 Fleet, Governance & Observability Studio E2E', () => {
+  test('dashboard loads, connects live SSE, and opens all studios', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByText('Omni MCP Gateway')).toBeVisible();
-    await expect(page.getByText('v6.0.0 FLEET READY')).toBeVisible();
+    await expect(page.getByText('v6.5.0 FLEET READY')).toBeVisible();
 
     // Verify Tool Groups Studio opens and renders builder
     await page.getByRole('button', { name: /Tool Groups/i }).click();
@@ -18,8 +18,94 @@ test.describe('Omni MCP v6.0.0 Fleet & Studio E2E', () => {
     await expect(page.getByText(/Generated TypeScript Declarations/i)).toBeVisible();
     await page.getByRole('button', { name: '✕' }).click();
 
-    // Verify Register External MCP modal opens
+    // Verify Register External MCP modal opens and closes cleanly
     await page.getByRole('button', { name: /Register External MCP/i }).click();
     await expect(page.getByText(/Register External MCP Server/i)).toBeVisible();
+    await page.getByRole('button', { name: /Close Register External Server Modal/i }).click();
+    await expect(page.getByText(/Register External MCP Server/i)).toBeHidden();
+    await expect(page.getByText('Omni MCP Gateway')).toBeVisible();
+  });
+
+  test('opens HITL Approval Inbox, resumes paused mutation script, verifies Merkle chain, and runs mcp.json import wizard', async ({ page, request }) => {
+    // 1. Trigger a paused mutating Code Mode script as agent_dev_token
+    const evalResp = await request.post('/api/codemode/eval', {
+      headers: {
+        Authorization: 'Bearer agent_dev_token',
+        'Content-Type': 'application/json',
+      },
+      data: {
+        code: 'async () => { const res = await codemode.accounting.refund({ ride_id: "r_e2e_1", reason: "e2e_dispute" }); return res; }',
+        require_mutation_approval: true,
+      },
+    });
+    expect(evalResp.ok()).toBeTruthy();
+    const evalJson = await evalResp.json();
+    expect(evalJson.status).toBe('APPROVAL_REQUIRED');
+
+    // 2. Open dashboard as default Admin (distinct principal from agent_dev) and open Approval Inbox
+    await page.goto('/');
+    await page.getByRole('button', { name: /Approvals/i }).click();
+    await expect(page.getByTestId('approval-inbox-modal')).toBeVisible();
+    await expect(page.getByText('HITL Approval Inbox')).toBeVisible();
+
+    // Approve & Resume the suspended frame unconditionally
+    const approveBtn = page.getByRole('button', { name: /Approve & Resume/i }).first();
+    await expect(approveBtn).toBeVisible({ timeout: 5000 });
+    await approveBtn.click();
+    await expect(page.getByText(/Approved & resumed/i)).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: /Close Approval Inbox/i }).click();
+
+    // 3. Open Observability Studio -> verify Trace Waterfall & Merkle Audit Chain badge
+    await page.getByRole('button', { name: /Observability/i }).click();
+    await expect(page.getByTestId('observability-studio-modal')).toBeVisible();
+    await expect(page.getByText(/W3C Trace Waterfall/i)).toBeVisible();
+    await page.getByRole('button', { name: /Merkle Audit Explorer/i }).click();
+    await page.getByRole('button', { name: /Verify Cryptographic Chain/i }).click();
+    await expect(page.getByTestId('merkle-verify-badge')).toContainText(/Merkle Chain Verified/i);
+    await page.getByRole('button', { name: /Close Observability Studio/i }).click();
+
+    // 4. Open Import mcp.json Wizard -> Preview secret ref conversion
+    await page.getByRole('button', { name: /Import mcp\.json/i }).click();
+    await expect(page.getByTestId('import-config-modal')).toBeVisible();
+    await page.getByRole('button', { name: /Preview Secret Conversion/i }).click();
+    await expect(page.getByTestId('import-preview-panel')).toBeVisible();
+    await expect(page.getByTestId('import-preview-panel')).toContainText(/\{env:/i);
+    await page.getByRole('button', { name: /Close Import Config Modal/i }).click();
+  });
+
+  test('preserves Approval Inbox resume error banner across live SSE refreshes', async ({ page, request }) => {
+    // Trigger a paused mutating Code Mode script as admin_dev_token so default Admin hits SoD rejection
+    const evalResp = await request.post('/api/codemode/eval', {
+      headers: {
+        Authorization: 'Bearer admin_dev_token',
+        'Content-Type': 'application/json',
+      },
+      data: {
+        code: 'async () => { const res = await codemode.accounting.refund({ ride_id: "r_e2e_sod", reason: "sod_check" }); return res; }',
+        require_mutation_approval: true,
+      },
+    });
+    expect(evalResp.ok()).toBeTruthy();
+    const evalJson = await evalResp.json();
+    expect(evalJson.status).toBe('APPROVAL_REQUIRED');
+    const execId: string = evalJson.execution_id;
+
+    await page.goto('/');
+    await expect(page.getByTestId('sse-status')).toContainText(/LIVE SSE/i);
+    await page.getByRole('button', { name: /Approvals/i }).click();
+    await expect(page.getByTestId('approval-inbox-modal')).toBeVisible();
+
+    const frameCard = page.getByTestId(`suspended-frame-${execId}`);
+    await expect(frameCard).toBeVisible({ timeout: 5000 });
+    await frameCard.getByRole('button', { name: /Approve & Resume/i }).click();
+
+    // Error banner must appear and remain visible even after SSE codemode.resumed triggers background refresh
+    await expect(page.getByText(/Resume rejected:/i)).toBeVisible({ timeout: 5000 });
+    await page.waitForTimeout(500);
+    await expect(page.getByText(/Resume rejected:/i)).toBeVisible();
+
+    // Clean up suspended frame so state stays tidy
+    await frameCard.getByRole('button', { name: /Reject & Discard/i }).click();
+    await page.getByRole('button', { name: /Close Approval Inbox/i }).click();
   });
 });

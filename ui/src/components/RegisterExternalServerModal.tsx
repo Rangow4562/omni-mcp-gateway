@@ -12,8 +12,6 @@ export const RegisterExternalServerModal: React.FC<RegisterExternalServerModalPr
   onClose,
   onRegistered,
 }) => {
-  if (!isOpen) return null;
-
   const [slug, setSlug] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [description, setDescription] = useState('');
@@ -38,6 +36,8 @@ export const RegisterExternalServerModal: React.FC<RegisterExternalServerModalPr
 
   const [submitting, setSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  if (!isOpen) return null;
 
   const isValidSecretRef = (val: string) => {
     if (!val.trim()) return true;
@@ -213,7 +213,9 @@ export const RegisterExternalServerModal: React.FC<RegisterExternalServerModalPr
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
+            aria-label="Close Register External Server Modal"
             style={{
               background: 'none',
               border: 'none',
@@ -499,6 +501,7 @@ export const RegisterExternalServerModal: React.FC<RegisterExternalServerModalPr
                       <button
                         type="button"
                         onClick={() => handleRemoveEnvRow(idx)}
+                        aria-label={`Remove environment variable ${idx + 1}`}
                         style={{ background: '#331a1a', border: '1px solid #552222', color: '#ff6666', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer' }}
                       >
                         ✕
@@ -641,6 +644,7 @@ export const RegisterExternalServerModal: React.FC<RegisterExternalServerModalPr
                       <button
                         type="button"
                         onClick={() => handleRemoveHeaderRow(idx)}
+                        aria-label={`Remove custom header ${idx + 1}`}
                         style={{ background: '#331a1a', border: '1px solid #552222', color: '#ff6666', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer' }}
                       >
                         ✕

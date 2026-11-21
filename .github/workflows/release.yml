@@ -62,14 +62,14 @@ jobs:
         run: |
           mkdir -p dist
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ] || [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target ${{ matrix.target }}
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc" --target ${{ matrix.target }}
             cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
             cp target/${{ matrix.target }}/release/omni dist/omni-${{ matrix.target }}
             cp target/${{ matrix.target }}/release/aifx dist/aifx-${{ matrix.target }}
             chmod +x dist/*
           elif [ "${{ matrix.target }}" = "macos-universal" ]; then
-            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target aarch64-apple-darwin
-            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target x86_64-apple-darwin
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc" --target aarch64-apple-darwin
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc" --target x86_64-apple-darwin
             cp target/aarch64-apple-darwin/release/omni-gateway dist/omni-gateway-darwin-arm64
             cp target/x86_64-apple-darwin/release/omni-gateway dist/omni-gateway-darwin-x64
             cp target/aarch64-apple-darwin/release/omni dist/omni-darwin-arm64
@@ -78,14 +78,14 @@ jobs:
             cp target/x86_64-apple-darwin/release/aifx dist/aifx-darwin-x64
             chmod +x dist/*
           elif [ "${{ matrix.target }}" = "windows-universal" ]; then
-            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target x86_64-pc-windows-msvc
-            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target aarch64-pc-windows-msvc
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc" --target x86_64-pc-windows-msvc
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc" --target aarch64-pc-windows-msvc
             cp target/x86_64-pc-windows-msvc/release/omni-gateway.exe dist/omni-gateway-win32-x64.exe
             cp target/aarch64-pc-windows-msvc/release/omni-gateway.exe dist/omni-gateway-win32-arm64.exe
             cp target/x86_64-pc-windows-msvc/release/omni.exe dist/omni-win32-x64.exe
             cp target/x86_64-pc-windows-msvc/release/aifx.exe dist/aifx-win32-x64.exe
           else
-            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment" --target ${{ matrix.target }}
+            cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc" --target ${{ matrix.target }}
             cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
             cp target/${{ matrix.target }}/release/omni dist/omni-${{ matrix.target }}
             cp target/${{ matrix.target }}/release/aifx dist/aifx-${{ matrix.target }}
@@ -118,11 +118,11 @@ jobs:
         run: |
           npm --prefix ui ci
           npm --prefix ui run build
-          cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment"
+          cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc"
       - name: Run Playwright E2E
         run: |
           npx --prefix ui playwright install chromium
-          ./target/release/omni-gateway 8080 &
+          ./target/release/omni-gateway 8080 --demo &
           sleep 2
           (cd ui && npx playwright test)
 

@@ -1,3 +1,6 @@
 pub mod otlp;
 
-pub use otlp::{OtlpExportReport, OtlpExporter};
+pub use otlp::{
+    LatencyHistogram, OtlpBatchWorker, OtlpExportReport, OtlpExporter, OtlpWorkerStatus,
+    DEFAULT_OTLP_BATCH_THRESHOLD,
+};

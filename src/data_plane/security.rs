@@ -1,7 +1,7 @@
 //! Security Engine: ABAC charter policies (humans, services, agents) and high-speed DFA PII redaction.
 
 use crate::json::JsonValue;
-use crate::models::{CharterPolicy, ServerRecord, ToolRecord};
+use crate::models::{ArgumentPolicyRule, CharterPolicy, ServerRecord, ToolRecord};
 
 pub struct PIIRedactor;
 
@@ -373,4 +373,154 @@ impl SecurityCharterEngine {
 
         (true, None)
     }
+
+    /// Evaluates ABAC charter policies AND declarative argument-level guardrails (v6.5.0).
+    /// Returns `(true, None)` if authorized, or `(false, Some(diagnostic))` returning `-32001 UNAUTHORIZED`.
+    pub fn evaluate_access_with_args(
+        server: &ServerRecord,
+        tool: &ToolRecord,
+        caller_actor: &str,
+        user_token: Option<&str>,
+        arguments: &JsonValue,
+    ) -> (bool, Option<String>) {
+        let (ok, err) = Self::evaluate_access(server, tool, caller_actor, user_token);
+        if !ok {
+            return (false, err);
+        }
+
+        // Evaluate server-level rules first, then tool-level override rules
+        for rule in &server.charter_policy.argument_rules {
+            if let Err(msg) = Self::evaluate_argument_rule(rule, arguments) {
+                return (
+                    false,
+                    Some(format!(
+                        "Argument policy guardrail violated on '{}.{}': {}",
+                        server.name, tool.name, msg
+                    )),
+                );
+            }
+        }
+        if let Some(ref tool_policy) = tool.charter_policy {
+            for rule in &tool_policy.argument_rules {
+                if let Err(msg) = Self::evaluate_argument_rule(rule, arguments) {
+                    return (
+                        false,
+                        Some(format!(
+                            "Argument policy guardrail violated on '{}.{}': {}",
+                            server.name, tool.name, msg
+                        )),
+                    );
+                }
+            }
+        }
+
+        (true, None)
+    }
+
+    /// Resolves a JSON Pointer (e.g. `/amount`, `/user/role`, or `amount`) inside `arguments`.
+    pub fn resolve_json_pointer<'a>(root: &'a JsonValue, pointer: &str) -> Option<&'a JsonValue> {
+        let trimmed = pointer.trim();
+        if trimmed.is_empty() || trimmed == "/" {
+            return Some(root);
+        }
+        let segments = trimmed.trim_start_matches('/').split('/');
+        let mut cur = root;
+        for seg in segments {
+            let unescaped = seg.replace("~1", "/").replace("~0", "~");
+            match cur {
+                JsonValue::Object(_) => {
+                    cur = cur.get(&unescaped)?;
+                }
+                JsonValue::Array(items) => {
+                    let idx = unescaped.parse::<usize>().ok()?;
+                    cur = items.get(idx)?;
+                }
+                _ => return None,
+            }
+        }
+        Some(cur)
+    }
+
+    /// Evaluates a single `ArgumentPolicyRule` against `arguments`.
+    pub fn evaluate_argument_rule(
+        rule: &ArgumentPolicyRule,
+        arguments: &JsonValue,
+    ) -> Result<(), String> {
+        let op = rule.op.trim().to_ascii_lowercase();
+        let actual_opt = Self::resolve_json_pointer(arguments, &rule.field);
+
+        match op.as_str() {
+            "required" | "exists" => {
+                if actual_opt.is_none() || actual_opt.is_some_and(|v| v.is_null()) {
+                    return Err(format!("field '{}' is required", rule.field));
+                }
+                return Ok(());
+            }
+            "forbidden" | "not_exists" => {
+                if actual_opt.is_some() && !actual_opt.is_some_and(|v| v.is_null()) {
+                    return Err(format!("field '{}' is forbidden by policy", rule.field));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let Some(actual) = actual_opt else {
+            // Optional field omitted: only fails if required; otherwise passes numeric/string guards
+            return Ok(());
+        };
+
+        let pass = match op.as_str() {
+            "eq" | "==" => actual == &rule.value,
+            "neq" | "!=" => actual != &rule.value,
+            "lt" | "<" => compare_numbers(actual, &rule.value).is_some_and(|ord| ord.is_lt()),
+            "lte" | "<=" => compare_numbers(actual, &rule.value).is_some_and(|ord| ord.is_le()),
+            "gt" | ">" => compare_numbers(actual, &rule.value).is_some_and(|ord| ord.is_gt()),
+            "gte" | ">=" => compare_numbers(actual, &rule.value).is_some_and(|ord| ord.is_ge()),
+            "contains" => match (actual.as_str(), rule.value.as_str()) {
+                (Some(a), Some(b)) => a.contains(b),
+                _ => false,
+            },
+            "not_contains" => match (actual.as_str(), rule.value.as_str()) {
+                (Some(a), Some(b)) => !a.contains(b),
+                _ => true,
+            },
+            "matches_prefix" | "starts_with" => match (actual.as_str(), rule.value.as_str()) {
+                (Some(a), Some(b)) => a.starts_with(b),
+                _ => false,
+            },
+            "in" => rule
+                .value
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|item| item == actual)),
+            "not_in" => rule
+                .value
+                .as_array()
+                .map_or(true, |arr| !arr.iter().any(|item| item == actual)),
+            other => {
+                return Err(format!(
+                    "unsupported argument policy operator '{}' on field '{}'",
+                    other, rule.field
+                ));
+            }
+        };
+
+        if pass {
+            Ok(())
+        } else {
+            Err(format!(
+                "field '{}' value {} failed rule '{} {}'",
+                rule.field,
+                actual.to_string_compact(),
+                rule.op,
+                rule.value.to_string_compact()
+            ))
+        }
+    }
+}
+
+fn compare_numbers(a: &JsonValue, b: &JsonValue) -> Option<std::cmp::Ordering> {
+    let af = a.as_f64()?;
+    let bf = b.as_f64()?;
+    af.partial_cmp(&bf)
 }

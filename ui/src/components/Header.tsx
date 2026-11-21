@@ -12,8 +12,12 @@ interface HeaderProps {
   onOpenRegisterExternal?: () => void;
   onOpenToolGroups?: () => void;
   onOpenCodeMode?: () => void;
+  onOpenApprovalInbox?: () => void;
+  onOpenObservability?: () => void;
+  onOpenImportConfig?: () => void;
   sseConnected?: boolean;
   pendingDiffCount: number;
+  pendingApprovalCount?: number;
   onTokenChanged?: () => void;
 }
 
@@ -27,8 +31,12 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenRegisterExternal,
   onOpenToolGroups,
   onOpenCodeMode,
+  onOpenApprovalInbox,
+  onOpenObservability,
+  onOpenImportConfig,
   sseConnected = false,
   pendingDiffCount,
+  pendingApprovalCount = 0,
   onTokenChanged,
 }) => {
   const [currentToken, setCurrentToken] = useState<string>(getToken());
@@ -37,6 +45,9 @@ export const Header: React.FC<HeaderProps> = ({
 
   useEffect(() => {
     setCurrentToken(getToken());
+    const onTokenSync = () => setCurrentToken(getToken());
+    window.addEventListener('omni-token-changed', onTokenSync);
+    return () => window.removeEventListener('omni-token-changed', onTokenSync);
   }, []);
 
   const handleRoleSelect = (roleToken: string) => {
@@ -98,7 +109,7 @@ export const Header: React.FC<HeaderProps> = ({
               borderRadius: '12px',
               fontWeight: 600,
             }}>
-              v6.0.0 FLEET READY
+              v6.5.0 FLEET READY
             </span>
             <span
               data-testid="sse-status"
@@ -291,6 +302,60 @@ export const Header: React.FC<HeaderProps> = ({
             }}
           >
             ⚡ Code Mode
+          </button>
+        )}
+
+        {onOpenApprovalInbox && (
+          <button
+            onClick={onOpenApprovalInbox}
+            style={{
+              backgroundColor: pendingApprovalCount > 0 ? '#4d2d00' : '#1e2235',
+              color: pendingApprovalCount > 0 ? '#ffd27d' : '#f0b86e',
+              border: pendingApprovalCount > 0 ? '1px solid #ff9900' : '1px solid #303652',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+            }}
+          >
+            🛡️ Approvals ({pendingApprovalCount})
+          </button>
+        )}
+
+        {onOpenObservability && (
+          <button
+            onClick={onOpenObservability}
+            style={{
+              backgroundColor: '#1e2235',
+              color: '#79c0ff',
+              border: '1px solid #303652',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+            }}
+          >
+            📊 Observability
+          </button>
+        )}
+
+        {onOpenImportConfig && (
+          <button
+            onClick={onOpenImportConfig}
+            style={{
+              backgroundColor: '#1e2235',
+              color: '#7ee787',
+              border: '1px solid #303652',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+            }}
+          >
+            📥 Import mcp.json
           </button>
         )}
 

@@ -271,6 +271,7 @@ pub trait AuditSink: Send + Sync {
 pub struct MerkleAuditStore {
     log_path: Option<String>,
     state: RwLock<AuditState>,
+    external_sink: RwLock<Option<std::sync::Arc<dyn AuditSink>>>,
 }
 
 impl MerkleAuditStore {
@@ -286,6 +287,12 @@ impl MerkleAuditStore {
             .filter(|&v| v > 0)
             .unwrap_or(10_000);
         Self::with_limits(log_path, memory_window, segment_max_records)
+    }
+
+    pub fn set_external_sink(&self, sink: std::sync::Arc<dyn AuditSink>) {
+        if let Ok(mut guard) = self.external_sink.write() {
+            *guard = Some(sink);
+        }
     }
 
     pub fn with_limits(
@@ -307,6 +314,7 @@ impl MerkleAuditStore {
                 memory_window,
                 segment_max_records,
             }),
+            external_sink: RwLock::new(None),
         };
 
         if let Some(path) = &log_path {
@@ -447,6 +455,12 @@ impl MerkleAuditStore {
                 }
             }
             guard.records_in_segment = 0;
+        }
+
+        if let Ok(sink_guard) = self.external_sink.read() {
+            if let Some(ref sink) = *sink_guard {
+                let _ = sink.emit_record(&record);
+            }
         }
 
         record

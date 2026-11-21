@@ -1264,12 +1264,11 @@ impl OmniMCPServer {
         }
 
         let bm25_scores = CodeModeTypeGenerator::bm25_score_corpus(&query, &corpus_fields);
-        let mut scored: Vec<(f64, JsonValue)> = Vec::new();
-        for (s, score) in servers.iter().zip(bm25_scores) {
-            if score > 0.0 || query.is_empty() {
-                let rounded_score = (score * 100.0).round() / 100.0;
-                scored.push((
-                    score,
+        let results: Vec<JsonValue> = if query.is_empty() {
+            servers
+                .iter()
+                .take(limit)
+                .map(|s| {
                     json!({
                         "server_name": s.name.clone(),
                         "display_name": s.display_name.clone(),
@@ -1278,18 +1277,69 @@ impl OmniMCPServer {
                         "protocol": s.protocol.as_str(),
                         "version": s.version as i64,
                         "enabled_tools_count": s.enabled_tools_count() as i64,
-                        "relevance_score": rounded_score
-                    }),
-                ));
-            }
-        }
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let results: Vec<JsonValue> = scored.into_iter().take(limit).map(|x| x.1).collect();
+                        "relevance_score": 0.0
+                    })
+                })
+                .collect()
+        } else {
+            let hybrid_docs: Vec<crate::data_plane::HybridDocument> = servers
+                .iter()
+                .zip(bm25_scores.iter())
+                .enumerate()
+                .map(|(idx, (s, &bm25))| {
+                    let text = corpus_fields[idx]
+                        .iter()
+                        .map(|(_, f)| f.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    crate::data_plane::HybridDocument {
+                        id: s.name.clone(),
+                        text,
+                        bm25_score: bm25,
+                    }
+                })
+                .collect();
+            let embedding_url = crate::config::get_config().embedding_url;
+            let ranked = crate::data_plane::rank_hybrid_rrf(
+                &query,
+                &hybrid_docs,
+                1.0,
+                1.0,
+                0.22,
+                embedding_url.as_deref(),
+            );
+            let server_map: std::collections::HashMap<&str, &crate::models::ServerRecord> =
+                servers.iter().map(|s| (s.name.as_str(), s)).collect();
+            ranked
+                .into_iter()
+                .take(limit)
+                .filter_map(|item| {
+                    let s = server_map.get(item.id.as_str())?;
+                    let score_display = if item.bm25_score > 0.0 {
+                        (item.bm25_score * 100.0).round() / 100.0
+                    } else {
+                        ((item.vector_similarity * 10.0) * 100.0).round() / 100.0
+                    };
+                    Some(json!({
+                        "server_name": s.name.clone(),
+                        "display_name": s.display_name.clone(),
+                        "description": s.description.clone(),
+                        "owning_team": s.owning_team.clone(),
+                        "protocol": s.protocol.as_str(),
+                        "version": s.version as i64,
+                        "enabled_tools_count": s.enabled_tools_count() as i64,
+                        "relevance_score": score_display,
+                        "rrf_score": (item.rrf_score * 10000.0).round() / 10000.0,
+                        "vector_similarity": (item.vector_similarity * 1000.0).round() / 1000.0
+                    }))
+                })
+                .collect()
+        };
 
         let payload = json!({
             "servers": JsonValue::Array(results),
-            "total_matches": servers.len() as i64
+            "total_matches": servers.len() as i64,
+            "ranking_engine": "hybrid_bm25_vector_rrf"
         });
 
         RPCResponse::ok(
@@ -1618,35 +1668,61 @@ impl OmniMCPServer {
         }
 
         let bm25_scores = CodeModeTypeGenerator::bm25_score_corpus(goal, &corpus_fields);
-        let mut candidates: Vec<(f64, String, String, String, bool, Vec<String>)> = Vec::new();
-        for ((s_name, t_name, desc, is_mut, tags), score) in
-            active_tools.into_iter().zip(bm25_scores)
-        {
-            if score > 0.0 {
-                candidates.push((score, s_name, t_name, desc, is_mut, tags));
-            }
-        }
-
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let hybrid_docs: Vec<crate::data_plane::HybridDocument> = active_tools
+            .iter()
+            .zip(bm25_scores.iter())
+            .enumerate()
+            .map(|(idx, ((s_name, t_name, _, _, _), &bm25))| {
+                let text = corpus_fields[idx]
+                    .iter()
+                    .map(|(_, f)| f.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                crate::data_plane::HybridDocument {
+                    id: format!("{}::{}", s_name, t_name),
+                    text,
+                    bm25_score: bm25,
+                }
+            })
+            .collect();
+        let embedding_url = crate::config::get_config().embedding_url;
+        let ranked = crate::data_plane::rank_hybrid_rrf(
+            goal,
+            &hybrid_docs,
+            1.0,
+            1.0,
+            0.22,
+            embedding_url.as_deref(),
+        );
+        let tool_lookup: std::collections::HashMap<
+            String,
+            (String, String, String, bool, Vec<String>),
+        > = active_tools
+            .into_iter()
+            .map(|item| (format!("{}::{}", item.0, item.1), item))
+            .collect();
 
         let mut pipeline = Vec::new();
-        for (idx, (score, s_name, t_name, desc, is_mut, tags)) in
-            candidates.into_iter().take(limit).enumerate()
-        {
-            pipeline.push(json!({
-                "step": (idx + 1) as i64,
-                "server_name": s_name,
-                "tool_name": t_name,
-                "description": desc,
-                "is_mutation": is_mut,
-                "bm25_score": (score * 100.0).round() / 100.0,
-                "tags": tags.iter().map(|s| JsonValue::from(s.as_str())).collect::<Vec<_>>()
-            }));
+        for (idx, item) in ranked.into_iter().take(limit).enumerate() {
+            if let Some((s_name, t_name, desc, is_mut, tags)) = tool_lookup.get(&item.id) {
+                pipeline.push(json!({
+                    "step": (idx + 1) as i64,
+                    "server_name": s_name.clone(),
+                    "tool_name": t_name.clone(),
+                    "description": desc.clone(),
+                    "is_mutation": *is_mut,
+                    "bm25_score": (item.bm25_score * 100.0).round() / 100.0,
+                    "vector_similarity": (item.vector_similarity * 1000.0).round() / 1000.0,
+                    "rrf_score": (item.rrf_score * 10000.0).round() / 10000.0,
+                    "tags": tags.iter().map(|s| JsonValue::from(s.as_str())).collect::<Vec<_>>()
+                }));
+            }
         }
 
         let payload = json!({
             "goal": goal,
             "recommended_pipeline": JsonValue::Array(pipeline),
+            "ranking_engine": "hybrid_bm25_vector_rrf",
             "confidence": 0.95
         });
 

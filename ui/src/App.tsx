@@ -9,6 +9,9 @@ import { RegisterExternalServerModal } from './components/RegisterExternalServer
 import { ExternalServerInspector } from './components/ExternalServerInspector';
 import { ToolGroupsStudio } from './components/ToolGroupsStudio';
 import { CodeModeStudio } from './components/CodeModeStudio';
+import { ApprovalInboxModal } from './components/ApprovalInboxModal';
+import { ObservabilityStudio } from './components/ObservabilityStudio';
+import { ImportConfigModal } from './components/ImportConfigModal';
 import {
   ServerSummary,
   ServerDetail,
@@ -16,7 +19,7 @@ import {
   PlatformStats,
   ToolItem,
 } from './types';
-import { apiFetch, ApiError, getToken } from './api';
+import { apiFetch, ApiError, getToken, listSuspendedFrames, listPendingCallbacks } from './api';
 
 export const App: React.FC = () => {
   const [servers, setServers] = useState<ServerSummary[]>([]);
@@ -33,6 +36,11 @@ export const App: React.FC = () => {
   const [isRegisterExternalOpen, setIsRegisterExternalOpen] = useState(false);
   const [isToolGroupsOpen, setIsToolGroupsOpen] = useState(false);
   const [isCodeModeOpen, setIsCodeModeOpen] = useState(false);
+  const [isApprovalInboxOpen, setIsApprovalInboxOpen] = useState(false);
+  const [isObservabilityOpen, setIsObservabilityOpen] = useState(false);
+  const [isImportConfigOpen, setIsImportConfigOpen] = useState(false);
+  const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
+  const [sseRevision, setSseRevision] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
   const [inspectServerTarget, setInspectServerTarget] = useState<ServerSummary | null>(null);
   const [testConsoleTarget, setTestConsoleTarget] = useState<{
@@ -100,15 +108,28 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  const fetchPendingApprovals = useCallback(async () => {
+    try {
+      const [frames, cbs] = await Promise.all([
+        listSuspendedFrames().catch(() => []),
+        listPendingCallbacks().catch(() => []),
+      ]);
+      setPendingApprovalCount(frames.length + cbs.length);
+    } catch {
+      // Non-approver tokens ignore silently
+    }
+  }, []);
+
   const refreshAll = useCallback(() => {
     setErrorBanner(null);
     fetchStats();
     fetchServers();
     fetchDiffs();
+    fetchPendingApprovals();
     if (selectedServerName) {
       fetchServerDetail(selectedServerName);
     }
-  }, [fetchStats, fetchServers, fetchDiffs, fetchServerDetail, selectedServerName]);
+  }, [fetchStats, fetchServers, fetchDiffs, fetchPendingApprovals, fetchServerDetail, selectedServerName]);
 
   useEffect(() => {
     refreshAll();
@@ -140,10 +161,19 @@ export const App: React.FC = () => {
           const frames = buffer.split('\n\n');
           buffer = frames.pop() || '';
           for (const frame of frames) {
-            if (frame.includes('event: server.health') || frame.includes('event: approval.')) {
+            if (
+              frame.includes('event: server.health') ||
+              frame.includes('event: approval.') ||
+              frame.includes('event: codemode.') ||
+              frame.includes('event: mcp.approval_required') ||
+              frame.includes('event: mcp.callback_resolved') ||
+              frame.includes('event: registry.')
+            ) {
+              setSseRevision((r) => r + 1);
               fetchServers();
               fetchStats();
               fetchDiffs();
+              fetchPendingApprovals();
             }
           }
         }
@@ -159,7 +189,7 @@ export const App: React.FC = () => {
       active = false;
       controller.abort();
     };
-  }, [fetchServers, fetchStats, fetchDiffs]);
+  }, [fetchServers, fetchStats, fetchDiffs, fetchPendingApprovals]);
 
   useEffect(() => {
     if (selectedServerName) {
@@ -266,8 +296,12 @@ export const App: React.FC = () => {
         onOpenRegisterExternal={() => setIsRegisterExternalOpen(true)}
         onOpenToolGroups={() => setIsToolGroupsOpen(true)}
         onOpenCodeMode={() => setIsCodeModeOpen(true)}
+        onOpenApprovalInbox={() => setIsApprovalInboxOpen(true)}
+        onOpenObservability={() => setIsObservabilityOpen(true)}
+        onOpenImportConfig={() => setIsImportConfigOpen(true)}
         sseConnected={sseConnected}
         pendingDiffCount={diffs.length}
+        pendingApprovalCount={pendingApprovalCount}
         onTokenChanged={refreshAll}
       />
 
@@ -348,6 +382,24 @@ export const App: React.FC = () => {
       <CodeModeStudio
         isOpen={isCodeModeOpen}
         onClose={() => setIsCodeModeOpen(false)}
+      />
+
+      <ApprovalInboxModal
+        isOpen={isApprovalInboxOpen}
+        onClose={() => setIsApprovalInboxOpen(false)}
+        onUpdated={refreshAll}
+        sseRevision={sseRevision}
+      />
+
+      <ObservabilityStudio
+        isOpen={isObservabilityOpen}
+        onClose={() => setIsObservabilityOpen(false)}
+      />
+
+      <ImportConfigModal
+        isOpen={isImportConfigOpen}
+        onClose={() => setIsImportConfigOpen(false)}
+        onImported={refreshAll}
       />
 
       {inspectServerTarget && (

@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::RwLock;
 
-/// Pluggable persistence backend trait for `MCPRegistry` (v6.0.0).
+/// Pluggable persistence backend trait for `MCPRegistry` (v6.0.0 / v6.5.0).
 pub trait RegistryStorageBackend: Send + Sync {
     fn load_all_servers(&self) -> Vec<ServerRecord>;
     fn save_server(&self, server: &ServerRecord);
@@ -21,6 +21,18 @@ pub trait RegistryStorageBackend: Send + Sync {
     fn load_all_tool_groups(&self) -> Vec<ToolGroupRecord>;
     fn save_tool_group(&self, group: &ToolGroupRecord);
     fn delete_tool_group(&self, slug: &str) -> Option<ToolGroupRecord>;
+    fn load_all_suspended_frames(&self) -> Vec<SuspendedExecutionFrame> {
+        Vec::new()
+    }
+    fn save_suspended_frame(&self, _frame: &SuspendedExecutionFrame) {}
+    fn delete_suspended_frame(&self, _execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        None
+    }
+    fn get_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        self.load_all_suspended_frames()
+            .into_iter()
+            .find(|f| f.execution_id == execution_id)
+    }
     fn consume_frame_cas(
         &self,
         execution_id: &str,
@@ -488,6 +500,22 @@ impl RegistryStorageBackend for WalRegistryStore {
         WalRegistryStore::delete_tool_group(self, slug)
     }
 
+    fn load_all_suspended_frames(&self) -> Vec<SuspendedExecutionFrame> {
+        self.list_suspended_frames()
+    }
+
+    fn save_suspended_frame(&self, frame: &SuspendedExecutionFrame) {
+        WalRegistryStore::save_suspended_frame(self, frame);
+    }
+
+    fn delete_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        WalRegistryStore::delete_suspended_frame(self, execution_id)
+    }
+
+    fn get_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        WalRegistryStore::get_suspended_frame(self, execution_id)
+    }
+
     fn consume_frame_cas(
         &self,
         execution_id: &str,
@@ -701,6 +729,66 @@ impl RegistryStorageBackend for SqliteRegistryBackend {
             .and_then(|j| ToolGroupRecord::from_json(&j))
     }
 
+    fn load_all_suspended_frames(&self) -> Vec<SuspendedExecutionFrame> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            match conn.prepare("SELECT payload FROM suspended_frames ORDER BY execution_id ASC") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for payload in rows.flatten() {
+            if let Ok(json) = JsonValue::parse(&payload) {
+                if let Some(frame) = SuspendedExecutionFrame::from_json(&json) {
+                    if !frame.is_consumed {
+                        out.push(frame);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn save_suspended_frame(&self, frame: &SuspendedExecutionFrame) {
+        SqliteRegistryBackend::save_suspended_frame(self, frame);
+    }
+
+    fn delete_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM suspended_frames WHERE execution_id = ?1",
+                rusqlite::params![execution_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = conn.execute(
+            "DELETE FROM suspended_frames WHERE execution_id = ?1",
+            rusqlite::params![execution_id],
+        );
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| SuspendedExecutionFrame::from_json(&j))
+    }
+
+    fn get_suspended_frame(&self, execution_id: &str) -> Option<SuspendedExecutionFrame> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM suspended_frames WHERE execution_id = ?1",
+                rusqlite::params![execution_id],
+                |row| row.get(0),
+            )
+            .ok();
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| SuspendedExecutionFrame::from_json(&j))
+    }
+
     fn consume_frame_cas(
         &self,
         execution_id: &str,
@@ -829,97 +917,6 @@ impl crate::storage::audit_log::AuditSink for SqliteRegistryBackend {
             count += 1;
         }
         (true, count)
-    }
-}
-
-/// PostgreSQL multi-replica storage backend (v6.0.0, enabled via `storage-postgres`).
-#[cfg(feature = "storage-postgres")]
-pub struct PostgresRegistryBackend {
-    pub dsn: String,
-    inner: WalRegistryStore,
-    audit_records: RwLock<Vec<crate::storage::audit_log::MerkleAuditRecord>>,
-}
-
-#[cfg(feature = "storage-postgres")]
-impl PostgresRegistryBackend {
-    pub const SCHEMA_SQL: &'static str = "
-        CREATE TABLE IF NOT EXISTS omni_servers (name TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at DOUBLE PRECISION NOT NULL);
-        CREATE TABLE IF NOT EXISTS omni_diffs (diff_id TEXT PRIMARY KEY, payload JSONB NOT NULL, resolved BOOLEAN NOT NULL DEFAULT FALSE);
-        CREATE TABLE IF NOT EXISTS omni_tool_groups (slug TEXT PRIMARY KEY, payload JSONB NOT NULL);
-        CREATE TABLE IF NOT EXISTS omni_suspended_frames (execution_id TEXT PRIMARY KEY, payload JSONB NOT NULL);
-        CREATE TABLE IF NOT EXISTS omni_audit_log (idx BIGINT PRIMARY KEY, current_hash TEXT NOT NULL, payload JSONB NOT NULL);
-    ";
-
-    pub fn connect(dsn: impl Into<String>) -> Result<Self, String> {
-        let dsn = dsn.into();
-        if !dsn.starts_with("postgres://") && !dsn.starts_with("postgresql://") && dsn != ":memory:"
-        {
-            return Err(format!("Invalid Postgres DSN: {}", dsn));
-        }
-        Ok(Self {
-            dsn,
-            inner: WalRegistryStore::new(":memory:"),
-            audit_records: RwLock::new(Vec::new()),
-        })
-    }
-
-    pub fn save_suspended_frame(&self, frame: &SuspendedExecutionFrame) {
-        self.inner.save_suspended_frame(frame);
-    }
-}
-
-#[cfg(feature = "storage-postgres")]
-impl RegistryStorageBackend for PostgresRegistryBackend {
-    fn load_all_servers(&self) -> Vec<ServerRecord> {
-        self.inner.load_all_servers()
-    }
-    fn save_server(&self, server: &ServerRecord) {
-        self.inner.save_server(server);
-    }
-    fn delete_server(&self, name: &str) -> Option<ServerRecord> {
-        self.inner.delete_server(name)
-    }
-    fn load_all_diffs(&self) -> Vec<ConfigDiff> {
-        self.inner.load_all_diffs()
-    }
-    fn save_diff(&self, diff: &ConfigDiff) {
-        self.inner.save_diff(diff);
-    }
-    fn load_all_tool_groups(&self) -> Vec<ToolGroupRecord> {
-        self.inner.load_all_tool_groups()
-    }
-    fn save_tool_group(&self, group: &ToolGroupRecord) {
-        self.inner.save_tool_group(group);
-    }
-    fn delete_tool_group(&self, slug: &str) -> Option<ToolGroupRecord> {
-        self.inner.delete_tool_group(slug)
-    }
-    fn consume_frame_cas(
-        &self,
-        execution_id: &str,
-        approver: &str,
-    ) -> Result<SuspendedExecutionFrame, String> {
-        self.inner.consume_frame_cas(execution_id, approver)
-    }
-}
-
-#[cfg(feature = "storage-postgres")]
-impl crate::storage::audit_log::AuditSink for PostgresRegistryBackend {
-    fn emit_record(
-        &self,
-        record: &crate::storage::audit_log::MerkleAuditRecord,
-    ) -> Result<(), String> {
-        let mut guard = self
-            .audit_records
-            .write()
-            .map_err(|_| "Postgres audit lock poisoned".to_string())?;
-        guard.push(record.clone());
-        Ok(())
-    }
-
-    fn verify_integrity(&self) -> (bool, usize) {
-        let guard = self.audit_records.read().unwrap();
-        (true, guard.len())
     }
 }
 

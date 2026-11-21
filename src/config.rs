@@ -28,6 +28,11 @@ pub struct OmniConfig {
     pub upstream_call_timeout_ms: u64,
     pub allow_loopback_upstream: bool,
     pub demo_seed: bool,
+    pub storage_backend: String,
+    pub database_url: String,
+    pub embedding_url: Option<String>,
+    pub otlp_endpoint: Option<String>,
+    pub otlp_flush_interval_ms: u64,
 }
 
 impl Default for OmniConfig {
@@ -131,6 +136,23 @@ impl OmniConfig {
                     }
                     cfg!(test)
                 }),
+            storage_backend: env::var("OMNI_STORAGE_BACKEND")
+                .unwrap_or_else(|_| "wal".to_string())
+                .trim()
+                .to_lowercase(),
+            database_url: env::var("OMNI_DATABASE_URL").unwrap_or_default(),
+            embedding_url: env::var("OMNI_EMBEDDING_URL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            otlp_endpoint: env::var("OMNI_OTLP_ENDPOINT")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            otlp_flush_interval_ms: env::var("OMNI_OTLP_FLUSH_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5000),
         }
     }
 }

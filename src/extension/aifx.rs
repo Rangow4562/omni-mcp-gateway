@@ -674,6 +674,75 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             }
             run_mock_echo_mcp_server(flood_stderr)
         }
+        "mock-bidirectional-mcp" => run_mock_bidirectional_mcp_server(),
+        "wasm" => {
+            let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            if sub != "register" || args.len() < 6 {
+                eprintln!("Usage: omni wasm register <server_name> <tool_name> <path/to/plugin.wasm> [--description <text>]");
+                return 1;
+            }
+            let server_name = args[3].as_str();
+            let tool_name = args[4].as_str();
+            let wasm_path = args[5].as_str();
+            let mut description = format!("Native Wasm plugin tool {}", tool_name);
+            let mut i = 6;
+            while i < args.len() {
+                if args[i] == "--description" && i + 1 < args.len() {
+                    description = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            match fs::read(wasm_path) {
+                Ok(bytes) => {
+                    if bytes.len() < 4 || &bytes[..4] != b"\0asm" {
+                        eprintln!(
+                            "Invalid .wasm file '{}': missing \\0asm magic header",
+                            wasm_path
+                        );
+                        return 1;
+                    }
+                    let b64 = encode_std_base64(&bytes);
+                    let ctx = get_gateway_context();
+                    let mut tool = crate::models::ToolRecord::new(
+                        tool_name,
+                        description,
+                        json!({"type": "object", "properties": {}}),
+                    );
+                    tool.protocol = crate::models::ProtocolType::WasmPlugin;
+                    tool.status = ToolStatus::Enabled;
+                    tool.wasm_module_base64 = Some(b64);
+
+                    let mut srv = ctx.registry.get_server(server_name).unwrap_or_else(|| {
+                        let mut s = crate::models::ServerRecord::new(
+                            server_name,
+                            format!("{} (Wasm Plugins)", server_name),
+                            "Zero-process WebAssembly plugin tools",
+                            "platform",
+                        );
+                        s.protocol = crate::models::ProtocolType::WasmPlugin;
+                        s.status = ToolStatus::Enabled;
+                        s
+                    });
+                    srv.status = ToolStatus::Enabled;
+                    srv.add_tool(tool);
+                    ctx.registry.register_server(srv);
+                    ctx.cache.refresh_now();
+                    println!(
+                        "[+] Registered native Wasm plugin tool '{}.{}' ({} bytes)",
+                        server_name,
+                        tool_name,
+                        bytes.len()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Failed to read Wasm file '{}': {}", wasm_path, e);
+                    1
+                }
+            }
+        }
         "import" => {
             let path = match args.get(2) {
                 Some(p) => p.as_str(),
@@ -725,11 +794,33 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             }
         }
         "migrate" => {
+            let to_v6_5 = args.iter().any(|a| a == "--to-v6.5");
             let to_v6 = args.iter().any(|a| a == "--to-v6");
             let dry_run = args.iter().any(|a| a == "--dry-run");
+            let mut target_backend =
+                std::env::var("OMNI_STORAGE_BACKEND").unwrap_or_else(|_| "sqlite".to_string());
+            let mut database_url = std::env::var("OMNI_DATABASE_URL").unwrap_or_default();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--target" && i + 1 < args.len() {
+                    target_backend = args[i + 1].clone();
+                    i += 2;
+                } else if args[i] == "--database-url" && i + 1 < args.len() {
+                    database_url = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             println!(
                 "Omni MCP {} State Migration Utility (v{}) {}",
-                if to_v6 { "v5 -> v6" } else { "v4 -> v5" },
+                if to_v6_5 {
+                    "-> v6.5"
+                } else if to_v6 {
+                    "v5 -> v6"
+                } else {
+                    "v4 -> v5"
+                },
                 env!("CARGO_PKG_VERSION"),
                 if dry_run { "[DRY-RUN]" } else { "" }
             );
@@ -737,7 +828,23 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             let cfg = crate::config::get_config();
             println!("[*] Data directory: {}", cfg.data_dir);
             println!("[*] Validating schema version and Merkle audit log continuity...");
-            if to_v6 {
+            if to_v6_5 {
+                let mig = migrate_to_v6_5(&cfg.data_dir, &target_backend, &database_url, dry_run);
+                println!(
+                    "[+] v6.5 migration ({}): {} ({} servers, {} tool groups)",
+                    target_backend, mig.summary, mig.servers_migrated, mig.tool_groups_count
+                );
+                println!(
+                    "[+] Audit chain integrity: {} ({} records)",
+                    if mig.audit_verified { "OK" } else { "FAILED" },
+                    mig.audit_records
+                );
+                if mig.ok {
+                    0
+                } else {
+                    1
+                }
+            } else if to_v6 {
                 let mig = migrate_v5_to_v6(&cfg.data_dir, dry_run);
                 let ctx = get_gateway_context();
                 let (ok, count) = ctx.audit_store.verify_chain();
@@ -834,6 +941,267 @@ pub fn migrate_v5_to_v6(data_dir: &str, dry_run: bool) -> MigrationReport {
             "migrated and compacted snapshot/WAL to v6.0".to_string()
         },
     }
+}
+
+/// Migrates existing File-WAL or SQLite registry data (plus Merkle audit log records) into
+/// SQLite or PostgreSQL (`v6.5.0`) with SHA-256 checksum verification.
+pub fn migrate_to_v6_5(
+    data_dir: &str,
+    target_backend: &str,
+    database_url: &str,
+    dry_run: bool,
+) -> MigrationReport {
+    let wal_path = std::path::Path::new(data_dir).join("omni_registry.db");
+    let legacy_wal = std::path::Path::new(data_dir).join("registry.db");
+    let sqlite_src = std::path::Path::new(data_dir).join("omni_registry.sqlite");
+
+    #[allow(unused_mut)]
+    let (mut servers, mut diffs, mut groups, mut frames) =
+        if wal_path.exists() || legacy_wal.exists() {
+            let src_path = if wal_path.exists() {
+                wal_path
+            } else {
+                legacy_wal
+            };
+            let src_store =
+                crate::storage::WalRegistryStore::new(src_path.to_string_lossy().to_string());
+            let s = src_store.list_all_servers();
+            let d = src_store.list_diffs(false);
+            let g = src_store.list_all_tool_groups();
+            let f = src_store.list_suspended_frames();
+            src_store.close();
+            (s, d, g, f)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+
+    // Fallback to existing SQLite database as migration source (e.g. SQLite -> PostgreSQL)
+    #[cfg(feature = "storage-sqlite")]
+    if servers.is_empty() && groups.is_empty() && sqlite_src.exists() {
+        use crate::storage::RegistryStorageBackend;
+        if let Ok(sq) =
+            crate::storage::SqliteRegistryBackend::try_open(sqlite_src.to_string_lossy().as_ref())
+        {
+            servers = sq.load_all_servers();
+            diffs = sq.load_all_diffs();
+            groups = sq.load_all_tool_groups();
+            frames = sq.load_all_suspended_frames();
+        }
+    }
+    #[cfg(not(feature = "storage-sqlite"))]
+    let _ = &sqlite_src;
+
+    let src_digest = compute_migration_checksum(&servers, &groups, &diffs, &frames);
+    let audit_path = std::path::Path::new(data_dir).join("omni_audit.log");
+    let audit_store =
+        crate::storage::MerkleAuditStore::new(Some(audit_path.to_string_lossy().to_string()));
+    let (audit_verified, audit_records) = audit_store.verify_chain();
+    let audit_entries = audit_store.list_records(None);
+
+    if dry_run {
+        return MigrationReport {
+            ok: audit_verified,
+            servers_migrated: servers.len(),
+            tool_groups_count: groups.len(),
+            audit_verified,
+            audit_records,
+            summary: format!(
+                "dry-run verified migration to '{}' (checksum {})",
+                target_backend,
+                &src_digest[..12]
+            ),
+        };
+    }
+
+    type MigDest = (
+        Box<dyn crate::storage::RegistryStorageBackend>,
+        Option<Box<dyn crate::storage::AuditSink>>,
+    );
+    let backend_res: Result<MigDest, String> = match target_backend.to_ascii_lowercase().as_str() {
+        "sqlite" => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let dsn = if !database_url.trim().is_empty() {
+                    database_url.to_string()
+                } else {
+                    std::path::Path::new(data_dir)
+                        .join("omni_registry.sqlite")
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                crate::storage::SqliteRegistryBackend::try_open(dsn.clone()).map(|b| {
+                    let sink_res = crate::storage::SqliteRegistryBackend::try_open(dsn);
+                    let sink = sink_res
+                        .ok()
+                        .map(|s| Box::new(s) as Box<dyn crate::storage::AuditSink>);
+                    (
+                        Box::new(b) as Box<dyn crate::storage::RegistryStorageBackend>,
+                        sink,
+                    )
+                })
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = database_url;
+                Err("SQLite migration requires the 'storage-sqlite' feature".to_string())
+            }
+        }
+        "postgres" | "postgresql" => {
+            #[cfg(feature = "storage-postgres")]
+            {
+                let dsn = if !database_url.trim().is_empty() {
+                    database_url.to_string()
+                } else {
+                    return MigrationReport {
+                        ok: false,
+                        servers_migrated: 0,
+                        tool_groups_count: 0,
+                        audit_verified,
+                        audit_records,
+                        summary:
+                            "PostgreSQL migration requires --database-url or OMNI_DATABASE_URL"
+                                .to_string(),
+                    };
+                };
+                crate::storage::PostgresRegistryBackend::connect(dsn.clone()).map(|b| {
+                    let sink = crate::storage::PostgresRegistryBackend::connect(dsn)
+                        .ok()
+                        .map(|s| Box::new(s) as Box<dyn crate::storage::AuditSink>);
+                    (
+                        Box::new(b) as Box<dyn crate::storage::RegistryStorageBackend>,
+                        sink,
+                    )
+                })
+            }
+            #[cfg(not(feature = "storage-postgres"))]
+            {
+                let _ = database_url;
+                Err("PostgreSQL migration requires the 'storage-postgres' feature".to_string())
+            }
+        }
+        other => Err(format!("Unsupported migration target '{}'", other)),
+    };
+
+    match backend_res {
+        Ok((dst, audit_sink_opt)) => {
+            for s in &servers {
+                dst.save_server(s);
+            }
+            for d in &diffs {
+                dst.save_diff(d);
+            }
+            for g in &groups {
+                dst.save_tool_group(g);
+            }
+            for f in &frames {
+                dst.save_suspended_frame(f);
+            }
+            let mut sink_ok = true;
+            if let Some(sink) = audit_sink_opt {
+                for rec in &audit_entries {
+                    if sink.emit_record(rec).is_err() {
+                        sink_ok = false;
+                        break;
+                    }
+                }
+                if sink_ok && !audit_entries.is_empty() {
+                    let (v, _) = sink.verify_integrity();
+                    sink_ok = v;
+                }
+            }
+            let verify_servers = dst.load_all_servers();
+            let verify_groups = dst.load_all_tool_groups();
+            let verify_diffs = dst.load_all_diffs();
+            let verify_frames = dst.load_all_suspended_frames();
+            let dst_digest = compute_migration_checksum(
+                &verify_servers,
+                &verify_groups,
+                &verify_diffs,
+                &verify_frames,
+            );
+            let checksum_ok = src_digest == dst_digest;
+            MigrationReport {
+                ok: audit_verified && sink_ok && checksum_ok,
+                servers_migrated: servers.len(),
+                tool_groups_count: groups.len(),
+                audit_verified: audit_verified && sink_ok,
+                audit_records,
+                summary: if checksum_ok && sink_ok {
+                    format!(
+                        "migrated to '{}' with verified SHA-256 checksum {}",
+                        target_backend,
+                        &dst_digest[..12]
+                    )
+                } else if !sink_ok {
+                    "audit log sink verification failed after migration".to_string()
+                } else {
+                    format!(
+                        "checksum mismatch after migration (src {} != dst {})",
+                        &src_digest[..12],
+                        &dst_digest[..12]
+                    )
+                },
+            }
+        }
+        Err(e) => MigrationReport {
+            ok: false,
+            servers_migrated: 0,
+            tool_groups_count: 0,
+            audit_verified,
+            audit_records,
+            summary: e,
+        },
+    }
+}
+
+fn compute_migration_checksum(
+    servers: &[crate::models::ServerRecord],
+    groups: &[crate::models::ToolGroupRecord],
+    diffs: &[crate::models::ConfigDiff],
+    frames: &[crate::models::SuspendedExecutionFrame],
+) -> String {
+    let mut keys: Vec<String> = servers
+        .iter()
+        .map(|s| format!("srv:{}:{}:{}", s.name, s.version, s.tools.len()))
+        .collect();
+    for g in groups {
+        keys.push(format!("grp:{}:{}", g.slug, g.entries.len()));
+    }
+    for d in diffs {
+        keys.push(format!("diff:{}:{}", d.diff_id, d.approved));
+    }
+    for f in frames {
+        keys.push(format!(
+            "frame:{}:{}",
+            f.execution_id, f.pending_arguments_hash
+        ));
+    }
+    keys.sort();
+    crate::storage::sha256_hex(keys.join("|").as_bytes())
+}
+
+fn encode_std_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 pub fn import_mcp_config_json(
@@ -987,7 +1355,8 @@ fn print_help() {
             "  omni bench [--iterations <N>]\n",
             "  omni bench-codemode [--iterations <N>]\n",
             "  omni import <path/to/mcp.json>\n",
-            "  omni migrate [--to-v6]\n\n",
+            "  omni wasm register <server> <tool> <path.wasm> [--description <text>]\n",
+            "  omni migrate [--to-v6 | --to-v6.5 --target sqlite|postgres --database-url <dsn>]\n\n",
             "NOTE: Commands can be prefixed with 'aifx', 'omni', or 'mcp' interchangeably."
         )
     );
@@ -1103,6 +1472,181 @@ pub fn run_mock_echo_mcp_server(flood_stderr: bool) -> i32 {
                     let _ = writeln!(stdout, "{}", resp.to_string_compact());
                     let _ = stdout.flush();
                 }
+            }
+        }
+    }
+    0
+}
+
+/// Mock bidirectional MCP stdio server used for end-to-end verification of Pillar 4:
+/// - `trigger_sampling`: emits `notifications/progress` (50%), then emits reverse
+///   `sampling/createMessage` (`id: 9001`), waits for the gateway's JSON-RPC response on stdin,
+///   emits `notifications/progress` (100%), and returns the gateway's sampling reply in `structuredContent`.
+/// - `slow_cancel`: sleeps briefly while listening for `notifications/cancelled`.
+pub fn run_mock_bidirectional_mcp_server() -> i32 {
+    use std::io::{BufRead, BufReader, Write};
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(json_val) = crate::json::JsonValue::parse(trimmed) else {
+            continue;
+        };
+        let id = json_val
+            .get("id")
+            .cloned()
+            .unwrap_or(crate::json::JsonValue::Null);
+        let method = json_val
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+
+        match method {
+            "initialize" => {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "mock-bidirectional-mcp", "version": "1.0.0" }
+                    }
+                });
+                let _ = writeln!(stdout, "{}", resp.to_string_compact());
+                let _ = stdout.flush();
+            }
+            "notifications/initialized" | "notifications/cancelled" => {}
+            "tools/list" => {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "trigger_sampling",
+                                "description": "Emits progress and reverse sampling/createMessage",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "prompt": { "type": "string" }
+                                    }
+                                }
+                            },
+                            {
+                                "name": "slow_cancel",
+                                "description": "Blocks briefly so caller can cancel it",
+                                "inputSchema": { "type": "object", "properties": {} }
+                            }
+                        ]
+                    }
+                });
+                let _ = writeln!(stdout, "{}", resp.to_string_compact());
+                let _ = stdout.flush();
+            }
+            "tools/call" => {
+                let params = json_val
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(crate::json::JsonValue::object());
+                let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(crate::json::JsonValue::object());
+
+                if tool_name == "slow_cancel" {
+                    // Wait until we receive a notifications/cancelled line on stdin
+                    let mut cancel_line = String::new();
+                    let _ = reader.read_line(&mut cancel_line);
+                    continue;
+                }
+
+                // 1. Emit mid-call progress notification (50%)
+                let prog1 = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": "tok-bidir-1",
+                        "progress": 50,
+                        "total": 100,
+                        "message": "requesting sampling"
+                    }
+                });
+                let _ = writeln!(stdout, "{}", prog1.to_string_compact());
+                let _ = stdout.flush();
+
+                // 2. Emit reverse server-to-client request: sampling/createMessage
+                let prompt_text = args
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Summarize user alice@example.com");
+                let rev_req = json!({
+                    "jsonrpc": "2.0",
+                    "id": 9001,
+                    "method": "sampling/createMessage",
+                    "params": {
+                        "messages": [{"role": "user", "content": {"type": "text", "text": prompt_text}}],
+                        "maxTokens": 128
+                    }
+                });
+                let _ = writeln!(stdout, "{}", rev_req.to_string_compact());
+                let _ = stdout.flush();
+
+                // 3. Read gateway's JSON-RPC reply to our reverse request
+                let mut reply_line = String::new();
+                let sampling_reply = match reader.read_line(&mut reply_line) {
+                    Ok(n) if n > 0 => crate::json::JsonValue::parse(reply_line.trim())
+                        .unwrap_or_else(|_| json!({"raw": reply_line.trim()})),
+                    _ => json!({"error": "eof"}),
+                };
+
+                // 4. Emit completion progress (100%)
+                let prog2 = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": "tok-bidir-1",
+                        "progress": 100,
+                        "total": 100,
+                        "message": "done"
+                    }
+                });
+                let _ = writeln!(stdout, "{}", prog2.to_string_compact());
+                let _ = stdout.flush();
+
+                // 5. Return final tools/call response containing the gateway's sampling reply
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "structuredContent": {
+                            "sampling_reply": sampling_reply
+                        }
+                    }
+                });
+                let _ = writeln!(stdout, "{}", resp.to_string_compact());
+                let _ = stdout.flush();
+            }
+            _ => {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": "Method not found" }
+                });
+                let _ = writeln!(stdout, "{}", resp.to_string_compact());
+                let _ = stdout.flush();
             }
         }
     }

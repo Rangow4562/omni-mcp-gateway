@@ -19,13 +19,13 @@ export const TestConsole: React.FC<TestConsoleProps> = ({
   isOpen,
   onClose,
 }) => {
-  if (!isOpen) return null;
-
   const [argsJson, setArgsJson] = useState('{\n  "driver_id": "drv_10284",\n  "include_telemetry": true\n}');
   const [projection, setProjection] = useState('');
   const [executing, setExecuting] = useState(false);
   const [response, setResponse] = useState<any>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  if (!isOpen) return null;
 
   const handleExecute = async () => {
     setExecuting(true);

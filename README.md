@@ -15,7 +15,7 @@
 <p>
   <a href="#why-omnimcp">Why</a> ·
   <a href="#installation-across-all-operating-systems">Quick start & OS binaries</a> ·
-  <a href="#release-evolution-v40--v60">What's new in v6.0</a> ·
+  <a href="#release-evolution-v40--v65">What's new in v6.5</a> ·
   <a href="#architecture-diagram">Architecture</a> ·
   <a href="#authoritative-json-rpc-20-error-code-contract--320xx-table">Error contract</a> ·
   <a href="#available-endpoints--apis">Endpoints & tools</a> ·
@@ -26,7 +26,7 @@
 
 </div>
 
-**OmniMCP** (`omni-mcp` `v6.0` — *Enterprise MCP Fleet, Tool Groups & Code Mode v2*) is a high-performance **Rust** Model Context Protocol (MCP) management platform and runtime gateway. It unifies external stdio/HTTP MCP fleets, Virtual Tool Groups, OpenAPI/Protobuf/Thrift services, and an in-process **Code Mode** sandbox behind one governed, sub-millisecond gateway.
+**OmniMCP** (`omni-mcp` `v6.5` — *Distributed Cluster HA, Host-Bridged Wasm Plugins, Live Multi-Protocol Wire, Bidirectional MCP & Governance Studio*) is a high-performance **Rust** Model Context Protocol (MCP) management platform and runtime gateway. It unifies external stdio/HTTP MCP fleets, Virtual Tool Groups, OpenAPI/Protobuf/Thrift services, and an in-process **Code Mode** sandbox behind one governed, sub-millisecond gateway.
 
 - **Unified External MCP Fleet & Tool Groups.** Supervise external stdio (`crates/omni-process-guard`) and HTTP/HTTPS (`rustls`) MCP servers with live SSE telemetry, health checks, and scoped Virtual Tool Groups in the React/Vite Fleet & Studio UI.
 - **Native Code Mode (`codemode`) & Wasm Sandbox.** Compiles tool schemas into compact `declare namespace codemode` TypeScript `.d.ts` definitions ($65\%\text{–}95\%$ token compression) and executes procedural scripts in an in-process AST VM ($\sim 100\ \mu\text{s}$) or `wasmi` WebAssembly sandbox with resumable WAL approval gates.
@@ -40,7 +40,7 @@
 
 Raw multi-server MCP setups degrade quickly as tool counts grow:
 
-| ❌ Connecting raw MCP servers directly | ✅ Routing through OmniMCP (`v6.0`) |
+| ❌ Connecting raw MCP servers directly | ✅ Routing through OmniMCP (`v6.5`) |
 | :--- | :--- |
 | Loads thousands of flat JSON schemas into every prompt, burning context tokens | Compiles schemas into compact `.d.ts` definitions and pre-injects top-$K$ via Okapi BM25 ($k_1 = 1.2, b = 0.75$) |
 | Forces slow multi-turn tool ping-pong for filtering, joins, and loops | Executes procedural `codemode` scripts with SSA auto-parallelization (`Stmt::ParallelWave`) and vectorized `PhysicalExpr` columnar pushdown |
@@ -64,10 +64,22 @@ Raw multi-server MCP setups degrade quickly as tool counts grow:
 
 ---
 
-## Release Evolution (`v4.0` → `v6.0`)
+## Release Evolution (`v4.0` → `v6.5`)
 
 <details open>
-<summary><strong>🚀 Version 6.0 — Enterprise MCP Fleet, Async Tokio/Rustls, OIDC/JWKS, SQLite WAL & Wasm Sandbox</strong></summary>
+<summary><strong>🚀 Version 6.5 — Distributed Cluster HA, Host-Bridged Wasm Plugins, Live Multi-Protocol Wire, Bidirectional MCP & Governance Studio</strong></summary>
+
+- **Real PostgreSQL Cluster Backend (`storage-postgres`)**: Pure-Rust PostgreSQL v3.0 wire client (`SCRAM-SHA-256`, optional `rustls` SSLRequest, parameterized Extended Queries), SQL CAS (`DELETE ... RETURNING`), `LISTEN/NOTIFY` cluster cache invalidation, and dynamic `OMNI_STORAGE_BACKEND=wal|sqlite|postgres` selection + `omni migrate --to-v6.5`.
+- **Host-Bridged Wasm Plugins & Guest ABI v1 (`sandbox-wasm`)**: Shared SHA-256 `wasmi::Module` LRU cache, `omni_alloc` / `omni_run` JSON linear-memory ABI, governed `omni::call_tool` host bridge, and native `.wasm` tool plugins (`ProtocolType::WasmPlugin`).
+- **Non-Blocking Async TLS (`AsyncTlsStream`), REST Verbs/Templates & Live gRPC/HTTP2**: Non-blocking `tokio` + `rustls` TLS/mTLS (supporting long-lived HTTPS SSE), `GET`/`POST`/`PUT`/`PATCH`/`DELETE` + OpenAPI `{param}` templates over `http://` & `https://`, and live HTTP/2 gRPC & Connect-RPC (`transport-grpc`).
+- **Bidirectional Server-Initiated MCP**: Intercepts upstream `sampling/createMessage`, `elicitation/create`, and `roots/list` under `Deny` / `RelayToClient` / `ApprovalGate`, bridges `notifications/progress` to SSE, and propagates `notifications/cancelled`.
+- **Hybrid BM25 + Vector RRF Discovery & Canonical Cache**: Zero-external-API 256-dim dense vector + Okapi BM25 RRF ranking (plus optional `OMNI_EMBEDDING_URL`) and recursively key-canonicalized `SemanticResponseCache`.
+- **AEAD Token Vault (`ring`), Argument ABAC & Governance Studio v3**: `ChaCha20-Poly1305` OAuth token store with auto-refresh & PKCE routes, JSON-pointer `ArgumentPolicyRule` guardrails, hourly `TenantQuotaTracker` budgets, modular `src/server/*`, live `OtlpBatchWorker`, and UI **Approval Inbox**, **Observability Studio**, and **`mcp.json` Import Wizard**.
+
+</details>
+
+<details>
+<summary><strong>⚡ Version 6.0 — Enterprise MCP Fleet, Async Tokio/Rustls, OIDC/JWKS, SQLite WAL & Wasm Sandbox</strong></summary>
 
 - **Async Runtime & Native `rustls` TLS/mTLS (`async-runtime`, `tls-rustls`)**: `tokio` multi-threaded async listener (`serve_async_listener` / `run_async_server`) with native `rustls` TLS 1.2/1.3 & mutual TLS client-certificate verification.
 - **OIDC / JWKS Asymmetric Auth (`RS256`, `ES256`, `EdDSA`)**: Full JWKS signature verification alongside HS256 JWTs, RFC 8707 resource indicators, and RFC 8693 token exchange.
@@ -131,7 +143,7 @@ npx -y @rangow2260/omni-mcp aifx mcp simulate --code "const res = await codemode
 
 ### 2. Native Pre-Built Binaries by Operating System
 
-All binaries (plus `omni-*`, `aifx-*`, Cargo SBOMs, and `SHA256SUMS`) are published on the [v6.0.0 GitHub Release](https://github.com/Rangow4562/omni-mcp-gateway/releases/tag/v6.0.0):
+All binaries (plus `omni-*`, `aifx-*`, Cargo SBOMs, and `SHA256SUMS`) are published on the [v6.5.0 GitHub Release](https://github.com/Rangow4562/omni-mcp-gateway/releases/tag/v6.5.0):
 
 | Operating System | Architecture | Target Triple | Release Binary Asset |
 | :--- | :--- | :--- | :--- |
@@ -145,44 +157,44 @@ All binaries (plus `omni-*`, `aifx-*`, Cargo SBOMs, and `SHA256SUMS`) are publis
 #### 🍎 macOS (Apple Silicon & Intel)
 ```bash
 # Apple Silicon (ARM64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.0.0/omni-gateway-darwin-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-darwin-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Intel (x64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.0.0/omni-gateway-darwin-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-darwin-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🐧 Linux (`x86_64` & ARM64)
 ```bash
 # Linux x64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.0.0/omni-gateway-linux-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-linux-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Linux ARM64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.0.0/omni-gateway-linux-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-linux-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🪟 Windows (PowerShell — x64 & ARM64)
 ```powershell
 # Windows x64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.0.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 
 # Windows ARM64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.0.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 ```
 
 #### 🐳 Docker & Build from Source
 ```bash
-# Docker (production container with UI & full v6.0 feature set)
-docker build -t omni-mcp:v6.0.0 .
-docker run --rm -e OMNI_AUTH_SECRET="your-secret" -p 8080:8080 omni-mcp:v6.0.0
+# Docker (production container with UI & full v6.5 feature set)
+docker build -t omni-mcp:v6.5.0 .
+docker run --rm -e OMNI_AUTH_SECRET="your-secret" -p 8080:8080 omni-mcp:v6.5.0
 
 # Build from source (Any OS with Rust 1.75+)
-cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,sandbox-wasm,process-containment"
+cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc"
 ./target/release/omni-gateway --stdio
 ```
 
@@ -501,4 +513,4 @@ See [`examples/mcp-configs/python_harness_agent.py`](examples/mcp-configs/python
 
 ## License
 
-Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)). See [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASE_v6.0.0.md](docs/RELEASE_v6.0.0.md) for release notes.
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)). See [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASE_v6.5.0.md](docs/RELEASE_v6.5.0.md) for release notes.

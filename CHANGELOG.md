@@ -2,6 +2,30 @@
 
 All notable changes to Omni MCP. Per-release narrative notes live in [`docs/`](docs/).
 
+## [6.5.0] - 2026-11-21
+
+### Added
+- **Real PostgreSQL Wire Protocol v3.0 Cluster Backend (`src/storage/postgres_store.rs`)**:
+  - Pure safe Rust (`#![forbid(unsafe_code)]`) PostgreSQL v3.0 wire protocol client (`SCRAM-SHA-256`, optional `rustls` SSLRequest, parameterized Extended Queries), idempotent `SCHEMA_SQL`, distributed atomic CAS (`DELETE FROM omni_suspended_frames WHERE execution_id = $1 RETURNING payload::text`), `LISTEN / NOTIFY` cluster cache invalidation, and cryptographic `AuditSink::verify_integrity()`.
+  - Dynamic `OMNI_STORAGE_BACKEND=wal|sqlite|postgres` + `OMNI_DATABASE_URL` runtime wiring in `ProductionGatewayContext::new()` and `omni migrate --to-v6.5`.
+- **Host-Bridged Wasm Plugins & Omni Wasm Guest ABI v1 (`src/data_plane/codemode/wasm_sandbox.rs`)**:
+  - SHA-256 compiled `wasmi::Module` bounded LRU cache, `omni_alloc` / `omni_run` JSON linear-memory ABI, `omni::log_utf8` (PII-redacted), and governed `omni::call_tool` host bridge.
+  - Native `.wasm` plugin tools (`ProtocolType::WasmPlugin`) registered via `POST /api/v1/wasm-tools` or `omni wasm register`.
+- **Non-Blocking Async TLS (`AsyncTlsStream`), Full REST Verbs/Templates & Live HTTP/2 gRPC / Connect-RPC**:
+  - Native non-blocking `tokio` + `rustls` `AsyncTlsStream` replacing `stream.into_std()` + `spawn_blocking` downgrades, serving concurrent HTTPS `/omni/mcp`, mTLS, and long-lived HTTPS `/api/v1/events` SSE streams.
+  - `HttpDownstreamClient::request()` supporting `GET`/`POST`/`PUT`/`PATCH`/`DELETE`, OpenAPI `{param}` URL templates with path-traversal rejection, and live `https://` routing in `ProtocolTranslator`.
+  - Live RFC 7540 HTTP/2 gRPC (`h2c` / TLS `h2`) & Connect-RPC client (`src/data_plane/downstream_grpc.rs`).
+- **Bidirectional Server-Initiated MCP (`sampling`, `elicitation`, `roots`, `progress`, `cancelled`)**:
+  - `UpstreamCallbackHub` coordinating reverse server-to-client requests across `StdioUpstreamSession` and `HttpUpstreamSession` SSE under `Deny`, `RelayToClient`, and `ApprovalGate` policies, plus `notifications/progress` SSE forwarding and `notifications/cancelled` bridging.
+- **Hybrid BM25 + Dense Vector RRF Discovery & Canonical Semantic Cache (`src/data_plane/semantic_index.rs`)**:
+  - Zero-external-API 256-dim local semantic embedder + optional `OMNI_EMBEDDING_URL` fused with Okapi BM25 via RRF, plus recursively key-canonicalized `SemanticResponseCache` with per-tool `cache_ttl_sec`.
+- **`ChaCha20-Poly1305` AEAD Token Vault, Auto-Refresh OAuth, Argument ABAC & Tenant Quotas**:
+  - `ring::aead::CHACHA20_POLY1305` `v2` token store with transparent `v6.0.0` read fallback, automatic `401 -> refresh_token` rotation, PKCE browser endpoints (`/api/v1/oauth/authorize/:server`, `/api/v1/oauth/callback`), declarative `ArgumentPolicyRule` guardrails, and sliding-window `TenantQuotaTracker`.
+- **`src/server/` Modular Decomposition & Live Batching OTLP Worker (`src/telemetry/otlp.rs`)**:
+  - Decomposed `src/server.rs` into `src/server/{mod,auth,http_codec,rest_api,mcp_router,sse,listener}.rs` and wired background `OtlpBatchWorker` with $p_{50}/p_{95}/p_{99}$ latency histograms.
+- **Governance & Observability Studio v3 (`ui/src/`)**:
+  - Added `ApprovalInboxModal`, `ObservabilityStudio` (W3C Trace Waterfall + Merkle Audit Explorer), `ImportConfigModal` (`mcp.json` wizard), and 1-click OAuth PKCE Connect on `ExternalServerInspector`.
+
 ## [6.0.0] - 2026-11-13
 
 ### Added

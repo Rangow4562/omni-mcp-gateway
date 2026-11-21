@@ -8,7 +8,7 @@ use crate::models::{
     ChangeOrigin, ConfigDiff, HistoryEntry, ProtocolType, SchemaSource, ServerRecord,
     SuspendedExecutionFrame, ToolGroupRecord, ToolRecord, ToolStatus,
 };
-use crate::storage::WalRegistryStore;
+use crate::storage::{RegistryStorageBackend, WalRegistryStore};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -65,7 +65,7 @@ struct RegistryInner {
 #[derive(Clone)]
 pub struct MCPRegistry {
     inner: Arc<RwLock<RegistryInner>>,
-    store: Option<Arc<WalRegistryStore>>,
+    store: Option<Arc<dyn RegistryStorageBackend>>,
 }
 
 impl Default for MCPRegistry {
@@ -76,25 +76,35 @@ impl Default for MCPRegistry {
 
 impl MCPRegistry {
     pub fn new(persistent_store: Option<Arc<WalRegistryStore>>) -> Self {
+        let backend: Option<Arc<dyn RegistryStorageBackend>> =
+            persistent_store.map(|s| s as Arc<dyn RegistryStorageBackend>);
+        Self::with_optional_backend(backend)
+    }
+
+    pub fn with_backend(backend: Arc<dyn RegistryStorageBackend>) -> Self {
+        Self::with_optional_backend(Some(backend))
+    }
+
+    fn with_optional_backend(backend: Option<Arc<dyn RegistryStorageBackend>>) -> Self {
         let mut servers = BTreeMap::new();
         let mut diffs = BTreeMap::new();
         let mut suspended_frames = BTreeMap::new();
         let mut tool_groups = BTreeMap::new();
         let mut version_history: HashMap<String, Vec<JsonValue>> = HashMap::new();
 
-        if let Some(store) = &persistent_store {
-            for s in store.list_all_servers() {
+        if let Some(store) = &backend {
+            for s in store.load_all_servers() {
                 let snap = Self::snapshot_server(&s);
                 version_history.insert(s.name.clone(), vec![snap]);
                 servers.insert(s.name.clone(), s);
             }
-            for d in store.list_diffs(false) {
+            for d in store.load_all_diffs() {
                 diffs.insert(d.diff_id.clone(), d);
             }
-            for f in store.list_suspended_frames() {
+            for f in store.load_all_suspended_frames() {
                 suspended_frames.insert(f.execution_id.clone(), f);
             }
-            for g in store.list_all_tool_groups() {
+            for g in store.load_all_tool_groups() {
                 tool_groups.insert(g.slug.clone(), g);
             }
         }
@@ -107,7 +117,36 @@ impl MCPRegistry {
                 tool_groups,
                 version_history,
             })),
-            store: persistent_store,
+            store: backend,
+        }
+    }
+
+    /// Reloads servers, diffs, suspended frames, and tool groups from the backing
+    /// distributed storage engine (invoked on PostgreSQL `LISTEN/NOTIFY` invalidation).
+    pub fn reload_from_backend(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let loaded_servers = store.load_all_servers();
+        let loaded_diffs = store.load_all_diffs();
+        let loaded_frames = store.load_all_suspended_frames();
+        let loaded_groups = store.load_all_tool_groups();
+        let mut guard = self.inner.write().unwrap();
+        guard.servers.clear();
+        for s in loaded_servers {
+            guard.servers.insert(s.name.clone(), s);
+        }
+        guard.diffs.clear();
+        for d in loaded_diffs {
+            guard.diffs.insert(d.diff_id.clone(), d);
+        }
+        guard.suspended_frames.clear();
+        for f in loaded_frames {
+            guard.suspended_frames.insert(f.execution_id.clone(), f);
+        }
+        guard.tool_groups.clear();
+        for g in loaded_groups {
+            guard.tool_groups.insert(g.slug.clone(), g);
         }
     }
 
@@ -959,7 +998,17 @@ impl MCPRegistry {
         approver: &str,
     ) -> Result<SuspendedExecutionFrame, &'static str> {
         if let Some(store) = &self.store {
-            let res = store.consume_frame(execution_id, approver)?;
+            let res = store.consume_frame_cas(execution_id, approver).map_err(|e| {
+                if e.contains("already been consumed") || e.contains("single-use") {
+                    "Approval has already been consumed (single-use violated)"
+                } else if e.contains("separation") || e.contains("Separation") {
+                    "Approval denied: Requester cannot approve their own mutation (separation of duties)"
+                } else if e.contains("expired") {
+                    "Approval frame has expired"
+                } else {
+                    "Approval continuation frame not found or expired"
+                }
+            })?;
             let mut guard = self.inner.write().unwrap();
             guard
                 .suspended_frames
@@ -1004,7 +1053,7 @@ impl MCPRegistry {
 
     pub fn list_suspended_frames(&self) -> Vec<SuspendedExecutionFrame> {
         if let Some(store) = &self.store {
-            return store.list_suspended_frames();
+            return store.load_all_suspended_frames();
         }
         let guard = self.inner.read().unwrap();
         guard

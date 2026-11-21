@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "omni-mcp"
-version = "6.0.0"
+version = "6.5.0"
 rust-version = "1.75.0"
 edition = "2021"
 authors = ["Omni MCP Engineering"]
@@ -26,6 +26,7 @@ storage-postgres = []
 sandbox-wasm = ["dep:wasmi"]
 process-containment = ["dep:omni-process-guard"]
 transport-http = []
+transport-grpc = []
 legacy-sse = []
 testing-mocks = []
 

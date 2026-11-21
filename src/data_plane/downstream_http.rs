@@ -7,7 +7,8 @@
 //! - Bounded retries with backoff
 //! - Feeds errors to circuit breaker (-32030) and Saga compensator (-32034)
 
-use std::collections::HashMap;
+use crate::json::JsonValue;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -69,23 +70,143 @@ impl HttpDownstreamClient {
             None => (rest, "/"),
         };
 
-        let (host, port) = match host_port.find(':') {
-            Some(idx) => {
-                let h = &host_port[..idx];
-                let p = host_port[idx + 1..]
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((h, p)) if !h.contains(']') || host_port.starts_with('[') => {
+                let port_num = p
                     .parse::<u16>()
                     .map_err(|e| format!("Invalid port in '{}': {}", host_port, e))?;
-                (h.to_string(), p)
+                (h.trim_matches(&['[', ']'][..]).to_string(), port_num)
             }
-            None => (host_port.to_string(), default_port),
+            _ => (
+                host_port.trim_matches(&['[', ']'][..]).to_string(),
+                default_port,
+            ),
         };
+        if host.is_empty() {
+            return Err(format!("Missing host in downstream URL '{}'", url));
+        }
 
         Ok((host, port, path.to_string()))
+    }
+
+    /// Interpolates OpenAPI `{param}` path templates with RFC 3986 percent-encoding while
+    /// blocking path-traversal (`..`, `/`, `\`, NUL) injections.
+    /// When `bind_remaining_as_query` is true (e.g. `GET`/`DELETE`), appends unused argument
+    /// keys as URL query parameters and returns `None` for the request body.
+    /// Otherwise returns the remaining unused arguments as a JSON object for the request body.
+    pub fn interpolate_url_template(
+        url_template: &str,
+        args: &JsonValue,
+        bind_remaining_as_query: bool,
+    ) -> Result<(String, Option<JsonValue>), String> {
+        let mut used_keys: HashSet<String> = HashSet::new();
+        let mut out_url = String::with_capacity(url_template.len() + 32);
+        let mut rest = url_template;
+
+        while let Some(open_idx) = rest.find('{') {
+            out_url.push_str(&rest[..open_idx]);
+            let after_open = &rest[open_idx + 1..];
+            if let Some(close_rel) = after_open.find('}') {
+                let param_name = after_open[..close_rel].trim();
+                if !param_name.is_empty() {
+                    let raw_val = args.get(param_name).ok_or_else(|| {
+                        format!(
+                            "Missing required URL template path parameter '{{{}}}'",
+                            param_name
+                        )
+                    })?;
+                    let val_str = json_scalar_to_string(raw_val);
+                    if is_path_traversal(&val_str) {
+                        return Err(format!(
+                            "Path traversal rejected in URL template parameter '{}': '{}'",
+                            param_name, val_str
+                        ));
+                    }
+                    out_url.push_str(&percent_encode_component(&val_str));
+                    used_keys.insert(param_name.to_string());
+                    rest = &after_open[close_rel + 1..];
+                    continue;
+                }
+            }
+            out_url.push('{');
+            rest = after_open;
+        }
+        out_url.push_str(rest);
+
+        let mut remaining_obj = JsonValue::object();
+        let mut query_pairs: Vec<String> = Vec::new();
+        if let Some(entries) = args.as_object() {
+            for (k, v) in entries {
+                if used_keys.contains(k) || k == "_projection" {
+                    continue;
+                }
+                if bind_remaining_as_query {
+                    if !v.is_null() {
+                        let val_str = json_scalar_to_string(v);
+                        query_pairs.push(format!(
+                            "{}={}",
+                            percent_encode_component(k),
+                            percent_encode_component(&val_str)
+                        ));
+                    }
+                } else {
+                    remaining_obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        if bind_remaining_as_query {
+            if !query_pairs.is_empty() {
+                let sep = if out_url.contains('?') { '&' } else { '?' };
+                out_url.push(sep);
+                out_url.push_str(&query_pairs.join("&"));
+            }
+            Ok((out_url, None))
+        } else {
+            Ok((out_url, Some(remaining_obj)))
+        }
+    }
+
+    /// Executes a full REST HTTP/1.1 or HTTPS request (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`)
+    /// with OpenAPI `{param}` URL template interpolation and query/body parameter binding.
+    pub fn request(
+        &self,
+        method: &str,
+        url_template: &str,
+        args: &JsonValue,
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> Result<Vec<u8>, String> {
+        let method_upper = method.trim().to_uppercase();
+        let verb = match method_upper.as_str() {
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" => method_upper.as_str(),
+            "" => "POST",
+            other => return Err(format!("Unsupported HTTP method '{}'", other)),
+        };
+
+        let bind_query = matches!(verb, "GET" | "DELETE" | "HEAD");
+        let (final_url, body_json) =
+            Self::interpolate_url_template(url_template, args, bind_query)?;
+        let payload: Vec<u8> = match body_json {
+            Some(ref j) => j.to_string_compact().into_bytes(),
+            None => Vec::new(),
+        };
+
+        self.send_method_bytes(verb, &final_url, &payload, extra_headers)
     }
 
     /// Executes an HTTP POST request to downstream service
     pub fn post_json(
         &self,
+        endpoint_url: &str,
+        payload: &[u8],
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> Result<Vec<u8>, String> {
+        self.send_method_bytes("POST", endpoint_url, payload, extra_headers)
+    }
+
+    fn send_method_bytes(
+        &self,
+        method: &str,
         endpoint_url: &str,
         payload: &[u8],
         extra_headers: Option<&HashMap<String, String>>,
@@ -100,7 +221,11 @@ impl HttpDownstreamClient {
 
         let is_https = endpoint_url.trim().starts_with("https://");
         let (host, port, path) = Self::parse_url(endpoint_url)?;
-        let addr_key = format!("{}:{}", host, port);
+        let addr_key = if host.contains(':') {
+            format!("[{}]:{}", host, port)
+        } else {
+            format!("{}:{}", host, port)
+        };
 
         let mut last_err = String::new();
         for attempt in 0..=self.max_retries {
@@ -108,18 +233,29 @@ impl HttpDownstreamClient {
                 std::thread::sleep(Duration::from_millis(10 * (1 << attempt)));
             }
 
-            match self.execute_roundtrip(is_https, &addr_key, &host, &path, payload, extra_headers)
-            {
+            match self.execute_roundtrip(
+                method,
+                is_https,
+                &addr_key,
+                &host,
+                &path,
+                payload,
+                extra_headers,
+            ) {
                 Ok(resp_bytes) => return Ok(resp_bytes),
                 Err(e) => {
+                    // Never retry deterministic HTTP 4xx client errors
+                    if e.starts_with("Downstream HTTP 4") {
+                        return Err(e);
+                    }
                     last_err = e;
                 }
             }
         }
 
         Err(format!(
-            "Downstream HTTP call to '{}' failed after {} retries: {}",
-            endpoint_url, self.max_retries, last_err
+            "Downstream HTTP {} call to '{}' failed after {} retries: {}",
+            method, endpoint_url, self.max_retries, last_err
         ))
     }
 
@@ -223,8 +359,10 @@ impl HttpDownstreamClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_roundtrip(
         &self,
+        method: &str,
         is_https: bool,
         addr_key: &str,
         host: &str,
@@ -232,17 +370,23 @@ impl HttpDownstreamClient {
         payload: &[u8],
         extra_headers: Option<&HashMap<String, String>>,
     ) -> Result<Vec<u8>, String> {
+        let has_custom_content_type = extra_headers
+            .is_some_and(|hdrs| hdrs.keys().any(|k| k.eq_ignore_ascii_case("content-type")));
         let mut req_header = format!(
-            "POST {} HTTP/1.1\r\n\
+            "{} {} HTTP/1.1\r\n\
              Host: {}\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
              Connection: {}\r\n",
+            method,
             path,
             host,
-            payload.len(),
             if is_https { "close" } else { "keep-alive" }
         );
+        if !payload.is_empty() || matches!(method, "POST" | "PUT" | "PATCH") {
+            if !has_custom_content_type {
+                req_header.push_str("Content-Type: application/json\r\n");
+            }
+            req_header.push_str(&format!("Content-Length: {}\r\n", payload.len()));
+        }
 
         if let Some(hdrs) = extra_headers {
             for (k, v) in hdrs {
@@ -250,7 +394,11 @@ impl HttpDownstreamClient {
                     && !k.eq_ignore_ascii_case("content-length")
                     && !k.eq_ignore_ascii_case("connection")
                 {
-                    req_header.push_str(&format!("{}: {}\r\n", k, v));
+                    let clean_k = k.replace(['\r', '\n'], "");
+                    let clean_v = v.replace(['\r', '\n'], "");
+                    if !clean_k.is_empty() {
+                        req_header.push_str(&format!("{}: {}\r\n", clean_k, clean_v));
+                    }
                 }
             }
         }
@@ -403,4 +551,48 @@ impl HttpDownstreamClient {
 
         Ok((body, keep_alive))
     }
+}
+
+fn json_scalar_to_string(v: &JsonValue) -> String {
+    match v {
+        JsonValue::Str(s) => s.clone(),
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Int(i) => i.to_string(),
+        JsonValue::Float(n) => {
+            if n.fract() == 0.0 && n.abs() < 1e15 {
+                format!("{}", *n as i64)
+            } else {
+                n.to_string()
+            }
+        }
+        JsonValue::Null => String::new(),
+        other => other.to_string_compact(),
+    }
+}
+
+fn is_path_traversal(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    s.contains("..")
+        || s.contains('/')
+        || s.contains('\\')
+        || s.contains('\0')
+        || lower.contains("%2e%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+}
+
+fn percent_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{:02X}", b));
+            }
+        }
+    }
+    out
 }

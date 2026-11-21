@@ -11,6 +11,7 @@ use crate::data_plane::codemode::{
 };
 use crate::data_plane::dst::{DeterministicSimulator, FaultInjectionConfig, SimulationReport};
 use crate::data_plane::projection::ResponseProjectionEngine;
+use crate::data_plane::rate_limiter::TenantQuotaTracker;
 use crate::data_plane::security::{PIIRedactor, SecurityCharterEngine};
 use crate::data_plane::translators::ProtocolTranslator;
 use crate::json::JsonValue;
@@ -20,8 +21,8 @@ use crate::models::{
     parse_traceparent, validate_tool_schema, CompletedMutationRecord, FeatureStatus,
     RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse, SagaCompensationRecord, ServerRecord,
     SuspendedExecutionFrame, ToolStatus, TraceSpan, APPROVAL_INVALID, CIRCUIT_OPEN, INTERNAL_ERROR,
-    INVALID_PARAMS, METHOD_NOT_FOUND, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED, TOOL_DISABLED,
-    UNAUTHORIZED,
+    INVALID_PARAMS, METHOD_NOT_FOUND, RATE_LIMITED, SAGA_COMPENSATED, SCHEMA_PREFLIGHT_FAILED,
+    TOOL_DISABLED, UNAUTHORIZED,
 };
 use crate::storage::audit_log::sha256_hex;
 use crate::storage::MerkleAuditStore;
@@ -42,8 +43,10 @@ pub struct MCPProxyGateway {
     pub translator: ProtocolTranslator,
     pub circuit_breaker: CircuitBreakerRegistry,
     pub semantic_cache: SemanticResponseCache,
+    pub quota_tracker: TenantQuotaTracker,
     pub audit_store: Option<Arc<MerkleAuditStore>>,
     pub traces: Option<Arc<RwLock<VecDeque<TraceSpan>>>>,
+    pub otlp_worker: Option<Arc<crate::telemetry::OtlpBatchWorker>>,
 }
 
 impl MCPProxyGateway {
@@ -57,8 +60,10 @@ impl MCPProxyGateway {
             translator: trans,
             circuit_breaker: CircuitBreakerRegistry::default(),
             semantic_cache: SemanticResponseCache::new(0.0),
+            quota_tracker: TenantQuotaTracker::default(),
             audit_store: None,
             traces: None,
+            otlp_worker: None,
         }
     }
 
@@ -76,9 +81,16 @@ impl MCPProxyGateway {
             translator,
             circuit_breaker,
             semantic_cache,
+            quota_tracker: TenantQuotaTracker::default(),
             audit_store: None,
             traces: None,
+            otlp_worker: None,
         }
+    }
+
+    pub fn with_otlp_worker(mut self, worker: Arc<crate::telemetry::OtlpBatchWorker>) -> Self {
+        self.otlp_worker = Some(worker);
+        self
     }
 
     pub fn with_upstream(
@@ -353,9 +365,14 @@ impl MCPProxyGateway {
             }
         }
 
-        // 2. Security Charter & ABAC Policy Check
-        let (is_allowed, reason) =
-            SecurityCharterEngine::evaluate_access(server, tool, caller_actor, user_token);
+        // 2. Security Charter, ABAC & Argument-Level Guardrails Policy Check (v6.5.0)
+        let (is_allowed, reason) = SecurityCharterEngine::evaluate_access_with_args(
+            server,
+            tool,
+            caller_actor,
+            user_token,
+            &arguments,
+        );
         if !is_allowed {
             return RPCResponse::err(
                 request.id.clone(),
@@ -364,6 +381,32 @@ impl MCPProxyGateway {
                     reason.unwrap_or_else(|| "Unauthorized by Charter Policy.".to_string()),
                 ),
             );
+        }
+
+        // 2.5. Per-Tenant / Principal Sliding-Window Quota Enforcement (v6.5.0)
+        let quota_policy = tool
+            .charter_policy
+            .as_ref()
+            .and_then(|p| p.tenant_quota.as_ref())
+            .or(server.charter_policy.tenant_quota.as_ref());
+        if let Some(qpol) = quota_policy {
+            let tenant_key = user_token.filter(|t| !t.is_empty()).unwrap_or(caller_actor);
+            if let Err((retry_after, msg)) =
+                self.quota_tracker
+                    .check_and_consume(tenant_key, 1, 0, 0, Some(qpol))
+            {
+                return RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::with_data(
+                        RATE_LIMITED,
+                        msg,
+                        json!({
+                            "retry_after_sec": retry_after as i64,
+                            "Retry-After": retry_after.to_string(),
+                        }),
+                    ),
+                );
+            }
         }
 
         // 3. Check Circuit Breaker for Downstream Service
@@ -411,6 +454,7 @@ impl MCPProxyGateway {
         // Prepare downstream propagation headers
         let mut downstream_headers = HashMap::new();
         downstream_headers.insert("traceparent".to_string(), downstream_traceparent);
+        downstream_headers.insert("x-omni-caller-actor".to_string(), caller_actor.to_string());
         if is_canary {
             downstream_headers.insert("x-omni-canary".to_string(), "true".to_string());
             downstream_headers.insert("x-omni-version".to_string(), effective_version.to_string());
@@ -434,7 +478,11 @@ impl MCPProxyGateway {
                 Ok(res) => {
                     self.circuit_breaker.record_success(&server.name);
                     if tool.idempotent_cacheable && !is_canary {
-                        self.semantic_cache.put(cache_key, res.clone());
+                        self.semantic_cache.put_with_ttl(
+                            cache_key,
+                            res.clone(),
+                            tool.cache_ttl_sec,
+                        );
                     }
                     (res, false)
                 }
@@ -508,6 +556,28 @@ impl MCPProxyGateway {
         } else {
             projected_result
         };
+
+        // 8.5. Enforce Per-Tenant Hourly Egress Bytes Quota (v6.5.0)
+        if let Some(qpol) = quota_policy {
+            let egress_bytes = final_result.to_string_compact().len() as u64;
+            let tenant_key = user_token.filter(|t| !t.is_empty()).unwrap_or(caller_actor);
+            if let Err((retry_after, msg)) =
+                self.quota_tracker
+                    .check_and_consume(tenant_key, 0, 0, egress_bytes, Some(qpol))
+            {
+                return RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::with_data(
+                        RATE_LIMITED,
+                        msg,
+                        json!({
+                            "retry_after_sec": retry_after as i64,
+                            "Retry-After": retry_after.to_string(),
+                        }),
+                    ),
+                );
+            }
+        }
 
         let elapsed_us = t0.elapsed().as_micros() as u64;
 
@@ -609,8 +679,8 @@ impl MCPProxyGateway {
             );
         }
 
-        // Record OpenTelemetry Distributed Trace Span
-        if let Some(traces_lock) = &self.traces {
+        // Record OpenTelemetry Distributed Trace Span (local ring buffer and/or live OTLP worker)
+        if self.traces.is_some() || self.otlp_worker.is_some() {
             let mut attrs = BTreeMap::new();
             attrs.insert(
                 "rpc.system".to_string(),
@@ -645,11 +715,17 @@ impl MCPProxyGateway {
                 attributes: attrs,
             };
 
-            if let Ok(mut g) = traces_lock.write() {
-                if g.len() >= 5000 {
-                    g.pop_front();
+            if let Some(ref worker) = self.otlp_worker {
+                worker.record_span(span.clone());
+            }
+
+            if let Some(traces_lock) = &self.traces {
+                if let Ok(mut g) = traces_lock.write() {
+                    if g.len() >= 5000 {
+                        g.pop_front();
+                    }
+                    g.push_back(span);
                 }
-                g.push_back(span);
             }
         }
     }
@@ -1141,6 +1217,25 @@ impl MCPProxyGateway {
 
         // Apply PII & Secret Redaction on the final sandbox result
         output.result = PIIRedactor::redact_payload(&output.result);
+
+        // Enforce Per-Tenant Hourly Code Mode Fuel & Egress Quotas (v6.5.0)
+        {
+            let tenant_key = user_token.filter(|t| !t.is_empty()).unwrap_or(caller_actor);
+            let egress_bytes = output.output_bytes_returned as u64;
+            if let Err((retry_after, msg)) = self.quota_tracker.check_and_consume(
+                tenant_key,
+                0,
+                output.ops_consumed,
+                egress_bytes,
+                None,
+            ) {
+                output.status = "ERROR".to_string();
+                output.feature_status = FeatureStatus::Error;
+                output.error_code = Some(RATE_LIMITED);
+                output.result = json!({"retry_after_sec": retry_after as i64});
+                output.error = Some(msg);
+            }
+        }
 
         let total_us = output.boot_parse_us + output.eval_us;
         self.record_telemetry_and_audit(

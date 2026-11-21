@@ -5,10 +5,11 @@
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
-    ExternalPromptRecord, ExternalResourceRecord, ProtocolType, SchemaSource, ToolRecord,
-    ToolStatus,
+    ExternalPromptRecord, ExternalResourceRecord, ProtocolType, SamplingElicitationPolicy,
+    SchemaSource, ToolRecord, ToolStatus, UNAUTHORIZED,
 };
 use crate::upstream::secrets::resolve_secret_ref;
+use crate::upstream::UpstreamCallbackHub;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -112,6 +113,9 @@ pub struct StdioUpstreamSession {
     pub call_timeout_ms: u64,
     process: Mutex<Option<StdioProcess>>,
     stderr_buffer: Arc<Mutex<VecDeque<String>>>,
+    progress_notifications: Arc<Mutex<Vec<JsonValue>>>,
+    callback_hub: Option<Arc<UpstreamCallbackHub>>,
+    sampling_policy: SamplingElicitationPolicy,
     last_initialize: Mutex<Option<f64>>,
     next_request_id: AtomicU64,
 }
@@ -136,8 +140,82 @@ impl StdioUpstreamSession {
             call_timeout_ms,
             process: Mutex::new(None),
             stderr_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_STDERR_LINES))),
+            progress_notifications: Arc::new(Mutex::new(Vec::new())),
+            callback_hub: None,
+            sampling_policy: SamplingElicitationPolicy::Deny,
             last_initialize: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
+        }
+    }
+
+    pub fn with_bidirectional_hub(
+        mut self,
+        hub: Arc<UpstreamCallbackHub>,
+        policy: SamplingElicitationPolicy,
+    ) -> Self {
+        self.callback_hub = Some(hub);
+        self.sampling_policy = policy;
+        self
+    }
+
+    pub fn drain_progress_notifications(&self) -> Vec<JsonValue> {
+        let mut guard = self.progress_notifications.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Sends `notifications/cancelled` to the upstream stdio subprocess and immediately
+    /// aborts the matching in-flight waiting channel (or all in-flight channels if `request_id == 0`).
+    pub fn cancel_request(&self, request_id: u64, reason: Option<&str>) -> bool {
+        let guard = self.process.lock().unwrap();
+        let Some(ref proc) = *guard else {
+            return false;
+        };
+        let cancel_msg = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {
+                "requestId": request_id as i64,
+                "reason": reason.unwrap_or("Cancelled by client")
+            }
+        });
+        let mut wire = cancel_msg.to_string_compact();
+        wire.push('\n');
+        if let Ok(mut sin) = proc.stdin.lock() {
+            let _ = sin.write_all(wire.as_bytes());
+            let _ = sin.flush();
+        }
+        let mut pending = proc.pending.lock().unwrap();
+        let cancel_err = json!({
+            "jsonrpc": "2.0",
+            "id": request_id as i64,
+            "error": {
+                "code": crate::models::TIMEOUT,
+                "message": format!("Request cancelled: {}", reason.unwrap_or("Cancelled by client"))
+            }
+        })
+        .to_string_compact();
+        if request_id == 0 {
+            let drained: Vec<(u64, Sender<String>)> =
+                std::mem::take(&mut *pending).into_iter().collect();
+            let had_any = !drained.is_empty();
+            for (_, tx) in drained {
+                let _ = tx.send(cancel_err.clone());
+            }
+            had_any
+        } else if let Some(tx) = pending.remove(&request_id) {
+            let _ = tx.send(cancel_err);
+            true
+        } else if pending.len() == 1 {
+            // Only fallback-abort when strictly a single in-flight request exists (external vs internal id)
+            if let Some((&only_id, _)) = pending.iter().next() {
+                if let Some(tx) = pending.remove(&only_id) {
+                    let _ = tx.send(cancel_err);
+                    return true;
+                }
+            }
+            false
+        } else {
+            false
         }
     }
 
@@ -286,11 +364,19 @@ impl StdioUpstreamSession {
             }
         });
 
-        // Detached background thread: Stdout reader with ID-multiplexing & server-to-client request rejection
+        // Detached background thread: Stdout reader with ID-multiplexing, bidirectional reverse
+        // server-to-client request interception (`sampling/createMessage`, `elicitation/create`,
+        // `roots/list`), and streaming `notifications/progress` forwarding (v6.5.0).
         let pending: Arc<Mutex<BTreeMap<u64, Sender<String>>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let pending_reader = pending.clone();
         let stdin_clone = stdin.clone();
+        let hub_clone = self.callback_hub.clone();
+        let progress_buf_clone = self.progress_notifications.clone();
+        let server_name_clone = self.server_name.clone();
+        let default_policy = self.sampling_policy.clone();
+        let reverse_timeout_ms = self.call_timeout_ms;
+
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line_res in reader.lines() {
@@ -302,24 +388,78 @@ impl StdioUpstreamSession {
                         }
 
                         if let Ok(json_val) = JsonValue::parse(trimmed) {
-                            let has_method = json_val.get("method").is_some();
+                            let method_opt = json_val.get("method").and_then(|m| m.as_str());
                             let req_id_opt = json_val.get("id");
 
-                            if has_method {
+                            if let Some(method_name) = method_opt {
                                 if let Some(id_val) = req_id_opt {
-                                    let rejection = json!({
-                                        "jsonrpc": "2.0",
-                                        "id": id_val.clone(),
-                                        "error": {
-                                            "code": -32601,
-                                            "message": "Method not found"
+                                    let id_owned = id_val.clone();
+                                    let method_owned = method_name.to_string();
+                                    let params_owned = json_val
+                                        .get("params")
+                                        .cloned()
+                                        .unwrap_or_else(JsonValue::object);
+                                    let is_governed_reverse = matches!(
+                                        method_name,
+                                        "sampling/createMessage"
+                                            | "elicitation/create"
+                                            | "roots/list"
+                                    );
+
+                                    if is_governed_reverse {
+                                        let stdin_for_reply = stdin_clone.clone();
+                                        let hub_for_reply = hub_clone.clone();
+                                        let srv_for_reply = server_name_clone.clone();
+                                        let policy_for_reply = default_policy.clone();
+                                        thread::spawn(move || {
+                                            let reply = if let Some(ref hub) = hub_for_reply {
+                                                hub.handle_reverse_request(
+                                                    &srv_for_reply,
+                                                    id_owned,
+                                                    &method_owned,
+                                                    params_owned,
+                                                    policy_for_reply,
+                                                    reverse_timeout_ms,
+                                                )
+                                            } else {
+                                                json!({
+                                                    "jsonrpc": "2.0",
+                                                    "id": id_owned,
+                                                    "error": {
+                                                        "code": UNAUTHORIZED,
+                                                        "message": "Sampling/Elicitation denied by gateway policy"
+                                                    }
+                                                })
+                                            };
+                                            let mut wire = reply.to_string_compact();
+                                            wire.push('\n');
+                                            if let Ok(mut sin) = stdin_for_reply.lock() {
+                                                let _ = sin.write_all(wire.as_bytes());
+                                                let _ = sin.flush();
+                                            }
+                                        });
+                                    } else {
+                                        let rejection = json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id_owned,
+                                            "error": {
+                                                "code": -32601,
+                                                "message": "Method not found"
+                                            }
+                                        });
+                                        let mut rej_str = rejection.to_string_compact();
+                                        rej_str.push('\n');
+                                        if let Ok(mut sin) = stdin_clone.lock() {
+                                            let _ = sin.write_all(rej_str.as_bytes());
+                                            let _ = sin.flush();
                                         }
-                                    });
-                                    let mut rej_str = rejection.to_string_compact();
-                                    rej_str.push('\n');
-                                    if let Ok(mut sin) = stdin_clone.lock() {
-                                        let _ = sin.write_all(rej_str.as_bytes());
-                                        let _ = sin.flush();
+                                    }
+                                } else if method_name == "notifications/progress" {
+                                    if let Ok(mut pbuf) = progress_buf_clone.lock() {
+                                        pbuf.push(json_val.clone());
+                                    }
+                                    if let Some(ref hub) = hub_clone {
+                                        hub.emit_progress(&server_name_clone, &json_val);
                                     }
                                 }
                                 continue;

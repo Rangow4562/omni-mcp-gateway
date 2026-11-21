@@ -34,9 +34,26 @@ fn main() {
             process::exit(omni_mcp::server::run_stdio_server(server_name));
         }
         match first.as_str() {
-            "mcp" | "aifx" | "omni" | "list" | "search" | "call" | "bench" | "codemode"
-            | "exec" | "types" | "resume" | "simulate" | "dst" | "bench-codemode"
-            | "bench-sandbox" | "import" | "migrate" => {
+            "mcp"
+            | "aifx"
+            | "omni"
+            | "list"
+            | "search"
+            | "call"
+            | "bench"
+            | "codemode"
+            | "exec"
+            | "types"
+            | "resume"
+            | "simulate"
+            | "dst"
+            | "bench-codemode"
+            | "bench-sandbox"
+            | "import"
+            | "migrate"
+            | "wasm"
+            | "mock-echo-mcp"
+            | "mock-bidirectional-mcp" => {
                 process::exit(run_aifx_cli(&args));
             }
             _ => {}
@@ -50,8 +67,8 @@ fn main() {
     }
     let host = cfg.host.clone();
     let port = args
-        .first()
-        .and_then(|s| s.parse::<u16>().ok())
+        .iter()
+        .find_map(|s| s.parse::<u16>().ok())
         .unwrap_or(cfg.port);
 
     if let Err(err) = cfg.validate_bind(&host) {

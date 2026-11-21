@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "OmniMCP Architecture",
+    "output": "omnimcp-architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "request-path",
+        "label": "Primary request path",
+        "focus": [
+          "clients",
+          "server",
+          "security",
+          "gateway",
+          "upstream",
+          "fleet"
+        ],
+        "note": "Follow one governed request from an MCP client to the external fleet."
+      },
+      {
+        "id": "control-plane",
+        "label": "Control plane",
+        "focus": [
+          "registry",
+          "audit",
+          "gateway"
+        ],
+        "note": "Registry state is WAL-backed and syncs into the CoW routing table."
+      },
+      {
+        "id": "codemode",
+        "label": "Code Mode",
+        "focus": [
+          "gateway",
+          "codemode",
+          "services"
+        ],
+        "note": "Scripts run in the in-process VM and fan out to translated services."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "Fleet & Studio UI",
+      "sublabel": "React · ui/dist",
+      "pos": [
+        15,
+        80
+      ],
+      "size": [
+        150,
+        56
+      ]
+    },
+    {
+      "id": "clients",
+      "type": "external",
+      "label": "MCP Clients",
+      "sublabel": "Claude · Cursor · IDEs",
+      "pos": [
+        15,
+        210
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "server",
+      "type": "backend",
+      "label": "Gateway Server",
+      "sublabel": "HTTP · stdio · JSON-RPC 2.0",
+      "pos": [
+        215,
+        235
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "omni-gateway"
+    },
+    {
+      "id": "security",
+      "type": "security",
+      "label": "Security Charter",
+      "sublabel": "ABAC · rate limit · PII redaction",
+      "pos": [
+        410,
+        235
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "DFA"
+    },
+    {
+      "id": "gateway",
+      "type": "backend",
+      "label": "MCP Proxy Gateway",
+      "sublabel": "CoW routing · cache · breaker",
+      "pos": [
+        605,
+        235
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "canary"
+    },
+    {
+      "id": "services",
+      "type": "external",
+      "label": "Enterprise Services",
+      "sublabel": "HTTP · gRPC · Thrift",
+      "pos": [
+        600,
+        80
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "codemode",
+      "type": "backend",
+      "label": "Code Mode",
+      "sublabel": "AST VM · wasm sandbox",
+      "pos": [
+        800,
+        80
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "wasmi"
+    },
+    {
+      "id": "upstream",
+      "type": "backend",
+      "label": "Upstream Clients",
+      "sublabel": "stdio · Streamable HTTP",
+      "pos": [
+        800,
+        235
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "fleet",
+      "type": "external",
+      "label": "External MCP Fleet",
+      "sublabel": "guarded subprocesses · rustls",
+      "pos": [
+        800,
+        370
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "audit",
+      "type": "database",
+      "label": "Merkle Audit Log",
+      "sublabel": "SHA-256 chain",
+      "pos": [
+        410,
+        370
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "registry",
+      "type": "backend",
+      "label": "Control Plane",
+      "sublabel": "MCPRegistry · IDL crawler · WAL",
+      "pos": [
+        605,
+        370
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "BM25"
+    }
+  ],
+  "connections": [
+    {
+      "id": "clients-server",
+      "from": "clients",
+      "to": "server",
+      "label": "JSON-RPC",
+      "variant": "emphasis",
+      "labelSegment": 1
+    },
+    {
+      "id": "ui-server",
+      "from": "ui",
+      "to": "server",
+      "label": "REST /api/v1",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "server-security",
+      "from": "server",
+      "to": "security",
+      "label": "enforce"
+    },
+    {
+      "id": "security-gateway",
+      "from": "security",
+      "to": "gateway"
+    },
+    {
+      "id": "gateway-upstream",
+      "from": "gateway",
+      "to": "upstream",
+      "label": "proxy"
+    },
+    {
+      "id": "upstream-fleet",
+      "from": "upstream",
+      "to": "fleet",
+      "label": "connect",
+      "labelDy": 24
+    },
+    {
+      "id": "gateway-codemode",
+      "from": "gateway",
+      "to": "codemode",
+      "label": "exec scripts",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [
+        [
+          680,
+          190
+        ],
+        [
+          875,
+          190
+        ]
+      ]
+    },
+    {
+      "id": "codemode-services",
+      "from": "codemode",
+      "to": "services",
+      "label": "invoke"
+    },
+    {
+      "id": "registry-gateway",
+      "from": "registry",
+      "to": "gateway",
+      "label": "routing sync"
+    },
+    {
+      "id": "server-audit",
+      "from": "server",
+      "to": "audit",
+      "label": "audit trail"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Entry points & governance",
+      "items": [
+        "omni-gateway serves HTTP :8080 or runs behind --stdio; omni / aifx CLIs link the same lib",
+        "React Fleet & Studio UI served from ui/dist with OIDC/JWKS, role-scoped access",
+        "ABAC charter policies, 16-shard rate limiting, DFA PII redaction, Merkle-chained audit"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Data & control plane",
+      "items": [
+        "CoW Arc routing table with canary routing, fallback, circuit breakers",
+        "In-memory config cache plus semantic TTL response cache",
+        "MCPRegistry diff / approval / rollback backed by a durable WAL store",
+        "IDL AutoCrawler turns Protobuf / Thrift / OpenAPI into MCP tools"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Code Mode & external fleet",
+      "items": [
+        "In-process AST VM (~100 µs) with optional wasmi sandbox",
+        "SSA auto-parallelization, columnar pushdown, resumable continuations",
+        "HITL approval gates with LIFO Saga rollback",
+        "stdio subprocesses under omni-process-guard; secrets from {env:} / {file:} only"
+      ]
+    }
+  ]
+}

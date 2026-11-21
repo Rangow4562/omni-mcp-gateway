@@ -572,17 +572,51 @@ impl CodeModeTypeGenerator {
         }
 
         let bm25_scores = Self::bm25_score_corpus(intent, &corpus_fields);
-        let mut candidates = Vec::new();
-        for ((srv, tool), score) in active_entries.into_iter().zip(bm25_scores) {
-            if score > 0.0 {
-                candidates.push((score, srv, tool));
+        let hybrid_docs: Vec<crate::data_plane::HybridDocument> = active_entries
+            .iter()
+            .zip(bm25_scores.iter())
+            .enumerate()
+            .map(|(idx, ((srv, tool), &bm25))| {
+                let text = corpus_fields[idx]
+                    .iter()
+                    .map(|(_, f)| f.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                crate::data_plane::HybridDocument {
+                    id: format!("{}::{}", srv.name, tool.name),
+                    text,
+                    bm25_score: bm25,
+                }
+            })
+            .collect();
+        let embedding_url = crate::config::get_config().embedding_url;
+        let ranked = crate::data_plane::rank_hybrid_rrf(
+            intent,
+            &hybrid_docs,
+            1.0,
+            1.0,
+            0.22,
+            embedding_url.as_deref(),
+        );
+        let mut lookup: std::collections::HashMap<
+            String,
+            (ServerRecord, crate::models::ToolRecord),
+        > = active_entries
+            .into_iter()
+            .map(|(srv, tool)| (format!("{}::{}", srv.name, tool.name), (srv, tool)))
+            .collect();
+
+        let mut selected: Vec<(f64, ServerRecord, crate::models::ToolRecord)> = Vec::new();
+        for item in ranked.into_iter().take(top_k) {
+            if let Some((srv, tool)) = lookup.remove(&item.id) {
+                let effective_score = if item.bm25_score > 0.0 {
+                    item.bm25_score
+                } else {
+                    item.vector_similarity * 5.0
+                };
+                selected.push((effective_score, srv, tool));
             }
         }
-
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        let selected: Vec<(f64, ServerRecord, crate::models::ToolRecord)> =
-            candidates.into_iter().take(top_k).collect();
 
         let top_score = selected.first().map(|c| c.0).unwrap_or(0.0);
         let total_selected_score: f64 = selected.iter().map(|c| c.0).sum();

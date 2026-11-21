@@ -6,16 +6,17 @@
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
-    ExternalPromptRecord, ExternalResourceRecord, ProtocolType, SchemaSource, SessionMode,
-    ToolRecord, ToolStatus,
+    ExternalPromptRecord, ExternalResourceRecord, ProtocolType, SamplingElicitationPolicy,
+    SchemaSource, SessionMode, ToolRecord, ToolStatus, UNAUTHORIZED,
 };
 use crate::upstream::secrets::resolve_secret_ref;
+use crate::upstream::UpstreamCallbackHub;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const MAX_PAGINATION_PAGES: usize = 50;
@@ -191,6 +192,8 @@ pub struct HttpUpstreamSession {
     last_initialize: Mutex<Option<f64>>,
     retry_ms: Mutex<Option<u64>>,
     progress_notifications: Mutex<Vec<JsonValue>>,
+    callback_hub: Option<Arc<UpstreamCallbackHub>>,
+    sampling_policy: SamplingElicitationPolicy,
     next_request_id: AtomicU64,
 }
 
@@ -220,8 +223,34 @@ impl HttpUpstreamSession {
             last_initialize: Mutex::new(None),
             retry_ms: Mutex::new(None),
             progress_notifications: Mutex::new(Vec::new()),
+            callback_hub: None,
+            sampling_policy: SamplingElicitationPolicy::Deny,
             next_request_id: AtomicU64::new(1),
         }
+    }
+
+    pub fn with_bidirectional_hub(
+        mut self,
+        hub: Arc<UpstreamCallbackHub>,
+        policy: SamplingElicitationPolicy,
+    ) -> Self {
+        self.callback_hub = Some(hub);
+        self.sampling_policy = policy;
+        self
+    }
+
+    /// Sends a `notifications/cancelled` notification to the upstream Streamable HTTP MCP server.
+    pub fn cancel_request(&self, request_id: u64, reason: Option<&str>) -> Result<(), String> {
+        let cancel_msg = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {
+                "requestId": request_id as i64,
+                "reason": reason.unwrap_or("Cancelled by client")
+            }
+        });
+        let _ = self.send_raw_http(&cancel_msg.to_string_compact().into_bytes())?;
+        Ok(())
     }
 
     pub fn get_retry_ms(&self) -> Option<u64> {
@@ -258,11 +287,13 @@ impl HttpUpstreamSession {
             validate_upstream_url_and_resolve(&self.url, self.allow_loopback)?;
 
         // Resolve bearer token if present, or fall back to encrypted OAuth 2.1 token store
+        // (auto-refreshing if the stored token record has expired and carries a refresh_token).
         let bearer_val = if let Some(ref b_ref) = self.bearer_ref {
             Some(resolve_secret_ref(b_ref, &self.secrets_dir)?)
         } else {
-            UpstreamOAuthTokenStore::new(&self.secrets_dir, None)
-                .load_token(&self.server_name)
+            let store = UpstreamOAuthTokenStore::new(&self.secrets_dir, None);
+            store
+                .load_fresh_access_token(&self.server_name, self.allow_loopback)
                 .ok()
         };
 
@@ -559,14 +590,55 @@ impl HttpUpstreamSession {
                 *self.retry_ms.lock().unwrap() = Some(ms);
             }
 
-            // Capture MCP notifications/progress frames for downstream forwarding
+            // Capture MCP notifications/progress frames and dispatch reverse server-initiated
+            // requests (`sampling/createMessage`, `elicitation/create`, `roots/list`) (v6.5.0).
             let mut progress_buf = self.progress_notifications.lock().unwrap();
+            let mut reverse_requests: Vec<(JsonValue, String, JsonValue)> = Vec::new();
             for msg in &parsed_msgs {
-                if msg.get("method").and_then(|m| m.as_str()) == Some("notifications/progress") {
-                    progress_buf.push(msg.clone());
+                if let Some(method_name) = msg.get("method").and_then(|m| m.as_str()) {
+                    if method_name == "notifications/progress" {
+                        progress_buf.push(msg.clone());
+                        if let Some(ref hub) = self.callback_hub {
+                            hub.emit_progress(&self.server_name, msg);
+                        }
+                    } else if let Some(rev_id) = msg.get("id") {
+                        if matches!(
+                            method_name,
+                            "sampling/createMessage" | "elicitation/create" | "roots/list"
+                        ) {
+                            reverse_requests.push((
+                                rev_id.clone(),
+                                method_name.to_string(),
+                                msg.get("params").cloned().unwrap_or_else(JsonValue::object),
+                            ));
+                        }
+                    }
                 }
             }
             drop(progress_buf);
+
+            for (rev_id, rev_method, rev_params) in reverse_requests {
+                let reply = if let Some(ref hub) = self.callback_hub {
+                    hub.handle_reverse_request(
+                        &self.server_name,
+                        rev_id,
+                        &rev_method,
+                        rev_params,
+                        self.sampling_policy.clone(),
+                        self.call_timeout_ms,
+                    )
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": rev_id,
+                        "error": {
+                            "code": UNAUTHORIZED,
+                            "message": "Sampling/Elicitation denied by gateway policy"
+                        }
+                    })
+                };
+                let _ = self.send_raw_http(&reply.to_string_compact().into_bytes());
+            }
 
             if let Some(eid) = expected_id {
                 if let Some(matched) = parsed_msgs
@@ -648,6 +720,20 @@ impl HttpUpstreamSession {
 
         let body = req.to_string_compact().into_bytes();
         let (mut status, mut headers, mut resp_bytes) = self.send_raw_http(&body)?;
+
+        // Automatic OAuth 2.1 refresh_token rotation on HTTP 401 Unauthorized (retry once) (v6.5.0)
+        if status == 401 && self.bearer_ref.is_none() {
+            let store = UpstreamOAuthTokenStore::new(&self.secrets_dir, None);
+            if store
+                .refresh_access_token(&self.server_name, self.allow_loopback)
+                .is_ok()
+            {
+                let retry = self.send_raw_http(&body)?;
+                status = retry.0;
+                headers = retry.1;
+                resp_bytes = retry.2;
+            }
+        }
 
         // Transparent session-expiry recovery:
         // If HTTP 404 in Stateful mode, re-initialize once to get a fresh session ID and retry
@@ -897,8 +983,70 @@ fn base64_decode_std(input: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Encrypted OAuth 2.1 + PKCE token store for hosted upstream SaaS MCP servers (v6.0.0).
-/// Stores encrypted tokens keyed by server name outside `ServerRecord` JSON/WAL.
+/// Full OAuth 2.1 token record sealed in `UpstreamOAuthTokenStore` (v6.5.0).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OAuthTokenRecord {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<f64>,
+    pub token_endpoint: Option<String>,
+    pub client_id: Option<String>,
+    pub scope: Option<String>,
+}
+
+impl OAuthTokenRecord {
+    pub fn from_access_token(access_token: impl Into<String>) -> Self {
+        Self {
+            access_token: access_token.into(),
+            refresh_token: None,
+            expires_at: None,
+            token_endpoint: None,
+            client_id: None,
+            scope: None,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|exp| now_epoch_secs() >= (exp - 15.0))
+    }
+
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "access_token": self.access_token.clone(),
+            "refresh_token": self.refresh_token.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "expires_at": self.expires_at.map(JsonValue::from).unwrap_or(JsonValue::Null),
+            "token_endpoint": self.token_endpoint.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "client_id": self.client_id.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "scope": self.scope.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let access_token = v.get("access_token")?.as_str()?.to_string();
+        Some(Self {
+            access_token,
+            refresh_token: v
+                .get("refresh_token")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+            expires_at: v.get("expires_at").and_then(|x| x.as_f64()),
+            token_endpoint: v
+                .get("token_endpoint")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+            client_id: v
+                .get("client_id")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+            scope: v.get("scope").and_then(|x| x.as_str()).map(String::from),
+        })
+    }
+}
+
+/// Encrypted OAuth 2.1 + PKCE token store for hosted upstream SaaS MCP servers (v6.0.0 / v6.5.0).
+/// Uses `ring::aead::CHACHA20_POLY1305` AEAD (`version: 2`) when `tls-rustls` is enabled,
+/// with transparent read-fallback for `v6.0.0` SHA-256 CTR+HMAC envelopes.
 pub struct UpstreamOAuthTokenStore {
     store_dir: PathBuf,
     master_key: [u8; 32],
@@ -987,31 +1135,28 @@ impl UpstreamOAuthTokenStore {
         )
     }
 
-    pub fn save_token(&self, server_name: &str, access_token: &str) -> Result<(), String> {
-        let _ = std::fs::create_dir_all(&self.store_dir);
-        let mut nonce = [0u8; 16];
-        crate::models::gather_entropy(&mut nonce);
-        let mut ciphertext = Vec::with_capacity(access_token.len());
-        for (counter, chunk) in access_token.as_bytes().chunks(32).enumerate() {
-            let mut block_in = Vec::with_capacity(68);
-            block_in.extend_from_slice(&self.master_key);
-            block_in.extend_from_slice(&nonce);
-            block_in.extend_from_slice(&(counter as u32).to_le_bytes());
-            let keystream = crate::storage::sha256(&block_in);
-            for (i, b) in chunk.iter().enumerate() {
-                ciphertext.push(b ^ keystream[i]);
-            }
+    /// Build a `application/x-www-form-urlencoded` body for OAuth 2.1 `refresh_token` rotation.
+    pub fn build_refresh_token_body(
+        client_id: Option<&str>,
+        refresh_token: &str,
+        scope: Option<&str>,
+    ) -> String {
+        let mut body = format!(
+            "grant_type=refresh_token&refresh_token={}",
+            url_encode_component(refresh_token),
+        );
+        if let Some(cid) = client_id.filter(|s| !s.is_empty()) {
+            body.push_str("&client_id=");
+            body.push_str(&url_encode_component(cid));
         }
-        let mut blob = Vec::with_capacity(nonce.len() + ciphertext.len());
-        blob.extend_from_slice(&nonce);
-        blob.extend_from_slice(&ciphertext);
-        let mac = crate::storage::audit_log::hmac_sha256_hex(&self.master_key, &blob);
-        let payload = json!({
-            "server": server_name,
-            "nonce_hex": hex_encode_bytes(&nonce),
-            "ciphertext_hex": hex_encode_bytes(&ciphertext),
-            "hmac_sha256": mac,
-        });
+        if let Some(s) = scope.filter(|s| !s.is_empty()) {
+            body.push_str("&scope=");
+            body.push_str(&url_encode_component(s));
+        }
+        body
+    }
+
+    fn token_file_path(&self, server_name: &str) -> PathBuf {
         let safe_name: String = server_name
             .chars()
             .map(|c| {
@@ -1022,61 +1167,282 @@ impl UpstreamOAuthTokenStore {
                 }
             })
             .collect();
-        let path = self.store_dir.join(format!("{}.oauth.enc", safe_name));
-        std::fs::write(&path, payload.to_string_compact())
-            .map_err(|e| format!("Failed to write encrypted OAuth token: {}", e))
+        self.store_dir.join(format!("{}.oauth.enc", safe_name))
+    }
+
+    pub fn save_token(&self, server_name: &str, access_token: &str) -> Result<(), String> {
+        self.save_token_record(
+            server_name,
+            &OAuthTokenRecord::from_access_token(access_token),
+        )
+    }
+
+    /// Seals a full `OAuthTokenRecord` using `ring::aead::CHACHA20_POLY1305` (with 96-bit OS CSPRNG
+    /// nonce and `server_name` AAD) when `tls-rustls` is compiled in, or SHA-256 CTR + HMAC fallback.
+    pub fn save_token_record(
+        &self,
+        server_name: &str,
+        record: &OAuthTokenRecord,
+    ) -> Result<(), String> {
+        let _ = std::fs::create_dir_all(&self.store_dir);
+        let plaintext = record.to_json().to_string_compact().into_bytes();
+        let path = self.token_file_path(server_name);
+
+        #[cfg(feature = "tls-rustls")]
+        {
+            use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+            let mut nonce_bytes = [0u8; 12];
+            crate::models::gather_entropy(&mut nonce_bytes);
+            let unbound = UnboundKey::new(&CHACHA20_POLY1305, &self.master_key)
+                .map_err(|_| "Failed to initialize ChaCha20-Poly1305 key".to_string())?;
+            let key = LessSafeKey::new(unbound);
+            let mut in_out = plaintext;
+            key.seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::from(server_name.as_bytes()),
+                &mut in_out,
+            )
+            .map_err(|_| "ChaCha20-Poly1305 AEAD seal failed".to_string())?;
+
+            let payload = json!({
+                "version": 2i64,
+                "alg": "ChaCha20-Poly1305",
+                "server": server_name,
+                "nonce_hex": hex_encode_bytes(&nonce_bytes),
+                "ciphertext_hex": hex_encode_bytes(&in_out),
+            });
+            std::fs::write(&path, payload.to_string_compact())
+                .map_err(|e| format!("Failed to write AEAD OAuth token: {}", e))
+        }
+
+        #[cfg(not(feature = "tls-rustls"))]
+        {
+            let mut nonce = [0u8; 16];
+            crate::models::gather_entropy(&mut nonce);
+            let mut ciphertext = Vec::with_capacity(plaintext.len());
+            for (counter, chunk) in plaintext.chunks(32).enumerate() {
+                let mut block_in = Vec::with_capacity(68);
+                block_in.extend_from_slice(&self.master_key);
+                block_in.extend_from_slice(&nonce);
+                block_in.extend_from_slice(&(counter as u32).to_le_bytes());
+                let keystream = crate::storage::sha256(&block_in);
+                for (i, b) in chunk.iter().enumerate() {
+                    ciphertext.push(b ^ keystream[i]);
+                }
+            }
+            let mut blob = Vec::with_capacity(nonce.len() + ciphertext.len());
+            blob.extend_from_slice(&nonce);
+            blob.extend_from_slice(&ciphertext);
+            let mac = crate::storage::audit_log::hmac_sha256_hex(&self.master_key, &blob);
+            let payload = json!({
+                "version": 1i64,
+                "alg": "SHA256-CTR-HMAC",
+                "server": server_name,
+                "nonce_hex": hex_encode_bytes(&nonce),
+                "ciphertext_hex": hex_encode_bytes(&ciphertext),
+                "hmac_sha256": mac,
+            });
+            std::fs::write(&path, payload.to_string_compact())
+                .map_err(|e| format!("Failed to write encrypted OAuth token: {}", e))
+        }
     }
 
     pub fn load_token(&self, server_name: &str) -> Result<String, String> {
-        let safe_name: String = server_name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let path = self.store_dir.join(format!("{}.oauth.enc", safe_name));
+        self.load_token_record(server_name).map(|r| r.access_token)
+    }
+
+    /// Loads and decrypts an `OAuthTokenRecord`, supporting both `v2` (`ChaCha20-Poly1305` AEAD)
+    /// and legacy `v6.0.0` (SHA-256 CTR + HMAC) envelopes transparently.
+    pub fn load_token_record(&self, server_name: &str) -> Result<OAuthTokenRecord, String> {
+        let path = self.token_file_path(server_name);
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read encrypted OAuth token: {}", e))?;
         let parsed = JsonValue::parse(&raw)?;
-        let nonce = hex_decode_bytes(
-            parsed
-                .get("nonce_hex")
+        let alg = parsed.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+
+        let plaintext_str = if alg == "ChaCha20-Poly1305" {
+            #[cfg(not(feature = "tls-rustls"))]
+            {
+                return Err(
+                    "ChaCha20-Poly1305 token envelope requires the 'tls-rustls' (ring) feature"
+                        .to_string(),
+                );
+            }
+            #[cfg(feature = "tls-rustls")]
+            {
+                use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+                let nonce = hex_decode_bytes(
+                    parsed
+                        .get("nonce_hex")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Missing nonce_hex")?,
+                )?;
+                if nonce.len() != 12 {
+                    return Err(format!("Invalid AEAD nonce length {}", nonce.len()));
+                }
+                let mut nonce_arr = [0u8; 12];
+                nonce_arr.copy_from_slice(&nonce);
+                let mut ciphertext = hex_decode_bytes(
+                    parsed
+                        .get("ciphertext_hex")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Missing ciphertext_hex")?,
+                )?;
+                let unbound = UnboundKey::new(&CHACHA20_POLY1305, &self.master_key)
+                    .map_err(|_| "Failed to initialize ChaCha20-Poly1305 key".to_string())?;
+                let key = LessSafeKey::new(unbound);
+                let plain = key
+                    .open_in_place(
+                        Nonce::assume_unique_for_key(nonce_arr),
+                        Aad::from(server_name.as_bytes()),
+                        &mut ciphertext,
+                    )
+                    .map_err(|_| {
+                        "OAuth token AEAD ChaCha20-Poly1305 authentication/decryption failed"
+                            .to_string()
+                    })?;
+                String::from_utf8(plain.to_vec())
+                    .map_err(|e| format!("Invalid UTF-8 token payload: {}", e))?
+            }
+        } else {
+            // Transparent legacy v6.0.0 SHA-256 CTR + HMAC read fallback
+            let nonce = hex_decode_bytes(
+                parsed
+                    .get("nonce_hex")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing nonce_hex")?,
+            )?;
+            let ciphertext = hex_decode_bytes(
+                parsed
+                    .get("ciphertext_hex")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing ciphertext_hex")?,
+            )?;
+            let mac = parsed
+                .get("hmac_sha256")
                 .and_then(|v| v.as_str())
-                .ok_or("Missing nonce_hex")?,
-        )?;
-        let ciphertext = hex_decode_bytes(
-            parsed
-                .get("ciphertext_hex")
-                .and_then(|v| v.as_str())
-                .ok_or("Missing ciphertext_hex")?,
-        )?;
-        let mac = parsed
-            .get("hmac_sha256")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing hmac_sha256")?;
-        let mut blob = Vec::with_capacity(nonce.len() + ciphertext.len());
-        blob.extend_from_slice(&nonce);
-        blob.extend_from_slice(&ciphertext);
-        let expected_mac = crate::storage::audit_log::hmac_sha256_hex(&self.master_key, &blob);
-        if !crate::models::constant_time_eq(mac.as_bytes(), expected_mac.as_bytes()) {
-            return Err("OAuth token store HMAC verification failed".to_string());
-        }
-        let mut plaintext = Vec::with_capacity(ciphertext.len());
-        for (counter, chunk) in ciphertext.chunks(32).enumerate() {
-            let mut block_in = Vec::with_capacity(68);
-            block_in.extend_from_slice(&self.master_key);
-            block_in.extend_from_slice(&nonce);
-            block_in.extend_from_slice(&(counter as u32).to_le_bytes());
-            let keystream = crate::storage::sha256(&block_in);
-            for (i, b) in chunk.iter().enumerate() {
-                plaintext.push(b ^ keystream[i]);
+                .ok_or("Missing hmac_sha256")?;
+            let mut blob = Vec::with_capacity(nonce.len() + ciphertext.len());
+            blob.extend_from_slice(&nonce);
+            blob.extend_from_slice(&ciphertext);
+            let expected_mac = crate::storage::audit_log::hmac_sha256_hex(&self.master_key, &blob);
+            if !crate::models::constant_time_eq(mac.as_bytes(), expected_mac.as_bytes()) {
+                return Err("OAuth token store HMAC verification failed".to_string());
+            }
+            let mut plaintext = Vec::with_capacity(ciphertext.len());
+            for (counter, chunk) in ciphertext.chunks(32).enumerate() {
+                let mut block_in = Vec::with_capacity(68);
+                block_in.extend_from_slice(&self.master_key);
+                block_in.extend_from_slice(&nonce);
+                block_in.extend_from_slice(&(counter as u32).to_le_bytes());
+                let keystream = crate::storage::sha256(&block_in);
+                for (i, b) in chunk.iter().enumerate() {
+                    plaintext.push(b ^ keystream[i]);
+                }
+            }
+            String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8 token: {}", e))?
+        };
+
+        // Support both v6.5 JSON OAuthTokenRecord and legacy raw access_token string
+        if plaintext_str.trim_start().starts_with('{') {
+            if let Ok(json_val) = JsonValue::parse(&plaintext_str) {
+                if let Some(rec) = OAuthTokenRecord::from_json(&json_val) {
+                    return Ok(rec);
+                }
             }
         }
-        String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8 token: {}", e))
+        Ok(OAuthTokenRecord::from_access_token(plaintext_str))
+    }
+
+    /// Returns a valid access token, automatically rotating via `refresh_token` if expired.
+    pub fn load_fresh_access_token(
+        &self,
+        server_name: &str,
+        allow_loopback: bool,
+    ) -> Result<String, String> {
+        let rec = self.load_token_record(server_name)?;
+        if rec.is_expired() && rec.refresh_token.is_some() && rec.token_endpoint.is_some() {
+            return self.refresh_access_token(server_name, allow_loopback);
+        }
+        Ok(rec.access_token)
+    }
+
+    /// Executes OAuth 2.1 `grant_type=refresh_token` rotation against `token_endpoint`
+    /// and seals the refreshed token record back to disk in AEAD `v2` format.
+    pub fn refresh_access_token(
+        &self,
+        server_name: &str,
+        allow_loopback: bool,
+    ) -> Result<String, String> {
+        let mut rec = self.load_token_record(server_name)?;
+        let refresh_tok = rec
+            .refresh_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("No refresh_token stored for '{}'", server_name))?;
+        let token_endpoint = rec
+            .token_endpoint
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("No token_endpoint stored for '{}'", server_name))?;
+
+        let form_body = Self::build_refresh_token_body(
+            rec.client_id.as_deref(),
+            refresh_tok,
+            rec.scope.as_deref(),
+        );
+        let body_bytes = form_body.into_bytes();
+
+        let mut req_headers = BTreeMap::new();
+        req_headers.insert(
+            "content-type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        );
+        req_headers.insert("accept".to_string(), "application/json".to_string());
+
+        let resp_bytes = if let Some((status, _hdrs, bytes)) =
+            invoke_mock_http(token_endpoint, token_endpoint, &req_headers, &body_bytes)
+        {
+            if status >= 400 {
+                return Err(format!(
+                    "OAuth token refresh failed with HTTP {}: {}",
+                    status,
+                    String::from_utf8_lossy(&bytes)
+                ));
+            }
+            bytes
+        } else {
+            let _ = validate_upstream_url_and_resolve(token_endpoint, allow_loopback)?;
+            let mut hdr_map = std::collections::HashMap::new();
+            hdr_map.insert(
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            );
+            hdr_map.insert("Accept".to_string(), "application/json".to_string());
+            let client = crate::data_plane::HttpDownstreamClient::new();
+            client.post_json(token_endpoint, &body_bytes, Some(&hdr_map))?
+        };
+
+        let resp_str = String::from_utf8(resp_bytes)
+            .map_err(|e| format!("Invalid UTF-8 in OAuth refresh response: {}", e))?;
+        let parsed = JsonValue::parse(&resp_str)?;
+        let new_access = parsed
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "OAuth refresh response missing 'access_token'".to_string())?
+            .to_string();
+
+        rec.access_token = new_access.clone();
+        if let Some(new_ref) = parsed.get("refresh_token").and_then(|v| v.as_str()) {
+            if !new_ref.is_empty() {
+                rec.refresh_token = Some(new_ref.to_string());
+            }
+        }
+        if let Some(expires_in) = parsed.get("expires_in").and_then(|v| v.as_f64()) {
+            rec.expires_at = Some(now_epoch_secs() + expires_in);
+        }
+        self.save_token_record(server_name, &rec)?;
+        Ok(new_access)
     }
 }
 

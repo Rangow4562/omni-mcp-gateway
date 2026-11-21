@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ServerSummary, ServerDetail, ServerInspection, ExternalSyncResult } from '../types';
-import { apiFetch } from '../api';
+import { apiFetch, initOAuthAuthorize } from '../api';
 
 interface ExternalServerInspectorProps {
   server: ServerSummary | ServerDetail | null;
@@ -17,22 +17,25 @@ export const ExternalServerInspector: React.FC<ExternalServerInspectorProps> = (
   onRediscovered,
   onDeregistered,
 }) => {
-  if (!isOpen || !server) return null;
-
   const [inspection, setInspection] = useState<ServerInspection | null>(null);
   const [loading, setLoading] = useState(false);
   const [rediscovering, setRediscovering] = useState(false);
   const [deregistering, setDeregistering] = useState(false);
   const [showStderr, setShowStderr] = useState(false);
   const [syncResult, setSyncResult] = useState<ExternalSyncResult | null>(null);
+  const [oauthUrl, setOauthUrl] = useState<string | null>(null);
+  const [oauthLoading, setOauthLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  const serverName = server?.name ?? '';
+
   const fetchInspection = async () => {
+    if (!serverName) return;
     setLoading(true);
     setErrorMsg(null);
     try {
       const data = await apiFetch<ServerInspection>(
-        `/api/v1/servers/external/${encodeURIComponent(server.name)}/inspect`
+        `/api/v1/servers/external/${encodeURIComponent(serverName)}/inspect`
       );
       setInspection(data);
     } catch (err: any) {
@@ -43,8 +46,27 @@ export const ExternalServerInspector: React.FC<ExternalServerInspectorProps> = (
   };
 
   useEffect(() => {
-    fetchInspection();
-  }, [server.name]);
+    if (isOpen && serverName) {
+      fetchInspection();
+    }
+  }, [isOpen, serverName]);
+
+  if (!isOpen || !server) return null;
+
+  const handleOAuthConnect = async () => {
+    setOauthLoading(true);
+    setErrorMsg(null);
+    try {
+      const res = await initOAuthAuthorize(server.name);
+      if (res?.authorization_url) {
+        setOauthUrl(res.authorization_url);
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Failed to initiate OAuth 2.1 PKCE flow.');
+    } finally {
+      setOauthLoading(false);
+    }
+  };
 
   const handleRediscover = async () => {
     setRediscovering(true);
@@ -307,6 +329,24 @@ export const ExternalServerInspector: React.FC<ExternalServerInspectorProps> = (
             </div>
           )}
 
+          {oauthUrl && (
+            <div style={{
+              backgroundColor: '#13243b',
+              border: '1px solid #276ef166',
+              color: '#a5d6ff',
+              padding: '10px 14px',
+              borderRadius: '6px',
+              fontSize: '12px',
+              marginBottom: '12px',
+              wordBreak: 'break-all',
+            }}>
+              <div style={{ fontWeight: 700, marginBottom: '4px' }}>🔐 OAuth 2.1 PKCE (S256) Ready</div>
+              <a href={oauthUrl} target="_blank" rel="noreferrer" style={{ color: '#79c0ff' }}>
+                {oauthUrl}
+              </a>
+            </div>
+          )}
+
           {/* Actions */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '20px', borderTop: '1px solid #222332', paddingTop: '16px' }}>
             <button
@@ -328,6 +368,23 @@ export const ExternalServerInspector: React.FC<ExternalServerInspectorProps> = (
             </button>
 
             <div style={{ display: 'flex', gap: '10px' }}>
+              <button
+                type="button"
+                onClick={handleOAuthConnect}
+                disabled={oauthLoading}
+                style={{
+                  backgroundColor: '#1b2c47',
+                  border: '1px solid #2e5394',
+                  color: '#79c0ff',
+                  padding: '8px 14px',
+                  borderRadius: '6px',
+                  fontWeight: 600,
+                  fontSize: '12px',
+                  cursor: oauthLoading ? 'wait' : 'pointer',
+                }}
+              >
+                {oauthLoading ? 'Starting PKCE...' : '🔐 OAuth PKCE Connect'}
+              </button>
               <button
                 type="button"
                 onClick={handleRediscover}

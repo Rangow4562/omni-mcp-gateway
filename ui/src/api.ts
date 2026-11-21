@@ -21,7 +21,11 @@ export function getToken(): string {
 }
 
 export function setToken(token: string): void {
-  localStorage.setItem(TOKEN_STORAGE_KEY, token.trim());
+  const trimmed = token.trim();
+  localStorage.setItem(TOKEN_STORAGE_KEY, trimmed);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('omni-token-changed', { detail: trimmed }));
+  }
 }
 
 export interface ApiError {
@@ -114,4 +118,79 @@ export async function saveToolGroup(group: ToolGroupItem): Promise<ToolGroupItem
 
 export async function deleteToolGroup(slug: string): Promise<void> {
   await apiFetch(`/api/v1/groups/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+}
+
+export async function listSuspendedFrames(): Promise<any[]> {
+  const res = await apiFetch<{ suspended_frames: any[] }>(
+    '/api/codemode/suspended?include_preview=true'
+  );
+  return res.suspended_frames || [];
+}
+
+export async function resumeSuspendedFrame(
+  executionId: string,
+  pendingArgumentsHash: string
+): Promise<any> {
+  return apiFetch('/api/codemode/resume', {
+    method: 'POST',
+    body: JSON.stringify({
+      execution_id: executionId,
+      arguments_digest: pendingArgumentsHash,
+    }),
+  });
+}
+
+export async function cancelSuspendedFrame(executionId: string): Promise<void> {
+  await apiFetch(`/api/codemode/suspended/${encodeURIComponent(executionId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function listPendingCallbacks(): Promise<any[]> {
+  const res = await apiFetch<{ callbacks: any[] }>('/api/v1/callbacks');
+  return res.callbacks || [];
+}
+
+export async function respondPendingCallback(
+  callbackId: string,
+  approved: boolean,
+  result?: any,
+  error?: string
+): Promise<any> {
+  return apiFetch(`/api/v1/callbacks/${encodeURIComponent(callbackId)}/respond`, {
+    method: 'POST',
+    body: JSON.stringify({ approved, result, error }),
+  });
+}
+
+export async function fetchTraces(): Promise<any[]> {
+  const res = await apiFetch<{ spans?: any[]; traces?: any[] }>('/api/traces');
+  return res.spans || res.traces || [];
+}
+
+export async function fetchAuditLog(): Promise<{ records: any[]; head_hash?: string }> {
+  const res = await apiFetch<{ records?: any[]; audit_log?: any[]; head_hash?: string }>('/api/audit');
+  return {
+    records: res.records || res.audit_log || [],
+    head_hash: res.head_hash,
+  };
+}
+
+export async function verifyAuditChain(): Promise<any> {
+  return apiFetch('/api/audit/verify');
+}
+
+export async function fetchOtlpStatus(): Promise<any> {
+  return apiFetch('/api/v1/telemetry/otlp/status');
+}
+
+export async function importMcpConfig(configJson: string, dryRun: boolean): Promise<any> {
+  return apiFetch('/api/v1/import-config', {
+    method: 'POST',
+    body: JSON.stringify({ config_json: configJson, dry_run: dryRun }),
+  });
+}
+
+export async function initOAuthAuthorize(serverName: string): Promise<any> {
+  return apiFetch(`/api/v1/oauth/authorize/${encodeURIComponent(serverName)}`);
 }

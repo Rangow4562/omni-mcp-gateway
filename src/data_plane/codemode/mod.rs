@@ -40,4 +40,4 @@ pub use parser::*;
 pub use typegen::*;
 pub use vm::*;
 #[cfg(feature = "sandbox-wasm")]
-pub use wasm_sandbox::WasmSandboxExecutor;
+pub use wasm_sandbox::{decode_wasm_base64, WasmSandboxExecutor, WasmToolCallback};

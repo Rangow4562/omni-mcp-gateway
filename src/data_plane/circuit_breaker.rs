@@ -128,6 +128,37 @@ impl CircuitBreakerRegistry {
 struct CachedItem {
     payload: JsonValue,
     expires_at: f64,
+    service_tool_prefix: String,
+    embedding: Option<Vec<f32>>,
+}
+
+/// Recursively canonicalizes a `JsonValue` by sorting all object keys lexicographically
+/// and normalizing numeric zero / whitespace so `{ "b": 1, "a": 2 }` and `{ "a": 2, "b": 1 }`
+/// serialize to the identical canonical string.
+pub fn canonicalize_json(val: &JsonValue) -> JsonValue {
+    match val {
+        JsonValue::Object(entries) => {
+            let mut sorted: Vec<(String, JsonValue)> = entries
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_json(v)))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            JsonValue::Object(sorted)
+        }
+        JsonValue::Array(items) => JsonValue::Array(items.iter().map(canonicalize_json).collect()),
+        JsonValue::Float(n) => {
+            if *n == 0.0 {
+                JsonValue::Int(0)
+            } else if n.fract() == 0.0 && n.abs() < 1e15 {
+                JsonValue::Int(*n as i64)
+            } else {
+                JsonValue::Float(*n)
+            }
+        }
+        JsonValue::Int(i) => JsonValue::Int(*i),
+        JsonValue::Str(s) => JsonValue::Str(s.trim().to_string()),
+        other => other.clone(),
+    }
 }
 
 #[derive(Clone)]
@@ -155,19 +186,16 @@ impl SemanticResponseCache {
     }
 
     pub fn make_key(service_name: &str, tool_name: &str, args: &JsonValue) -> String {
+        let canonical = canonicalize_json(args);
         format!(
             "{}::{}::{}",
             service_name,
             tool_name,
-            args.to_string_compact()
+            canonical.to_string_compact()
         )
     }
 
     pub fn get(&self, key: &str) -> Option<JsonValue> {
-        if self.ttl_seconds <= 0.0 {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
         let now = now_epoch_secs();
         let guard = self.entries.read().unwrap();
         if let Some(item) = guard.get(key) {
@@ -180,11 +208,73 @@ impl SemanticResponseCache {
         None
     }
 
+    /// Attempts exact canonical lookup first; if missed and `similarity_threshold` is in `(0, 1]`,
+    /// performs vector-similarity lookup across live cached entries for the same `service::tool`.
+    pub fn get_or_similar(
+        &self,
+        service_name: &str,
+        tool_name: &str,
+        args: &JsonValue,
+        similarity_threshold: f64,
+    ) -> Option<JsonValue> {
+        let key = Self::make_key(service_name, tool_name, args);
+        let now = now_epoch_secs();
+        let guard = self.entries.read().unwrap();
+        if let Some(item) = guard.get(&key) {
+            if now < item.expires_at {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(item.payload.clone());
+            }
+        }
+        if similarity_threshold > 0.0 && similarity_threshold <= 1.0 {
+            let prefix = format!("{}::{}", service_name, tool_name);
+            let query_vec = crate::data_plane::semantic_index::embed_local(
+                &canonicalize_json(args).to_string_compact(),
+            );
+            let mut best: Option<(f64, &JsonValue)> = None;
+            for item in guard.values() {
+                if item.service_tool_prefix == prefix && now < item.expires_at {
+                    if let Some(ref vec) = item.embedding {
+                        let sim =
+                            crate::data_plane::semantic_index::cosine_similarity(&query_vec, vec);
+                        if sim >= similarity_threshold
+                            && best.map_or(true, |(b_sim, _)| sim > b_sim)
+                        {
+                            best = Some((sim, &item.payload));
+                        }
+                    }
+                }
+            }
+            if let Some((_, payload)) = best {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(payload.clone());
+            }
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
     pub fn put(&self, key: String, payload: JsonValue) {
-        if self.ttl_seconds <= 0.0 {
+        self.put_with_ttl(key, payload, None);
+    }
+
+    /// Inserts a cached response using `ttl_override_sec` if supplied, else the cache default TTL.
+    pub fn put_with_ttl(&self, key: String, payload: JsonValue, ttl_override_sec: Option<u64>) {
+        let effective_ttl = ttl_override_sec
+            .map(|s| s as f64)
+            .unwrap_or(self.ttl_seconds);
+        if effective_ttl <= 0.0 {
             return;
         }
         let now = now_epoch_secs();
+        let parts: Vec<&str> = key.splitn(3, "::").collect();
+        let (service_tool_prefix, embedding) = if parts.len() == 3 {
+            let prefix = format!("{}::{}", parts[0], parts[1]);
+            let vec = crate::data_plane::semantic_index::embed_local(parts[2]);
+            (prefix, Some(vec))
+        } else {
+            (String::new(), None)
+        };
         let mut guard = self.entries.write().unwrap();
         if guard.len() > 4096 {
             guard.retain(|_, v| now < v.expires_at);
@@ -193,7 +283,9 @@ impl SemanticResponseCache {
             key,
             CachedItem {
                 payload,
-                expires_at: now + self.ttl_seconds,
+                expires_at: now + effective_ttl,
+                service_tool_prefix,
+                embedding,
             },
         );
     }

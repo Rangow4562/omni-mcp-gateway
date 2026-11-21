@@ -228,6 +228,7 @@ pub enum ProtocolType {
     NativeMcp,
     ThirdParty,
     ExternalMcp,
+    WasmPlugin,
 }
 
 impl ProtocolType {
@@ -239,6 +240,7 @@ impl ProtocolType {
             ProtocolType::NativeMcp => "Native_MCP",
             ProtocolType::ThirdParty => "ThirdParty",
             ProtocolType::ExternalMcp => "External_MCP",
+            ProtocolType::WasmPlugin => "WasmPlugin",
         }
     }
 
@@ -250,6 +252,9 @@ impl ProtocolType {
             "Native_MCP" | "native_mcp" | "NATIVE_MCP" => ProtocolType::NativeMcp,
             "ThirdParty" | "third_party" | "THIRDPARTY" => ProtocolType::ThirdParty,
             "External_MCP" | "external_mcp" | "EXTERNAL_MCP" => ProtocolType::ExternalMcp,
+            "WasmPlugin" | "wasm_plugin" | "WASM_PLUGIN" | "wasm" | "WASM" => {
+                ProtocolType::WasmPlugin
+            }
             _ => ProtocolType::Http,
         }
     }
@@ -522,6 +527,118 @@ impl ActorType {
     }
 }
 
+/// Declarative argument-level guardrail rule evaluated before tool execution (v6.5.0).
+/// Example: `{ field: "/amount", op: "lte", value: 5000 }` or `{ field: "/environment", op: "neq", value: "prod" }`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArgumentPolicyRule {
+    pub field: String,
+    pub op: String,
+    pub value: JsonValue,
+}
+
+impl ArgumentPolicyRule {
+    pub fn new(field: impl Into<String>, op: impl Into<String>, value: JsonValue) -> Self {
+        Self {
+            field: field.into(),
+            op: op.into(),
+            value,
+        }
+    }
+
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "field": self.field.clone(),
+            "op": self.op.clone(),
+            "value": self.value.clone(),
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let field = v.get("field")?.as_str()?.to_string();
+        let op = v.get("op")?.as_str()?.to_string();
+        let value = v.get("value").cloned().unwrap_or(JsonValue::Null);
+        Some(Self { field, op, value })
+    }
+}
+
+/// Per-tenant / per-principal hourly sliding-window resource quota policy (v6.5.0).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TenantQuotaPolicy {
+    pub max_tool_calls_per_hour: u64,
+    pub max_codemode_fuel_per_hour: u64,
+    pub max_egress_bytes_per_hour: u64,
+}
+
+impl Default for TenantQuotaPolicy {
+    fn default() -> Self {
+        Self {
+            max_tool_calls_per_hour: 10_000,
+            max_codemode_fuel_per_hour: 50_000_000,
+            max_egress_bytes_per_hour: 500 * 1024 * 1024,
+        }
+    }
+}
+
+impl TenantQuotaPolicy {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "max_tool_calls_per_hour": self.max_tool_calls_per_hour as i64,
+            "max_codemode_fuel_per_hour": self.max_codemode_fuel_per_hour as i64,
+            "max_egress_bytes_per_hour": self.max_egress_bytes_per_hour as i64,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        if !v.is_object() {
+            return None;
+        }
+        let d = Self::default();
+        Some(Self {
+            max_tool_calls_per_hour: v
+                .get("max_tool_calls_per_hour")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(d.max_tool_calls_per_hour),
+            max_codemode_fuel_per_hour: v
+                .get("max_codemode_fuel_per_hour")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(d.max_codemode_fuel_per_hour),
+            max_egress_bytes_per_hour: v
+                .get("max_egress_bytes_per_hour")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(d.max_egress_bytes_per_hour),
+        })
+    }
+}
+
+/// Correlation frame for bidirectional upstream-initiated MCP requests (`sampling/createMessage`,
+/// `elicitation/create`, `roots/list`) awaiting client relay or operator approval (v6.5.0).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingUpstreamCallback {
+    pub callback_id: String,
+    pub server_name: String,
+    pub upstream_request_id: JsonValue,
+    pub method: String,
+    pub params: JsonValue,
+    pub mode: String,
+    pub status: String,
+    pub created_at: f64,
+}
+
+impl PendingUpstreamCallback {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "callback_id": self.callback_id.clone(),
+            "server_name": self.server_name.clone(),
+            "upstream_request_id": self.upstream_request_id.clone(),
+            "method": self.method.clone(),
+            "params": self.params.clone(),
+            "mode": self.mode.clone(),
+            "status": self.status.clone(),
+            "created_at": self.created_at,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CharterPolicy {
     pub allowed_actors: Vec<ActorType>,
@@ -529,6 +646,8 @@ pub struct CharterPolicy {
     pub rate_limit_rpm: u32,
     pub require_redaction: bool,
     pub custom_attributes: JsonValue,
+    pub argument_rules: Vec<ArgumentPolicyRule>,
+    pub tenant_quota: Option<TenantQuotaPolicy>,
 }
 
 impl Default for CharterPolicy {
@@ -539,6 +658,8 @@ impl Default for CharterPolicy {
             rate_limit_rpm: 1200,
             require_redaction: true,
             custom_attributes: JsonValue::object(),
+            argument_rules: Vec::new(),
+            tenant_quota: None,
         }
     }
 }
@@ -570,12 +691,15 @@ impl CharterPolicy {
             .iter()
             .map(|t| JsonValue::from(t.as_str()))
             .collect();
+        let arg_rules: Vec<JsonValue> = self.argument_rules.iter().map(|r| r.to_json()).collect();
         json!({
             "allowed_actors": JsonValue::Array(actors),
             "allowed_tools": JsonValue::Array(tools),
             "rate_limit_rpm": self.rate_limit_rpm as i64,
             "require_redaction": self.require_redaction,
-            "custom_attributes": self.custom_attributes.clone()
+            "custom_attributes": self.custom_attributes.clone(),
+            "argument_rules": JsonValue::Array(arg_rules),
+            "tenant_quota": self.tenant_quota.as_ref().map(|q| q.to_json()).unwrap_or(JsonValue::Null),
         })
     }
 
@@ -615,12 +739,32 @@ impl CharterPolicy {
             .cloned()
             .unwrap_or_else(JsonValue::object);
 
+        let argument_rules = v
+            .get("argument_rules")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(ArgumentPolicyRule::from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let tenant_quota = v.get("tenant_quota").and_then(|q| {
+            if q.is_null() {
+                None
+            } else {
+                TenantQuotaPolicy::from_json(q)
+            }
+        });
+
         Self {
             allowed_actors,
             allowed_tools,
             rate_limit_rpm,
             require_redaction,
             custom_attributes,
+            argument_rules,
+            tenant_quota,
         }
     }
 }
@@ -1059,6 +1203,9 @@ pub struct ToolRecord {
     pub retired_at: Option<f64>,
     pub last_seen_in_sync: Option<f64>,
     pub timeout_ms: Option<u64>,
+    pub http_method: Option<String>,
+    pub cache_ttl_sec: Option<u64>,
+    pub wasm_module_base64: Option<String>,
 }
 
 impl ToolRecord {
@@ -1090,6 +1237,9 @@ impl ToolRecord {
             retired_at: None,
             last_seen_in_sync: None,
             timeout_ms: None,
+            http_method: None,
+            cache_ttl_sec: None,
+            wasm_module_base64: None,
         }
     }
 
@@ -1161,6 +1311,9 @@ impl ToolRecord {
             "retired_at": self.retired_at,
             "last_seen_in_sync": self.last_seen_in_sync,
             "timeout_ms": self.timeout_ms.map(|v| v as i64).map(JsonValue::from).unwrap_or(JsonValue::Null),
+            "http_method": self.http_method.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "cache_ttl_sec": self.cache_ttl_sec.map(|v| v as i64).map(JsonValue::from).unwrap_or(JsonValue::Null),
+            "wasm_module_base64": self.wasm_module_base64.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
         })
     }
 
@@ -1252,6 +1405,15 @@ impl ToolRecord {
         let retired_at = v.get("retired_at").and_then(|x| x.as_f64());
         let last_seen_in_sync = v.get("last_seen_in_sync").and_then(|x| x.as_f64());
         let timeout_ms = v.get("timeout_ms").and_then(|x| x.as_u64());
+        let http_method = v
+            .get("http_method")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+        let cache_ttl_sec = v.get("cache_ttl_sec").and_then(|x| x.as_u64());
+        let wasm_module_base64 = v
+            .get("wasm_module_base64")
+            .and_then(|x| x.as_str())
+            .map(String::from);
 
         Some(Self {
             name,
@@ -1276,6 +1438,9 @@ impl ToolRecord {
             retired_at,
             last_seen_in_sync,
             timeout_ms,
+            http_method,
+            cache_ttl_sec,
+            wasm_module_base64,
         })
     }
 }
