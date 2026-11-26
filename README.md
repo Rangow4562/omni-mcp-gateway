@@ -298,13 +298,11 @@ All gateway, discovery, and Code Mode error states map to compiler-checked const
 
 <p align="center">
   <a href="https://htmlpreview.github.io/?https://github.com/Rangow4562/omni-mcp-gateway/blob/main/docs/omnimcp-architecture.html">
-    <img src="assets/architecture.gif" alt="OmniMCP v6.0 Architecture Diagram — Click to open interactive architecture map" width="100%" />
+    <img src="assets/architecture.gif" alt="OmniMCP v6.8.0 Architecture Diagram — Click to open interactive architecture map" width="100%" />
   </a>
 </p>
 
-> **Interactive diagram**: open [`docs/omnimcp-architecture.html`](docs/omnimcp-architecture.html) (or [view live interactive page](https://htmlpreview.github.io/?https://github.com/Rangow4562/omni-mcp-gateway/blob/main/docs/omnimcp-architecture.html)) — a self-contained interactive map of the gateway with guided views for the request path, registry & discovery, and trust & containment.
-
-![Omni MCP Gateway — Unified External MCP Fleet](assets/architecture-v5.5.0.png)
+> **Interactive diagram**: open [docs/omnimcp-architecture.html](https://github.com/Rangow4562/omni-mcp-gateway/blob/main/docs/omnimcp-architecture.html) (or [view live interactive page](https://htmlpreview.github.io/?https://github.com/Rangow4562/omni-mcp-gateway/blob/main/docs/omnimcp-architecture.html)) — a self-contained interactive map of the gateway with guided views for the request path, registry & discovery, and trust & containment.
 
 ```
                     AI Agents / LLMs / Shell Coding Agents
@@ -317,7 +315,7 @@ All gateway, discovery, and Code Mode error states map to compiler-checked const
                                    │
                                    ▼
              ┌──────────────────────────────────────────────────┐
-             │   AUTONOMOUS CODE MODE ENGINE (v4.0 – v6.0)      │
+             │   AUTONOMOUS CODE MODE ENGINE (v4.0 – v6.8)      │
              ├──────────────────────────────────────────────────┤
              │  • Polyglot AST Sandbox (~100 us, Outbound:null) │
              │  • wasmi Fuel-Metered Wasm Sandbox (sandbox-wasm)│

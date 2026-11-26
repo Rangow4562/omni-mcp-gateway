@@ -60,7 +60,7 @@
       "sublabel": "Studio v4 · Skills · Tasks · Inbox",
       "pos": [
         15,
-        80
+        70
       ],
       "size": [
         150,
@@ -74,7 +74,7 @@
       "sublabel": "Claude · Cursor · IDEs",
       "pos": [
         15,
-        210
+        190
       ],
       "size": [
         150,
@@ -88,7 +88,7 @@
       "sublabel": "HTTP · stdio · JSON-RPC 2.0",
       "pos": [
         215,
-        235
+        215
       ],
       "size": [
         150,
@@ -103,7 +103,7 @@
       "sublabel": "ABAC · elicitation · PII redaction",
       "pos": [
         410,
-        235
+        215
       ],
       "size": [
         150,
@@ -118,7 +118,7 @@
       "sublabel": "CoW routing · cache · breaker",
       "pos": [
         605,
-        235
+        215
       ],
       "size": [
         150,
@@ -133,7 +133,7 @@
       "sublabel": "stdio · Streamable HTTP · rustls",
       "pos": [
         800,
-        235
+        215
       ],
       "size": [
         150,
@@ -147,7 +147,7 @@
       "sublabel": "HTTP · gRPC · Thrift",
       "pos": [
         600,
-        80
+        70
       ],
       "size": [
         150,
@@ -161,7 +161,7 @@
       "sublabel": "AST VM · Wasm ABI v2",
       "pos": [
         800,
-        80
+        70
       ],
       "size": [
         150,
@@ -176,7 +176,7 @@
       "sublabel": "curated + synthesized · SHA-256",
       "pos": [
         215,
-        370
+        340
       ],
       "size": [
         150,
@@ -191,7 +191,7 @@
       "sublabel": "FileBlobBackend · s3/gcs/azure",
       "pos": [
         410,
-        370
+        340
       ],
       "size": [
         150,
@@ -206,7 +206,7 @@
       "sublabel": "MCPRegistry · IDL · PgWirePool",
       "pos": [
         605,
-        370
+        340
       ],
       "size": [
         150,
@@ -221,7 +221,7 @@
       "sublabel": "TaskManager · CAS · TTL reaper",
       "pos": [
         800,
-        370
+        340
       ],
       "size": [
         150,
@@ -275,11 +275,11 @@
       "via": [
         [
           680,
-          190
+          175
         ],
         [
           875,
-          190
+          175
         ]
       ]
     },
@@ -320,29 +320,28 @@
       "dot": "cyan",
       "title": "Entry points & governance",
       "items": [
-        "omni-gateway serves HTTP :8080 or runs behind --stdio; unified 2026-07-28 capability negotiation and server/discover parity across /omni/mcp, /groups/<slug>/mcp and /<service>/mcp",
-        "Studio UI v4: Skills Studio, Tasks Monitor and a unified Approval & Elicitation Inbox",
-        "ABAC charter policies plus ElicitationPolicyRule, 16-shard rate limiting, DFA PII redaction, Merkle-chained audit on accept/decline"
+        "HTTP :8080 or --stdio; unified 2026-07-28 capabilities and server/discover across every MCP mount",
+        "Studio v4: Skills Studio, Tasks Monitor, unified Approval & Elicitation Inbox",
+        "ABAC charter + elicitation policy, 16-shard rate limiting, DFA PII redaction, Merkle audit"
       ]
     },
     {
       "dot": "emerald",
       "title": "Control plane & HA state",
       "items": [
-        "CoW Arc routing table with canary routing, fallback and circuit breakers; bounded PgWirePool (OMNI_PG_POOL_SIZE=8) ends single-connection starvation",
-        "Channel-dispatched LISTEN/NOTIFY (omni_registry_changed vs omni_task_changed) prevents task updates from triggering server catalog reload storms",
-        "Fleet-aware SkillEngine merges curated persisted skills with auto-synthesized Tool Group / Virtual Service Code Mode playbooks, digested to manifest_sha256",
-        "Multi-replica HA OAuth flows and tokens (ChaCha20-Poly1305 AEAD) across Postgres / SQLite / WAL; migrate state with omni migrate --to-v6.8"
+        "CoW Arc routing with canary, fallback, breakers; bounded PgWirePool (OMNI_PG_POOL_SIZE=8)",
+        "LISTEN/NOTIFY channel dispatch keeps task updates out of registry reload storms",
+        "SkillEngine merges curated skills with auto-synthesized Code Mode playbooks",
+        "HA OAuth flows & ChaCha20-Poly1305 tokens; omni migrate --to-v6.8"
       ]
     },
     {
       "dot": "violet",
       "title": "Code Mode, tasks & files",
       "items": [
-        "In-process AST VM (~100 µs) with optional wasmi sandbox; Wasm Guest ABI v2 adds omni::file_stat and omni::file_read_chunk (max 256 KiB/call, fuel-metered, no ambient FS access)",
-        "GA MCP Tasks: durable Postgres HA persistence, atomic CAS transitions, 60-second TTL reaper, 64-task concurrency cap, cooperative cancellation with LIFO Saga unwind",
-        "Elicitation form/url modes: resultType input_required, strict secret-safety and primitive-schema validation, decline triggers Saga rollback",
-        "Opt-in file uploads (SEP-2356): 64 MiB chunked streaming bypass with FileBlobBackend for local, postgres, s3, gcs, azure and http/WebDAV"
+        "AST VM (~100 µs) with wasmi sandbox; Wasm ABI v2 adds file_stat / file_read_chunk",
+        "GA Tasks: Postgres HA, CAS transitions, 60 s TTL reaper, cooperative cancel + Saga unwind",
+        "Opt-in uploads: 64 MiB chunked bypass; FileBlobBackend for s3, gcs, azure, local, http"
       ]
     }
   ]

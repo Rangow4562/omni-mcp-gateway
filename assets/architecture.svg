@@ -24,125 +24,125 @@
   <!-- Top Title Header -->
   <rect x="36" y="24" width="108" height="34" rx="7" fill="url(#violetGrad)"/>
   <text x="90" y="46" fill="#FFFFFF" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-weight="900" font-size="14" text-anchor="middle" letter-spacing="1">OMNIMCP</text>
-  <text x="160" y="47" fill="#181A20" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-weight="800" font-size="21">ENTERPRISE MCP FLEET &amp; CODE MODE ARCHITECTURE (v6.0)</text>
-  <text x="1202" y="46" fill="#059669" font-family="monospace" font-weight="700" font-size="12.5" text-anchor="end">● RUSTLS · TOKIO · SQLITE WAL · WASMI</text>
+  <text x="160" y="47" fill="#181A20" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-weight="800" font-size="21">ENTERPRISE MCP FLEET &amp; CODE MODE ARCHITECTURE (v6.8)</text>
+  <text x="1202" y="46" fill="#059669" font-family="monospace" font-weight="700" font-size="12" text-anchor="end">● SKILLS · TASKS · ELICITATION · WASM ABI v2</text>
 
   <!-- Column 1: Clients & Harnesses -->
   <rect x="36" y="78" width="256" height="606" rx="10" fill="#FAFAFC" stroke="#DCDFE8" stroke-width="1.5"/>
-  <text x="54" y="108" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="800" font-size="12.5" letter-spacing="1">1. CLIENTS &amp; HARNESSES</text>
+  <text x="54" y="108" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="800" font-size="12.5" letter-spacing="1">1. CLIENTS &amp; STUDIO v4</text>
 
   <g transform="translate(52, 126)">
     <rect width="224" height="98" rx="8" fill="#FFFFFF" stroke="#DFE3EC"/>
     <text x="14" y="25" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">AI Coding Agents &amp; CLIs</text>
     <text x="14" y="46" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">Claude · Codex · Cursor · Antigravity</text>
-    <text x="14" y="64" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">NPX Zero-Install &amp; Native Binaries</text>
-    <text x="14" y="84" fill="#059669" font-family="monospace" font-size="10.5">omni / aifx --stdio | mcp call</text>
+    <text x="14" y="64" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">Skills CLI &amp; v6.8 Migration</text>
+    <text x="14" y="84" fill="#059669" font-family="monospace" font-size="10.5">omni skills | migrate --to-v6.8</text>
   </g>
 
   <g transform="translate(52, 240)">
     <rect width="224" height="102" rx="8" fill="#FFFFFF" stroke="#DFE3EC"/>
-    <text x="14" y="25" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">Streamable HTTP &amp; Groups</text>
-    <text x="14" y="46" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">MCP 2024-11-05 .. 2026-07-28</text>
-    <text x="14" y="64" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">Scoped Virtual Tool Groups</text>
+    <text x="14" y="25" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">MCP 2026-07-28 &amp; Extensions</text>
+    <text x="14" y="46" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">server/discover · Skills · Tasks (GA)</text>
+    <text x="14" y="64" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">Elicitation (form/url) · Files</text>
     <text x="14" y="84" fill="#6D28D9" font-family="monospace" font-size="10.5">/omni/mcp · /groups/&lt;slug&gt;/mcp</text>
   </g>
 
   <g transform="translate(52, 358)">
     <rect width="224" height="102" rx="8" fill="#FFFFFF" stroke="#DFE3EC"/>
-    <text x="14" y="25" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">Auth &amp; Mesh Callers</text>
-    <text x="14" y="46" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">OIDC/JWKS (RS256/ES256/EdDSA)</text>
-    <text x="14" y="64" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">HS256 + RFC 8707/8693/9728</text>
-    <text x="14" y="84" fill="#B45309" font-family="monospace" font-size="10.5">Virtual /&lt;service&gt;/mcp (mTLS)</text>
+    <text x="14" y="25" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">Streaming Uploads &amp; Auth</text>
+    <text x="14" y="46" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">64 MiB Chunked Upload Bypass</text>
+    <text x="14" y="64" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">OIDC/JWKS · AEAD OAuth PKCE</text>
+    <text x="14" y="84" fill="#B45309" font-family="monospace" font-size="10.5">/api/v1/files/upload/:id (PUT)</text>
   </g>
 
   <g transform="translate(52, 476)">
     <rect width="224" height="190" rx="8" fill="#F5F3FF" stroke="#8B5CF6"/>
-    <text x="14" y="25" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">React 18 Fleet &amp; Studio UI</text>
-    <text x="14" y="48" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Live Fleet SSE Telemetry</text>
-    <text x="14" y="68" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• ToolGroupsStudio &amp; Diffs</text>
-    <text x="14" y="88" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• CodeModeStudio Playground</text>
-    <text x="14" y="108" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• HITL Approval &amp; Audit View</text>
+    <text x="14" y="25" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">Governance Studio UI v4</text>
+    <text x="14" y="48" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• SkillsStudio &amp; SHA-256 Verify</text>
+    <text x="14" y="68" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• TasksMonitor &amp; Live Cancel</text>
+    <text x="14" y="88" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Unified Approval/Elicit Inbox</text>
+    <text x="14" y="108" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Trace Waterfall &amp; Merkle Audit</text>
     <text x="14" y="138" fill="#6D28D9" font-family="monospace" font-size="10.5">GET /api/v1/events (SSE)</text>
-    <text x="14" y="158" fill="#059669" font-family="monospace" font-size="10.5">Playwright E2E Verified</text>
+    <text x="14" y="158" fill="#059669" font-family="monospace" font-size="10.5">5/5 Playwright E2E Verified</text>
   </g>
 
   <!-- Column 2: Data Plane & Code Mode Engine -->
   <rect x="324" y="78" width="516" height="606" rx="10" fill="#FAFAFC" stroke="#7C3AED" stroke-width="2"/>
-  <text x="346" y="108" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="800" font-size="12.5" letter-spacing="1">2. DATA PLANE &amp; CODE MODE ENGINE (TOKIO + RUSTLS)</text>
+  <text x="346" y="108" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="800" font-size="12.5" letter-spacing="1">2. DATA PLANE, TASKS &amp; WASM ABI v2 (TOKIO + RUSTLS)</text>
 
   <!-- Async Ingress & Auth -->
   <g transform="translate(344, 126)">
     <rect width="476" height="104" rx="8" fill="#FFFFFF" stroke="#DFE3EC"/>
-    <text x="16" y="25" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Async HTTP/1.1 + rustls TLS/mTLS Front Door</text>
-    <text x="16" y="46" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• serve_async_listener / run_async_server + Origin DNS-rebinding guard</text>
-    <text x="16" y="65" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Deny-by-default RBAC (Agent / Operator / Approver / Admin) &amp; 16-shard limiter</text>
-    <text x="16" y="86" fill="#6D28D9" font-family="monospace" font-size="11">/omni/mcp · /api/v1/* · /openapi.json · /healthz · /metrics</text>
+    <text x="16" y="25" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Non-Blocking AsyncTlsStream + Elicitation &amp; RBAC</text>
+    <text x="16" y="46" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Dual async/sync chunked upload bypass (64 MiB) + 10 MiB JSON-RPC guard</text>
+    <text x="16" y="65" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Argument-level ABAC, Tenant Quotas, Secret-Safe form &amp; url Elicitation</text>
+    <text x="16" y="86" fill="#6D28D9" font-family="monospace" font-size="11">tasks/get · tasks/update · tasks/cancel · skills/list · resources/directory/read</text>
   </g>
 
   <!-- Code Mode v2 & Wasm Sandbox -->
   <g transform="translate(344, 244)">
     <rect width="476" height="148" rx="8" fill="#F5F3FF" stroke="#8B5CF6"/>
-    <text x="16" y="25" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Omni Code Mode v2 &amp; wasmi Sandbox (src/data_plane/codemode/)</text>
-    <text x="16" y="47" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• Okapi BM25 (k1=1.2, b=0.75) 0-turn .d.ts schema pre-injection (65–95% savings)</text>
-    <text x="16" y="67" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• Pure-Rust AST VM (~100 us) + wasmi fuel-metered Wasm sandbox (sandbox-wasm)</text>
-    <text x="16" y="87" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• SSA ParallelWave pass + ColumnarRecordBatch vectorized PhysicalExpr pushdown</text>
-    <text x="16" y="107" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• HMAC-SHA256 SuspendedExecutionFrame + CAS resume + LIFO Saga rollbacks</text>
+    <text x="16" y="25" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">TaskManager, Code Mode &amp; Wasm Guest ABI v2</text>
+    <text x="16" y="47" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• 250ms grace-window promotion → resultType: "task" + cooperative cancel_flag</text>
+    <text x="16" y="67" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• Hybrid Okapi BM25 + 256-dim Dense Vector RRF + Canonical Semantic Cache</text>
+    <text x="16" y="87" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• Wasm ABI v2: omni::call_tool, omni::file_stat, omni::file_read_chunk (256 KiB)</text>
+    <text x="16" y="107" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• SSA ParallelWave + ColumnarRecordBatch + CAS resume + LIFO Saga rollback</text>
     <text x="16" y="130" fill="#059669" font-family="monospace" font-size="11">globalOutbound: null · -320xx error contract · Xoshiro256StarStar DST</text>
   </g>
 
   <!-- Routing, Resilience & Observability -->
   <g transform="translate(344, 406)">
     <rect width="476" height="136" rx="8" fill="#FFFFFF" stroke="#DFE3EC"/>
-    <text x="16" y="25" fill="#059669" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Routing, Resilience, Wire Translation &amp; Telemetry</text>
-    <text x="16" y="47" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• CoW Arc&lt;BTreeMap&gt; routing table + Canary weighted routing &amp; fallback</text>
-    <text x="16" y="67" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Per-service Circuit Breaker + TTL Semantic Cache + Response Projection</text>
-    <text x="16" y="87" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• DFA PII/Secret Redactor + W3C traceparent OTLP exporter (src/telemetry/)</text>
-    <text x="16" y="114" fill="#6D28D9" font-family="monospace" font-size="11">HttpDownstreamClient (rustls) · gRPC / Thrift / Mesh RPC Translators</text>
+    <text x="16" y="25" fill="#059669" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Live REST/gRPC Streaming, Mesh &amp; OTLP Telemetry</text>
+    <text x="16" y="47" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• HttpDownstreamClient (GET/POST/PUT/PATCH/DELETE + post_stream_file)</text>
+    <text x="16" y="67" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• GrpcDownstreamClient (HTTP/2 h2c/h2 + HPACK Huffman + file metadata)</text>
+    <text x="16" y="87" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Circuit Breaker + Canary + DFA PII Redactor + Batching OtlpBatchWorker</text>
+    <text x="16" y="114" fill="#6D28D9" font-family="monospace" font-size="11">CoW Arc&lt;BTreeMap&gt; · Bidirectional Sampling/Elicitation &amp; Progress</text>
   </g>
 
   <!-- Segmented Merkle Audit -->
   <g transform="translate(344, 556)">
     <rect width="476" height="110" rx="8" fill="#ECFDF5" stroke="#10B981"/>
-    <text x="16" y="25" fill="#059669" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Segmented Merkle Audit &amp; Checkpoints (AuditSink)</text>
-    <text x="16" y="48" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• Zero-dependency FIPS 180-4 SHA-256 Merkle chain with sliding window</text>
-    <text x="16" y="68" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• Automatic JSONL segment rotation + HMAC-SHA256 signed .ckpt checkpoints</text>
-    <text x="16" y="90" fill="#059669" font-family="monospace" font-size="11">GET /api/audit/verify · SQLite AuditSink persistence</text>
+    <text x="16" y="25" fill="#059669" font-family="-apple-system, sans-serif" font-weight="700" font-size="14">Segmented Merkle Audit &amp; Multi-Cloud Blob Store</text>
+    <text x="16" y="48" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• FIPS 180-4 SHA-256 Merkle chain + HMAC-SHA256 .ckpt + Postgres AuditSink</text>
+    <text x="16" y="68" fill="#181A20" font-family="-apple-system, sans-serif" font-size="11.5">• FileBlobBackend: local | postgres BYTEA | s3 SigV4 | gcs | azure | http</text>
+    <text x="16" y="90" fill="#059669" font-family="monospace" font-size="11">GET /api/audit/verify · 60s Task &amp; File Blob TTL Reapers</text>
   </g>
 
   <!-- Column 3: Control Plane, Storage & Upstreams -->
   <rect x="872" y="78" width="332" height="606" rx="10" fill="#FAFAFC" stroke="#DCDFE8" stroke-width="1.5"/>
-  <text x="892" y="108" fill="#059669" font-family="-apple-system, sans-serif" font-weight="800" font-size="12.5" letter-spacing="1">3. CONTROL PLANE &amp; FLEET</text>
+  <text x="892" y="108" fill="#059669" font-family="-apple-system, sans-serif" font-weight="800" font-size="12.5" letter-spacing="1">3. HA STORAGE &amp; FLEET</text>
 
   <g transform="translate(890, 126)">
     <rect width="296" height="132" rx="8" fill="#FFFFFF" stroke="#DFE3EC"/>
-    <text x="14" y="25" fill="#B45309" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">Registry, AutoCrawler &amp; Diffs</text>
-    <text x="14" y="47" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Protobuf v2/v3, Thrift &amp; OpenAPI 3.1</text>
-    <text x="14" y="66" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Disabled-by-default tool gate</text>
-    <text x="14" y="85" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• ConfigDiff review, approval &amp; rollback</text>
-    <text x="14" y="108" fill="#B45309" font-family="monospace" font-size="10.5">omni import mcp.json · migrate --to-v6</text>
+    <text x="14" y="25" fill="#B45309" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">Skills Engine &amp; AutoCrawler</text>
+    <text x="14" y="47" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• 512 files / 16 MiB deterministic SHA-256</text>
+    <text x="14" y="66" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Auto-synthesized Tool Group playbooks</text>
+    <text x="14" y="85" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Protobuf, Thrift, OpenAPI 3.1 + Diffs</text>
+    <text x="14" y="108" fill="#B45309" font-family="monospace" font-size="10.5">skill://&lt;slug&gt;/SKILL.md</text>
   </g>
 
   <g transform="translate(890, 274)">
-    <rect width="296" height="128" rx="8" fill="#FFFFFF" stroke="#DFE3EC"/>
-    <text x="14" y="25" fill="#059669" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">SQLite WAL + CAS Store</text>
-    <text x="14" y="47" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• RegistryStorageBackend (storage-sqlite)</text>
-    <text x="14" y="66" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Atomic CAS continuation consumption</text>
-    <text x="14" y="85" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• FNV-1a WAL + atomic snapshot compaction</text>
-    <text x="14" y="108" fill="#059669" font-family="monospace" font-size="10.5">Crash-safe Saga &amp; fleet state</text>
+    <rect width="296" height="148" rx="8" fill="#FFFFFF" stroke="#DFE3EC"/>
+    <text x="14" y="25" fill="#059669" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">PgWirePool HA + SQLite + WAL</text>
+    <text x="14" y="47" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• PgWirePool (OMNI_PG_POOL_SIZE=8)</text>
+    <text x="14" y="66" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• LISTEN omni_registry_changed vs</text>
+    <text x="14" y="84" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">  omni_task_changed (no reload storm)</text>
+    <text x="14" y="103" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11.5">• Shared omni_oauth_tokens (AEAD)</text>
+    <text x="14" y="128" fill="#059669" font-family="monospace" font-size="10.5">SQL CAS · omni_mcp_tasks · file_blobs</text>
   </g>
 
-  <g transform="translate(890, 418)">
-    <rect width="296" height="248" rx="8" fill="#F5F3FF" stroke="#8B5CF6"/>
-    <text x="14" y="25" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">External MCP Fleet &amp; Targets</text>
-    <text x="14" y="50" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="600" font-size="12">1. Stdio MCP (omni-process-guard)</text>
-    <text x="14" y="68" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   ID-multiplexed, per-tool timeout_ms</text>
-    <text x="14" y="86" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   Win Job Objects / Linux killpg</text>
-    <text x="14" y="114" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="600" font-size="12">2. Streamable HTTP / SSE (rustls)</text>
-    <text x="14" y="132" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   ext://&lt;slug&gt;/&lt;uri&gt; resources &amp; prompts</text>
-    <text x="14" y="150" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   Opt-in AutoSyncScheduler</text>
-    <text x="14" y="178" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="600" font-size="12">3. Downstream Services &amp; 3P OAuth</text>
-    <text x="14" y="196" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   HTTP/gRPC/Thrift + RFC 8693 exchange</text>
-    <text x="14" y="226" fill="#6D28D9" font-family="monospace" font-size="10.5">Docker · Linux · macOS · Windows</text>
+  <g transform="translate(890, 438)">
+    <rect width="296" height="228" rx="8" fill="#F5F3FF" stroke="#8B5CF6"/>
+    <text x="14" y="25" fill="#6D28D9" font-family="-apple-system, sans-serif" font-weight="700" font-size="13.5">External Fleet &amp; Wasm Plugins</text>
+    <text x="14" y="49" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="600" font-size="12">1. Stdio MCP (omni-process-guard)</text>
+    <text x="14" y="67" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   Win Job Objects / Linux killpg</text>
+    <text x="14" y="93" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="600" font-size="12">2. Streamable HTTP / SSE (rustls)</text>
+    <text x="14" y="111" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   Auto-refresh AEAD OAuth + callbacks</text>
+    <text x="14" y="137" fill="#181A20" font-family="-apple-system, sans-serif" font-weight="600" font-size="12">3. Native .wasm Plugins &amp; Cloud</text>
+    <text x="14" y="155" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   WasmPlugin · AWS S3 · GCS · Azure</text>
+    <text x="14" y="173" fill="#4A5060" font-family="-apple-system, sans-serif" font-size="11">   HTTP/2 gRPC · REST · WebDAV</text>
+    <text x="14" y="206" fill="#6D28D9" font-family="monospace" font-size="10.5">Docker · Kubernetes · Linux · macOS · Win</text>
   </g>
 
   <!-- Connectors -->
@@ -152,6 +152,6 @@
   <line x1="324" y1="570" x2="292" y2="570" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
 
   <line x1="840" y1="190" x2="872" y2="190" stroke="#D97706" stroke-width="2" marker-end="url(#arrowAmber)"/>
-  <line x1="840" y1="335" x2="872" y2="335" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
-  <line x1="840" y1="510" x2="872" y2="510" stroke="#7C3AED" stroke-width="2" marker-end="url(#arrowViolet)"/>
+  <line x1="840" y1="345" x2="872" y2="345" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <line x1="840" y1="520" x2="872" y2="520" stroke="#7C3AED" stroke-width="2" marker-end="url(#arrowViolet)"/>
 </svg>
