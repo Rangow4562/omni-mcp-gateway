@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { SuspendedFrameItem, PendingCallbackItem } from '../types';
+import { SuspendedFrameItem, PendingCallbackItem, McpTaskItem } from '../types';
 import {
   listSuspendedFrames,
   resumeSuspendedFrame,
   cancelSuspendedFrame,
   listPendingCallbacks,
   respondPendingCallback,
+  fetchTasks,
+  respondTask,
   getToken,
   setToken,
   DEV_ROLE_TOKENS,
@@ -26,6 +28,8 @@ export const ApprovalInboxModal: React.FC<ApprovalInboxModalProps> = ({
 }) => {
   const [frames, setFrames] = useState<SuspendedFrameItem[]>([]);
   const [callbacks, setCallbacks] = useState<PendingCallbackItem[]>([]);
+  const [elicitTasks, setElicitTasks] = useState<McpTaskItem[]>([]);
+  const [formValues, setFormValues] = useState<Record<string, Record<string, any>>>({});
   const [loading, setLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -41,13 +45,19 @@ export const ApprovalInboxModal: React.FC<ApprovalInboxModalProps> = ({
       setErrorMsg(null);
     }
     try {
-      const [fList, cbList] = await Promise.all([
+      const [fList, cbList, taskList] = await Promise.all([
         listSuspendedFrames(),
         listPendingCallbacks().catch(() => []),
+        fetchTasks().catch(() => []),
       ]);
       if (reqId !== requestSeqRef.current) return;
       setFrames(fList);
       setCallbacks(cbList);
+      const frameIds = new Set(fList.map((f) => f.execution_id));
+      const pendingElicitations = (taskList as McpTaskItem[]).filter(
+        (t) => t.status === 'input_required' && !frameIds.has(t.task_id)
+      );
+      setElicitTasks(pendingElicitations);
     } catch (e: any) {
       if (reqId !== requestSeqRef.current) return;
       const msg = e?.message || 'Failed to load HITL Approval Inbox (Approver/Admin role required)';
@@ -153,6 +163,36 @@ export const ApprovalInboxModal: React.FC<ApprovalInboxModalProps> = ({
     }
   };
 
+  const updateFormField = (taskId: string, field: string, value: any) => {
+    setFormValues((prev) => ({
+      ...prev,
+      [taskId]: {
+        ...(prev[taskId] || {}),
+        [field]: value,
+      },
+    }));
+  };
+
+  const handleRespondElicitation = async (
+    task: McpTaskItem,
+    action: 'accept' | 'decline' | 'cancel'
+  ) => {
+    setBusyId(task.task_id);
+    setErrorMsg(null);
+    setStatusMsg(null);
+    try {
+      const content = action === 'accept' ? formValues[task.task_id] || {} : {};
+      await respondTask(task.task_id, action, content);
+      setStatusMsg(`Elicitation ${task.task_id} ${action}ed`);
+      await loadInbox({ background: true });
+      onUpdated?.();
+    } catch (e: any) {
+      setErrorMsg(e?.message || 'Failed to submit elicitation response');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const renderHighlightedScript = (script: string, targetTool: string) => {
     return script.split('\n').map((line, idx) => {
       const isMutationLine = line.includes(targetTool);
@@ -213,10 +253,10 @@ export const ApprovalInboxModal: React.FC<ApprovalInboxModalProps> = ({
         >
           <div>
             <h2 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: '#fff' }}>
-              🛡️ HITL Approval Inbox
+              🛡️ Unified Approval &amp; Elicitation Inbox (form / url)
             </h2>
             <div style={{ fontSize: '12px', color: '#8b8fa8', marginTop: '2px' }}>
-              Review paused mutating Code Mode continuations &amp; upstream sampling/elicitation gates
+              Review paused mutating Code Mode continuations, form/url MCP elicitations &amp; upstream sampling gates
             </div>
           </div>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
@@ -291,7 +331,7 @@ export const ApprovalInboxModal: React.FC<ApprovalInboxModalProps> = ({
             <div style={{ color: '#8b8fa8', padding: '24px', textAlign: 'center', fontSize: '13px' }}>
               Loading suspended execution frames...
             </div>
-          ) : frames.length === 0 && callbacks.length === 0 ? (
+          ) : frames.length === 0 && callbacks.length === 0 && elicitTasks.length === 0 ? (
             <div
               style={{
                 color: '#8b8fa8',
@@ -302,7 +342,7 @@ export const ApprovalInboxModal: React.FC<ApprovalInboxModalProps> = ({
                 fontSize: '13px',
               }}
             >
-              No pending HITL approvals or upstream sampling callbacks.
+              No pending HITL approvals, MCP form/url elicitations, or upstream sampling callbacks.
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -492,6 +532,259 @@ export const ApprovalInboxModal: React.FC<ApprovalInboxModalProps> = ({
                         }}
                       >
                         {busyId === frame.execution_id ? 'Resuming...' : '✓ Approve & Resume'}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {elicitTasks.map((task) => {
+                const reqs = Array.isArray(task.input_requests) ? task.input_requests : [];
+                const firstReq = reqs[0] || {};
+                const reqParams = firstReq.params || {};
+                const mode = reqParams.mode === 'url' ? 'url' : 'form';
+                const schemaProps: Record<string, any> =
+                  reqParams.requestedSchema?.properties || {};
+                const requiredFields: string[] = Array.isArray(
+                  reqParams.requestedSchema?.required
+                )
+                  ? reqParams.requestedSchema.required
+                  : [];
+                const taskForm = formValues[task.task_id] || {};
+                return (
+                  <div
+                    key={task.task_id}
+                    data-testid={`elicitation-task-${task.task_id}`}
+                    style={{
+                      backgroundColor: '#0c0d13',
+                      border: mode === 'url' ? '1px solid #2b4c7e' : '1px solid #4c3b19',
+                      borderRadius: '8px',
+                      padding: '14px 16px',
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        marginBottom: '8px',
+                      }}
+                    >
+                      <div>
+                        <span
+                          style={{
+                            backgroundColor: mode === 'url' ? '#172a4a' : '#422c0c',
+                            color: mode === 'url' ? '#79c0ff' : '#ffd27d',
+                            fontSize: '11px',
+                            fontWeight: 700,
+                            padding: '2px 8px',
+                            borderRadius: '10px',
+                            marginRight: '8px',
+                          }}
+                        >
+                          {mode === 'url' ? 'URL ELICITATION' : 'FORM ELICITATION'}
+                        </span>
+                        <strong style={{ color: '#fff', fontSize: '13px' }}>
+                          {task.server_scope || 'omni-mcp'} · {task.task_id}
+                        </strong>
+                      </div>
+                      <span style={{ fontSize: '11px', color: '#8b8fa8' }}>
+                        actor: {task.caller_actor}
+                      </span>
+                    </div>
+
+                    {(reqParams.message || task.status_message) && (
+                      <div style={{ fontSize: '12px', color: '#d1d5db', marginBottom: '10px' }}>
+                        {reqParams.message || task.status_message}
+                      </div>
+                    )}
+
+                    {mode === 'url' && reqParams.url && (
+                      <div
+                        style={{
+                          backgroundColor: '#090c14',
+                          border: '1px solid #253659',
+                          borderRadius: '6px',
+                          padding: '10px 12px',
+                          marginBottom: '12px',
+                          fontSize: '12px',
+                        }}
+                      >
+                        <div style={{ color: '#8b8fa8', marginBottom: '4px' }}>
+                          OAuth Authorization Link ({reqParams.elicitationId || task.task_id}):
+                        </div>
+                        <a
+                          href={reqParams.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{ color: '#58a6ff', wordBreak: 'break-all' }}
+                        >
+                          {reqParams.url}
+                        </a>
+                      </div>
+                    )}
+
+                    {mode === 'form' && Object.keys(schemaProps).length > 0 && (
+                      <div
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '10px',
+                          marginBottom: '12px',
+                        }}
+                      >
+                        {Object.entries(schemaProps).map(([fieldName, propDef]) => {
+                          const isRequired = requiredFields.includes(fieldName);
+                          const propType = propDef?.type || 'string';
+                          const enumValues: any[] | null = Array.isArray(propDef?.enum)
+                            ? propDef.enum
+                            : null;
+                          const currentVal = taskForm[fieldName];
+                          return (
+                            <label
+                              key={fieldName}
+                              style={{
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '4px',
+                                fontSize: '12px',
+                                color: '#c9d1d9',
+                              }}
+                            >
+                              <span>
+                                <strong>{fieldName}</strong>
+                                {isRequired && <span style={{ color: '#ff7b72' }}> *</span>}
+                                {propDef?.description && (
+                                  <span style={{ color: '#8b8fa8', marginLeft: '6px' }}>
+                                    — {propDef.description}
+                                  </span>
+                                )}
+                              </span>
+                              {enumValues ? (
+                                <select
+                                  data-testid={`elicit-input-${task.task_id}-${fieldName}`}
+                                  value={currentVal ?? ''}
+                                  onChange={(e) =>
+                                    updateFormField(task.task_id, fieldName, e.target.value)
+                                  }
+                                  style={{
+                                    backgroundColor: '#07080c',
+                                    color: '#fff',
+                                    border: '1px solid #30334a',
+                                    borderRadius: '6px',
+                                    padding: '6px 8px',
+                                    fontSize: '12px',
+                                  }}
+                                >
+                                  <option value="">-- Select --</option>
+                                  {enumValues.map((opt) => (
+                                    <option key={String(opt)} value={String(opt)}>
+                                      {String(opt)}
+                                    </option>
+                                  ))}
+                                </select>
+                              ) : propType === 'boolean' ? (
+                                <input
+                                  data-testid={`elicit-input-${task.task_id}-${fieldName}`}
+                                  type="checkbox"
+                                  checked={Boolean(currentVal)}
+                                  onChange={(e) =>
+                                    updateFormField(task.task_id, fieldName, e.target.checked)
+                                  }
+                                  style={{ width: '16px', height: '16px' }}
+                                />
+                              ) : propType === 'number' || propType === 'integer' ? (
+                                <input
+                                  data-testid={`elicit-input-${task.task_id}-${fieldName}`}
+                                  type="number"
+                                  step={propType === 'integer' ? '1' : 'any'}
+                                  value={currentVal ?? ''}
+                                  onChange={(e) =>
+                                    updateFormField(
+                                      task.task_id,
+                                      fieldName,
+                                      e.target.value === '' ? undefined : Number(e.target.value)
+                                    )
+                                  }
+                                  style={{
+                                    backgroundColor: '#07080c',
+                                    color: '#fff',
+                                    border: '1px solid #30334a',
+                                    borderRadius: '6px',
+                                    padding: '6px 8px',
+                                    fontSize: '12px',
+                                  }}
+                                />
+                              ) : (
+                                <input
+                                  data-testid={`elicit-input-${task.task_id}-${fieldName}`}
+                                  type="text"
+                                  value={currentVal ?? ''}
+                                  onChange={(e) =>
+                                    updateFormField(task.task_id, fieldName, e.target.value)
+                                  }
+                                  style={{
+                                    backgroundColor: '#07080c',
+                                    color: '#fff',
+                                    border: '1px solid #30334a',
+                                    borderRadius: '6px',
+                                    padding: '6px 8px',
+                                    fontSize: '12px',
+                                  }}
+                                />
+                              )}
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                      <button
+                        onClick={() => void handleRespondElicitation(task, 'cancel')}
+                        disabled={busyId === task.task_id}
+                        style={{
+                          backgroundColor: '#252738',
+                          border: '1px solid #35384d',
+                          color: '#c9d1d9',
+                          padding: '6px 12px',
+                          borderRadius: '6px',
+                          fontSize: '12px',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => void handleRespondElicitation(task, 'decline')}
+                        disabled={busyId === task.task_id}
+                        style={{
+                          backgroundColor: '#3b1c1c',
+                          border: '1px solid #772b2b',
+                          color: '#ff8080',
+                          padding: '6px 12px',
+                          borderRadius: '6px',
+                          fontSize: '12px',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Decline
+                      </button>
+                      <button
+                        onClick={() => void handleRespondElicitation(task, 'accept')}
+                        disabled={busyId === task.task_id}
+                        style={{
+                          backgroundColor: '#00e575',
+                          border: 'none',
+                          color: '#000',
+                          padding: '6px 14px',
+                          borderRadius: '6px',
+                          fontWeight: 700,
+                          fontSize: '12px',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {busyId === task.task_id ? 'Submitting...' : 'Accept'}
                       </button>
                     </div>
                   </div>

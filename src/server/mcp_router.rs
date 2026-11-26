@@ -56,6 +56,8 @@ impl ProductionGatewayContext {
         if path.starts_with("/api/")
             && path != "/api/openapi.json"
             && path != "/api/oauth/callback"
+            && !path.starts_with("/api/files/upload/")
+            && !path.starts_with("/api/files/download/")
             && !method.eq_ignore_ascii_case("OPTIONS")
         {
             let required_role = match path {
@@ -70,6 +72,18 @@ impl ProductionGatewayContext {
                     || path.starts_with("/api/v1/servers/external/") =>
                 {
                     AuthRole::Admin
+                }
+                "/api/skills/sync-dir" => AuthRole::Admin,
+                _ if path == "/api/skills" && method.eq_ignore_ascii_case("GET") => AuthRole::Agent,
+                _ if path.starts_with("/api/skills/") && method.eq_ignore_ascii_case("GET") => {
+                    AuthRole::Agent
+                }
+                _ if path == "/api/skills" || path.starts_with("/api/skills/") => AuthRole::Admin,
+                _ if path == "/api/tasks" && method.eq_ignore_ascii_case("GET") => {
+                    AuthRole::Operator
+                }
+                _ if path.starts_with("/api/tasks/") && method.eq_ignore_ascii_case("POST") => {
+                    AuthRole::Approver
                 }
                 "/api/servers/toggle_status"
                 | "/api/tools/toggle_status"
@@ -130,7 +144,17 @@ impl ProductionGatewayContext {
             return self.handle_get(path, query_opt, headers);
         }
 
+        if method.eq_ignore_ascii_case("PUT") {
+            if let Some(upload_id) = path.strip_prefix("/api/files/upload/") {
+                return self.handle_file_upload(upload_id, query_opt, headers, body_bytes);
+            }
+            return self.json_response(405, json!({"error": "Method not allowed"}));
+        }
+
         if method.eq_ignore_ascii_case("POST") {
+            if let Some(upload_id) = path.strip_prefix("/api/files/upload/") {
+                return self.handle_file_upload(upload_id, query_opt, headers, body_bytes);
+            }
             return self.handle_post(path, headers, body_bytes);
         }
 
@@ -257,23 +281,77 @@ impl ProductionGatewayContext {
                     .map(|sid| vec![("Mcp-Session-Id".to_string(), sid.clone())])
                     .unwrap_or_default()
             };
-            if rpc_method == "initialize" {
+            if rpc_method == "server/discover" {
+                let discover = crate::models::build_server_discover_result(
+                    &self.config,
+                    crate::models::CapabilityScope::ToolGroup(group.slug.clone()),
+                    &format!("omni-group:{}", group.slug),
+                    env!("CARGO_PKG_VERSION"),
+                    &group.description,
+                );
+                return self.json_response_with_headers(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": discover
+                    }),
+                    group_headers(),
+                );
+            } else if rpc_method == "initialize" {
+                let params = json_val
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(JsonValue::object);
+                if let Some(required) = params
+                    .get("clientCapabilities")
+                    .and_then(|c| c.get("required"))
+                    .and_then(|r| r.as_array())
+                {
+                    let unsupported: Vec<&str> = required
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .filter(|cap| {
+                            !crate::models::is_required_capability_supported(cap, &self.config)
+                        })
+                        .collect();
+                    if !unsupported.is_empty() {
+                        return self.json_response_with_headers(
+                            200,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "error": {
+                                    "code": crate::models::MISSING_REQUIRED_CLIENT_CAPABILITY,
+                                    "message": format!(
+                                        "Missing required client capabilities: {}",
+                                        unsupported.join(", ")
+                                    )
+                                }
+                            }),
+                            group_headers(),
+                        );
+                    }
+                }
+                let client_ver = params.get("protocolVersion").and_then(|v| v.as_str());
+                let negotiated = crate::models::negotiate_protocol_version(client_ver);
+                let capabilities = crate::models::build_server_capabilities(
+                    &self.config,
+                    crate::models::CapabilityScope::ToolGroup(group.slug.clone()),
+                );
                 return self.json_response_with_headers(
                     200,
                     json!({
                         "jsonrpc": "2.0",
                         "id": req_id,
                         "result": {
-                            "protocolVersion": "2025-11-25",
-                            "capabilities": {
-                                "tools": {"listChanged": false},
-                                "resources": {"listChanged": false},
-                                "prompts": {"listChanged": false}
-                            },
+                            "protocolVersion": negotiated,
+                            "capabilities": capabilities,
                             "serverInfo": {
                                 "name": format!("omni-group:{}", group.slug),
                                 "version": env!("CARGO_PKG_VERSION")
-                            }
+                            },
+                            "resultType": "complete"
                         }
                     }),
                     group_headers(),
@@ -349,14 +427,27 @@ impl ProductionGatewayContext {
                     }
                 }
                 if let Some((srv_name, t_name)) = matched_target {
+                    let mut fwd_params = json!({
+                        "name": t_name,
+                        "arguments": args
+                    });
+                    if let Some(cc) = params.get("clientCapabilities").cloned() {
+                        fwd_params.insert("clientCapabilities", cc);
+                    }
+                    if let Some(caps) = params.get("capabilities").cloned() {
+                        fwd_params.insert("capabilities", caps);
+                    }
+                    if let Some(meta) = params.get("_meta").cloned() {
+                        fwd_params.insert("_meta", meta);
+                    }
+                    if let Some(task) = params.get("task").cloned() {
+                        fwd_params.insert("task", task);
+                    }
                     let rpc_req = crate::models::RPCRequest {
                         jsonrpc: "2.0".to_string(),
                         id: req_id.clone().unwrap_or(JsonValue::Null),
                         method: "tools/call".to_string(),
-                        params: json!({
-                            "name": t_name,
-                            "arguments": args
-                        }),
+                        params: fwd_params,
                     };
                     let rpc_resp = self.gateway.handle_request_with_trace(
                         &srv_name,
@@ -401,10 +492,14 @@ impl ProductionGatewayContext {
                 );
             } else if rpc_method == "resources/templates/list"
                 || rpc_method == "resources/read"
+                || rpc_method == "resources/directory/read"
+                || rpc_method == "skills/list"
+                || rpc_method == "skills/get"
                 || rpc_method == "prompts/list"
                 || rpc_method == "prompts/get"
                 || rpc_method == "tasks/get"
                 || rpc_method == "tasks/update"
+                || rpc_method == "tasks/cancel"
             {
                 let allowed_servers: std::collections::HashSet<String> = group
                     .entries
@@ -459,7 +554,13 @@ impl ProductionGatewayContext {
                         .cloned()
                         .unwrap_or_else(JsonValue::object),
                 };
-                let mut resp = self.omni_mcp.handle_request(&rpc_req, actor, Some(token));
+                let mut resp = self.omni_mcp.handle_request_scoped(
+                    &rpc_req,
+                    actor,
+                    Some(token),
+                    Some(&group.slug),
+                    None,
+                );
                 if rpc_method == "prompts/list" {
                     if let Some(res_val) = resp.result.as_mut() {
                         if let Some(arr) = res_val.get("prompts").and_then(|p| p.as_array()) {
@@ -704,6 +805,29 @@ impl ProductionGatewayContext {
                             ),
                         };
                     }
+                }
+
+                if matches!(
+                    req_method,
+                    Some("tasks/get") | Some("tasks/update") | Some("tasks/cancel")
+                ) {
+                    let rpc_req = crate::models::RPCRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: json_val.get("id").cloned().unwrap_or(JsonValue::Null),
+                        method: req_method.unwrap_or("").to_string(),
+                        params: json_val
+                            .get("params")
+                            .cloned()
+                            .unwrap_or_else(JsonValue::object),
+                    };
+                    let resp = self.omni_mcp.handle_request_scoped(
+                        &rpc_req,
+                        actor,
+                        Some(token),
+                        None,
+                        Some(&service_name),
+                    );
+                    return self.json_response(200, resp.to_json());
                 }
 
                 match RPCBatchOrSingle::from_json(&json_val) {

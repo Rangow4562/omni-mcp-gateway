@@ -16,6 +16,7 @@ pub enum CodeModeError {
     MaxHostCallsExceeded(usize),
     GlobalOutboundBlocked(String),
     ApprovalRequired(PendingApproval),
+    Cancelled(String),
     RuntimeError(String),
 }
 
@@ -84,6 +85,7 @@ impl CodeModeError {
                 "ApprovalRequired: Tool '{}.{}' is marked as a state-mutating operation and requires approval.",
                 p.server_name, p.tool_name
             ),
+            Self::Cancelled(msg) => format!("Cancelled: {}", msg),
             Self::RuntimeError(msg) => format!("RuntimeError: {}", msg),
         }
     }

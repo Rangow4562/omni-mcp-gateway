@@ -857,6 +857,14 @@ impl CodeModeTypeGenerator {
         }
     }
 
+    pub fn generate_all_declarations(servers: &[ServerRecord]) -> String {
+        let res = Self::generate_declarations(servers, None, None);
+        format!(
+            "interface OmniFileHandle {{\n  fileId: string;\n  filename?: string;\n  mimeType?: string;\n  sizeBytes?: number;\n  sha256?: string;\n}}\n\n{}",
+            res.typescript_declarations
+        )
+    }
+
     pub fn json_schema_to_ts_type(schema: &JsonValue) -> String {
         Self::json_schema_to_ts_type_inner(schema, schema, 0)
     }
@@ -864,6 +872,12 @@ impl CodeModeTypeGenerator {
     fn json_schema_to_ts_type_inner(schema: &JsonValue, root: &JsonValue, depth: usize) -> String {
         if depth >= 8 {
             return "any".to_string();
+        }
+
+        if let Some(marker) = schema.get("x-mcp-file") {
+            if !matches!(marker, JsonValue::Bool(false) | JsonValue::Null) {
+                return "OmniFileHandle".to_string();
+            }
         }
 
         if let Some(ref_str) = schema.get("$ref").and_then(|v| v.as_str()) {

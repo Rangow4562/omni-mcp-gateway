@@ -2,6 +2,23 @@
 
 All notable changes to Omni MCP. Per-release narrative notes live in [`docs/`](docs/).
 
+## [6.8.0] - 2026-11-26
+
+### Added
+- **Unified `2026-07-28` Capability Negotiation, `server/discover` Parity & `PgWirePool`**:
+  - Unified `build_server_capabilities()` and `ClientCapabilitiesMeta::from_params()` enforcing backward-compatible `elicitation: {}` -> `form`-only semantics across `/omni/mcp`, `/groups/<slug>/mcp`, and `/<service>/mcp`.
+  - Enforced `group_slug` / `server_scope` isolation on `tasks/*` and `skills/*`.
+  - Replaced single `wire_conn` in `PostgresRegistryBackend` with bounded `PgWirePool` (`OMNI_PG_POOL_SIZE=8`) and channel-dispatched `LISTEN/NOTIFY` (`omni_registry_changed` vs `omni_task_changed`).
+- **Skills over MCP (`io.modelcontextprotocol/skills`, SEP-2640)**:
+  - Added `SkillFileEntry`, `SkillRecord::validate()` (512 files / 16 MiB, YAML frontmatter `name`/`description`, path-traversal guard, deterministic `manifest_sha256`), `src/control_plane/skills.rs` (`SkillEngine` with curated + auto-synthesized Tool Group & Service playbooks), Postgres/SQLite/WAL persistence (`omni_skills`), MCP handlers (`skills/list`, `skills/get`, `resources/read` `skill://`, `resources/directory/read`), REST `/api/v1/skills*`, and CLI `omni skills list|publish|verify`.
+- **Postgres HA-Backed MCP Tasks (`io.modelcontextprotocol/tasks`, GA)**:
+  - Added `McpTaskRecord`, `omni_mcp_tasks` across Postgres/SQLite/WAL, `src/data_plane/task_runner.rs` (`TaskManager` with grace-window promotion returning `resultType: "task"`, bounded semaphore, 60s TTL reaper, Prometheus `omni_mcp_tasks_active` & `omni_mcp_tasks_total`).
+  - Added cooperative `cancel_flag` to Code Mode VM `HostCallbacks` and Wasm `WasmHostState` (`CodeModeError::Cancelled` -> LIFO Saga rollback), and GA `tasks/get`, `tasks/update` (`inputResponses` -> `{}` ack + legacy `action` fallback), and `tasks/cancel` (`{}` ack).
+- **Governance-Driven Elicitation (`form` & `url`) + Multi-Replica HA OAuth**:
+  - Added `ElicitationPolicyRule` with strict secret-key & primitive-schema validator, `form`-mode MRTR `resultType: "input_required"` + Merkle audit on `accept`/`decline`, `url`-mode PKCE using `OMNI_PUBLIC_BASE_URL`, and shared `omni_oauth_flows`, `omni_oauth_tokens` (ChaCha20-Poly1305 AEAD), and `omni_upstream_callbacks` across Postgres/SQLite/WAL.
+- **Feature-Gated File Uploads (`io.modelcontextprotocol/files`, SEP-2356), Wasm Guest ABI v2 & Studio UI v4**:
+  - Added dual async/sync streaming upload bypass (`POST`/`PUT /api/v1/files/upload/:upload_id`, up to `OMNI_FILE_UPLOAD_MAX_BYTES=64 MiB`, `Transfer-Encoding: chunked`, `PUT` CORS), universal multi-cloud `FileBlobBackend` (`local`, `postgres`, `s3` SigV4, `gcs`, `azure`, `http`) in `src/storage/file_store.rs`, isolated `src/extension/file_uploads.rs` (`x-mcp-file`, `upload_required` MRTR, inline `<= 256 KiB`), Wasm Guest ABI v2 (`omni::file_stat`, `omni::file_read_chunk`), `HttpDownstreamClient::post_stream_file()`, chunked binary metadata in `GrpcDownstreamClient`, Governance Studio UI v4 (`SkillsStudioModal`, `TasksMonitorModal`, unified `ApprovalInboxModal`), and `omni migrate --to-v6.8`.
+
 ## [6.5.0] - 2026-11-21
 
 ### Added

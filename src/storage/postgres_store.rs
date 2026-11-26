@@ -16,13 +16,17 @@
 
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
-use crate::models::{ConfigDiff, ServerRecord, SuspendedExecutionFrame, ToolGroupRecord};
+use crate::models::{
+    ConfigDiff, FileBlobRecord, McpTaskRecord, McpTaskStatus, OAuthFlowRecord, OAuthTokenRecord,
+    PendingUpstreamCallback, ServerRecord, SkillRecord, SuspendedExecutionFrame, ToolGroupRecord,
+};
 use crate::storage::audit_log::{hmac_sha256, sha256, AuditSink, MerkleAuditRecord, GENESIS_HASH};
 use crate::storage::wal_store::{RegistryStorageBackend, WalRegistryStore};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -637,11 +641,99 @@ impl PgWireConnection {
     }
 }
 
-/// Real PostgreSQL multi-replica storage backend (`storage-postgres`, v6.5.0).
+struct PgWirePoolState {
+    idle: VecDeque<PgWireConnection>,
+    total_open: usize,
+}
+
+/// Bounded PostgreSQL Wire Protocol v3.0 connection pool (`v6.8.0`, `OMNI_PG_POOL_SIZE=8`).
+pub struct PgWirePool {
+    dsn: PgDsn,
+    max_size: usize,
+    state: Mutex<PgWirePoolState>,
+    available: Condvar,
+}
+
+impl PgWirePool {
+    pub fn new(dsn: PgDsn, max_size: usize, initial_conn: PgWireConnection) -> Self {
+        let mut idle = VecDeque::new();
+        idle.push_back(initial_conn);
+        Self {
+            dsn,
+            max_size: max_size.max(1),
+            state: Mutex::new(PgWirePoolState {
+                idle,
+                total_open: 1,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    fn checkout(&self) -> Result<PgWireConnection, String> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "PostgreSQL pool lock poisoned".to_string())?;
+        loop {
+            if let Some(conn) = guard.idle.pop_front() {
+                return Ok(conn);
+            }
+            if guard.total_open < self.max_size {
+                guard.total_open += 1;
+                drop(guard);
+                match PgWireConnection::connect(&self.dsn) {
+                    Ok(conn) => return Ok(conn),
+                    Err(e) => {
+                        if let Ok(mut g) = self.state.lock() {
+                            g.total_open = g.total_open.saturating_sub(1);
+                            self.available.notify_one();
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            let (g, _) = self
+                .available
+                .wait_timeout(guard, Duration::from_secs(5))
+                .map_err(|_| "PostgreSQL pool wait poisoned".to_string())?;
+            guard = g;
+            if let Some(conn) = guard.idle.pop_front() {
+                return Ok(conn);
+            }
+            if guard.total_open >= self.max_size {
+                return Err(format!(
+                    "PostgreSQL connection pool exhausted (max_size={})",
+                    self.max_size
+                ));
+            }
+        }
+    }
+
+    fn checkin(&self, conn: PgWireConnection) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.idle.push_back(conn);
+            self.available.notify_one();
+        }
+    }
+
+    fn discard(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.total_open = guard.total_open.saturating_sub(1);
+            self.available.notify_one();
+        }
+    }
+}
+
+/// Real PostgreSQL multi-replica storage backend (`storage-postgres`, v6.5.0 / v6.8.0).
 pub struct PostgresRegistryBackend {
     pub dsn: String,
     parsed_dsn: Option<PgDsn>,
-    wire_conn: Mutex<Option<PgWireConnection>>,
+    pool: Option<PgWirePool>,
+    pool_size: usize,
     memory_fallback: Option<WalRegistryStore>,
     memory_audit: RwLock<Vec<MerkleAuditRecord>>,
     listener_running: Arc<AtomicBool>,
@@ -654,19 +746,38 @@ impl PostgresRegistryBackend {
         CREATE TABLE IF NOT EXISTS omni_tool_groups (slug TEXT PRIMARY KEY, payload JSONB NOT NULL);
         CREATE TABLE IF NOT EXISTS omni_suspended_frames (execution_id TEXT PRIMARY KEY, payload JSONB NOT NULL);
         CREATE TABLE IF NOT EXISTS omni_audit_log (idx BIGINT PRIMARY KEY, current_hash TEXT NOT NULL, payload JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_skills (slug TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at DOUBLE PRECISION NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_mcp_tasks (task_id TEXT PRIMARY KEY, status TEXT NOT NULL, expires_at DOUBLE PRECISION NOT NULL, payload JSONB NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_omni_mcp_tasks_status_expires ON omni_mcp_tasks (status, expires_at);
+        CREATE TABLE IF NOT EXISTS omni_oauth_flows (state TEXT PRIMARY KEY, expires_at DOUBLE PRECISION NOT NULL, payload JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_oauth_tokens (server_name TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at DOUBLE PRECISION NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_upstream_callbacks (request_id TEXT PRIMARY KEY, payload JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_file_blobs (file_id TEXT PRIMARY KEY, expires_at DOUBLE PRECISION NOT NULL, payload JSONB NOT NULL);
+        CREATE TABLE IF NOT EXISTS omni_file_blob_chunks (file_id TEXT NOT NULL, chunk_idx INTEGER NOT NULL, data BYTEA NOT NULL, PRIMARY KEY (file_id, chunk_idx));
     ";
 
     pub const NOTIFY_CHANNEL: &'static str = "omni_registry_changed";
+    pub const NOTIFY_TASK_CHANNEL: &'static str = "omni_task_changed";
 
     /// Connects to a real PostgreSQL cluster via Wire Protocol v3.0 (or uses an in-memory
     /// backend with real cryptographic audit verification when `dsn == ":memory:"`).
     pub fn connect(dsn: impl Into<String>) -> Result<Self, String> {
+        let pool_size = crate::config::get_config().pg_pool_size;
+        Self::connect_with_pool_size(dsn, pool_size)
+    }
+
+    pub fn connect_with_pool_size(
+        dsn: impl Into<String>,
+        pool_size: usize,
+    ) -> Result<Self, String> {
         let dsn = dsn.into();
+        let pool_size = pool_size.clamp(1, 128);
         if dsn == ":memory:" {
             return Ok(Self {
                 dsn,
                 parsed_dsn: None,
-                wire_conn: Mutex::new(None),
+                pool: None,
+                pool_size,
                 memory_fallback: Some(WalRegistryStore::new(":memory:")),
                 memory_audit: RwLock::new(Vec::new()),
                 listener_running: Arc::new(AtomicBool::new(false)),
@@ -677,47 +788,57 @@ impl PostgresRegistryBackend {
         let mut conn = PgWireConnection::connect(&parsed)?;
         conn.execute_simple(Self::SCHEMA_SQL)
             .map_err(|e| format!("Failed to initialize PostgreSQL schema: {}", e))?;
+        let pool = PgWirePool::new(parsed.clone(), pool_size, conn);
 
         Ok(Self {
             dsn,
             parsed_dsn: Some(parsed),
-            wire_conn: Mutex::new(Some(conn)),
+            pool: Some(pool),
+            pool_size,
             memory_fallback: None,
             memory_audit: RwLock::new(Vec::new()),
             listener_running: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Executes a parameterized query against PostgreSQL with 1 automatic reconnect attempt.
+    pub fn pool_size(&self) -> usize {
+        self.pool
+            .as_ref()
+            .map(|p| p.max_size())
+            .unwrap_or(self.pool_size)
+    }
+
+    /// Executes a parameterized query against PostgreSQL via `PgWirePool` with 1 automatic reconnect attempt.
     fn run_query(&self, sql: &str, params: &[&str]) -> Result<Vec<Vec<Option<String>>>, String> {
-        let mut guard = self
-            .wire_conn
-            .lock()
-            .map_err(|_| "PostgreSQL connection lock poisoned".to_string())?;
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| "PostgreSQL connection pool not initialized".to_string())?;
+        let mut conn = pool.checkout()?;
 
-        if guard.is_none() {
-            if let Some(ref parsed) = self.parsed_dsn {
-                let conn = PgWireConnection::connect(parsed)?;
-                *guard = Some(conn);
-            } else {
-                return Err("PostgreSQL connection not initialized".to_string());
-            }
-        }
-
-        let first_attempt = guard.as_mut().unwrap().execute_params(sql, params);
+        let first_attempt = conn.execute_params(sql, params);
         match first_attempt {
-            Ok(rows) => Ok(rows),
+            Ok(rows) => {
+                pool.checkin(conn);
+                Ok(rows)
+            }
             Err(first_err) => {
                 // Only reconnect on transport/socket errors — never replay SQL errors
                 if first_err.starts_with("PostgreSQL error") {
+                    pool.checkin(conn);
                     return Err(first_err);
                 }
-                *guard = None;
+                drop(conn);
+                pool.discard();
                 if let Some(ref parsed) = self.parsed_dsn {
                     if let Ok(mut fresh) = PgWireConnection::connect(parsed) {
                         let retry = fresh.execute_params(sql, params);
                         if retry.is_ok() {
-                            *guard = Some(fresh);
+                            if let Ok(mut g) = pool.state.lock() {
+                                g.total_open += 1;
+                                g.idle.push_back(fresh);
+                                pool.available.notify_one();
+                            }
                         }
                         return retry;
                     }
@@ -728,6 +849,10 @@ impl PostgresRegistryBackend {
     }
 
     fn emit_notify(&self, key: &str) {
+        self.emit_notify_channel(Self::NOTIFY_CHANNEL, key);
+    }
+
+    pub fn emit_notify_channel(&self, channel: &str, key: &str) {
         if self.memory_fallback.is_some() {
             return;
         }
@@ -735,19 +860,24 @@ impl PostgresRegistryBackend {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
             .collect();
-        let sql = format!("NOTIFY {}, '{}'", Self::NOTIFY_CHANNEL, sanitized);
-        if let Ok(mut guard) = self.wire_conn.lock() {
-            if let Some(ref mut conn) = *guard {
-                let _ = conn.execute_simple(&sql);
+        let sql = format!("NOTIFY {}, '{}'", channel, sanitized);
+        if let Some(ref pool) = self.pool {
+            if let Ok(mut conn) = pool.checkout() {
+                if conn.execute_simple(&sql).is_ok() {
+                    pool.checkin(conn);
+                } else {
+                    drop(conn);
+                    pool.discard();
+                }
             }
         }
     }
 
-    /// Starts a dedicated background PostgreSQL `LISTEN omni_registry_changed` connection
-    /// that invokes `on_change(payload)` immediately when sibling replicas commit mutations.
-    pub fn start_invalidation_listener<F>(&self, on_change: F) -> Result<(), String>
+    /// Starts a dedicated background PostgreSQL `LISTEN omni_registry_changed; LISTEN omni_task_changed;`
+    /// connection that invokes `on_event(channel, payload)` immediately when sibling replicas commit mutations.
+    pub fn start_channel_invalidation_listener<F>(&self, on_event: F) -> Result<(), String>
     where
-        F: Fn(&str) + Send + Sync + 'static,
+        F: Fn(&str, &str) + Send + Sync + 'static,
     {
         let parsed = match &self.parsed_dsn {
             Some(p) => p.clone(),
@@ -757,8 +887,13 @@ impl PostgresRegistryBackend {
             return Ok(());
         }
         let running = self.listener_running.clone();
+        let listen_sql = format!(
+            "LISTEN {}; LISTEN {};",
+            Self::NOTIFY_CHANNEL,
+            Self::NOTIFY_TASK_CHANNEL
+        );
         let mut listen_conn = PgWireConnection::connect(&parsed)?;
-        listen_conn.execute_simple(&format!("LISTEN {}", Self::NOTIFY_CHANNEL))?;
+        listen_conn.execute_simple(&listen_sql)?;
 
         thread::spawn(move || {
             let mut conn = Some(listen_conn);
@@ -766,10 +901,7 @@ impl PostgresRegistryBackend {
                 if conn.is_none() {
                     thread::sleep(Duration::from_millis(250));
                     if let Ok(mut fresh) = PgWireConnection::connect(&parsed) {
-                        if fresh
-                            .execute_simple(&format!("LISTEN {}", Self::NOTIFY_CHANNEL))
-                            .is_ok()
-                        {
+                        if fresh.execute_simple(&listen_sql).is_ok() {
                             conn = Some(fresh);
                         }
                     }
@@ -780,8 +912,8 @@ impl PostgresRegistryBackend {
                     .unwrap()
                     .poll_notification(Duration::from_millis(200));
                 match poll_res {
-                    Ok(Some((_channel, payload))) => {
-                        on_change(&payload);
+                    Ok(Some((channel, payload))) => {
+                        on_event(&channel, &payload);
                     }
                     Ok(None) => {}
                     Err(_) => {
@@ -791,6 +923,19 @@ impl PostgresRegistryBackend {
             }
         });
         Ok(())
+    }
+
+    /// Backward-compatible invalidation listener invoking `on_change(payload)` only for
+    /// `omni_registry_changed` events (never reloading catalog on `omni_task_changed`).
+    pub fn start_invalidation_listener<F>(&self, on_change: F) -> Result<(), String>
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.start_channel_invalidation_listener(move |channel, payload| {
+            if channel == Self::NOTIFY_CHANNEL {
+                on_change(payload);
+            }
+        })
     }
 
     pub fn stop_invalidation_listener(&self) {
@@ -1073,6 +1218,483 @@ impl RegistryStorageBackend for PostgresRegistryBackend {
         frame.approver_identity = Some(approver.to_string());
         self.emit_notify(&format!("frame_consumed:{}", execution_id));
         Ok(frame)
+    }
+
+    fn load_all_skills(&self) -> Vec<SkillRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.load_all_skills();
+        }
+        let rows = match self.run_query(
+            "SELECT payload::text FROM omni_skills ORDER BY slug ASC",
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| SkillRecord::from_json(&j))
+            .collect()
+    }
+
+    fn save_skill(&self, skill: &SkillRecord) {
+        if let Some(ref mem) = self.memory_fallback {
+            mem.save_skill(skill);
+            return;
+        }
+        let payload = skill.to_json().to_string_compact();
+        let updated_at = skill.updated_at.to_string();
+        let _ = self.run_query(
+            "INSERT INTO omni_skills (slug, payload, updated_at) VALUES ($1, $2::jsonb, $3::double precision) \
+             ON CONFLICT (slug) DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at",
+            &[&skill.slug, &payload, &updated_at],
+        );
+        self.emit_notify(&format!("skill:{}", skill.slug));
+    }
+
+    fn delete_skill(&self, slug: &str) -> Option<SkillRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.delete_skill(slug);
+        }
+        let rows = self
+            .run_query(
+                "DELETE FROM omni_skills WHERE slug = $1 RETURNING payload::text",
+                &[slug],
+            )
+            .ok()?;
+        let payload = rows.into_iter().next()?.into_iter().next().flatten()?;
+        self.emit_notify(&format!("skill:{}", slug));
+        let json = JsonValue::parse(&payload).ok()?;
+        SkillRecord::from_json(&json)
+    }
+
+    fn load_all_mcp_tasks(&self) -> Vec<McpTaskRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.load_all_mcp_tasks();
+        }
+        let rows = match self.run_query(
+            "SELECT payload::text FROM omni_mcp_tasks ORDER BY task_id DESC",
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| McpTaskRecord::from_json(&j))
+            .collect()
+    }
+
+    fn get_mcp_task(&self, task_id: &str) -> Option<McpTaskRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.get_mcp_task(task_id);
+        }
+        let rows = self
+            .run_query(
+                "SELECT payload::text FROM omni_mcp_tasks WHERE task_id = $1",
+                &[task_id],
+            )
+            .ok()?;
+        let payload = rows.into_iter().next()?.into_iter().next().flatten()?;
+        let json = JsonValue::parse(&payload).ok()?;
+        McpTaskRecord::from_json(&json)
+    }
+
+    fn save_mcp_task(&self, task: &McpTaskRecord) {
+        if let Some(ref mem) = self.memory_fallback {
+            mem.save_mcp_task(task);
+            return;
+        }
+        let payload = task.to_json().to_string_compact();
+        let expires_at = task.expires_at.to_string();
+        let _ = self.run_query(
+            "INSERT INTO omni_mcp_tasks (task_id, status, expires_at, payload) \
+             VALUES ($1, $2, $3::double precision, $4::jsonb) \
+             ON CONFLICT (task_id) DO UPDATE SET status = EXCLUDED.status, expires_at = EXCLUDED.expires_at, payload = EXCLUDED.payload",
+            &[&task.task_id, task.status.as_str(), &expires_at, &payload],
+        );
+        self.emit_notify_channel(
+            Self::NOTIFY_TASK_CHANNEL,
+            &format!("task:{}:{}", task.task_id, task.status.as_str()),
+        );
+    }
+
+    fn update_mcp_task_cas(
+        &self,
+        task_id: &str,
+        expected_status: McpTaskStatus,
+        updated: &McpTaskRecord,
+    ) -> Result<McpTaskRecord, String> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.update_mcp_task_cas(task_id, expected_status, updated);
+        }
+        let payload = updated.to_json().to_string_compact();
+        let expires_at = updated.expires_at.to_string();
+        let rows = self.run_query(
+            "UPDATE omni_mcp_tasks SET status = $1, expires_at = $2::double precision, payload = $3::jsonb \
+             WHERE task_id = $4 AND status = $5 RETURNING payload::text",
+            &[
+                updated.status.as_str(),
+                &expires_at,
+                &payload,
+                task_id,
+                expected_status.as_str(),
+            ],
+        )?;
+        if rows.is_empty() {
+            return Err(format!(
+                "Task '{}' not found or status mismatch (expected '{}')",
+                task_id,
+                expected_status.as_str()
+            ));
+        }
+        self.emit_notify_channel(
+            Self::NOTIFY_TASK_CHANNEL,
+            &format!("task:{}:{}", task_id, updated.status.as_str()),
+        );
+        Ok(updated.clone())
+    }
+
+    fn request_mcp_task_cancel(&self, task_id: &str) -> Option<McpTaskRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.request_mcp_task_cancel(task_id);
+        }
+        let mut task = self.get_mcp_task(task_id)?;
+        task.cancel_requested = true;
+        if !task.status.is_terminal() {
+            task.status = McpTaskStatus::Cancelled;
+            task.status_message = Some("Cancelled by client".to_string());
+        }
+        task.updated_at = now_epoch_secs();
+        self.save_mcp_task(&task);
+        self.emit_notify_channel(Self::NOTIFY_TASK_CHANNEL, &format!("cancel:{}", task_id));
+        Some(task)
+    }
+
+    fn purge_expired_mcp_tasks(&self, now_epoch: f64) -> usize {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.purge_expired_mcp_tasks(now_epoch);
+        }
+        let now_str = now_epoch.to_string();
+        let rows = self
+            .run_query(
+                "DELETE FROM omni_mcp_tasks WHERE expires_at <= $1::double precision RETURNING task_id",
+                &[&now_str],
+            )
+            .unwrap_or_default();
+        rows.len()
+    }
+
+    fn save_oauth_flow(&self, flow: &OAuthFlowRecord) {
+        if let Some(ref mem) = self.memory_fallback {
+            mem.save_oauth_flow(flow);
+            return;
+        }
+        let payload = flow.to_json().to_string_compact();
+        let expires_at = flow.expires_at.to_string();
+        let _ = self.run_query(
+            "INSERT INTO omni_oauth_flows (state, expires_at, payload) VALUES ($1, $2::double precision, $3::jsonb) \
+             ON CONFLICT (state) DO UPDATE SET expires_at = EXCLUDED.expires_at, payload = EXCLUDED.payload",
+            &[&flow.state, &expires_at, &payload],
+        );
+    }
+
+    fn load_all_oauth_flows(&self) -> Vec<OAuthFlowRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.load_all_oauth_flows();
+        }
+        let rows = match self.run_query(
+            "SELECT payload::text FROM omni_oauth_flows ORDER BY state ASC",
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| OAuthFlowRecord::from_json(&j))
+            .collect()
+    }
+
+    fn take_oauth_flow(&self, state: &str) -> Option<OAuthFlowRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.take_oauth_flow(state);
+        }
+        let rows = self
+            .run_query(
+                "DELETE FROM omni_oauth_flows WHERE state = $1 RETURNING payload::text",
+                &[state],
+            )
+            .ok()?;
+        let payload = rows.into_iter().next()?.into_iter().next().flatten()?;
+        let json = JsonValue::parse(&payload).ok()?;
+        OAuthFlowRecord::from_json(&json)
+    }
+
+    fn save_oauth_token(&self, token: &OAuthTokenRecord) {
+        if let Some(ref mem) = self.memory_fallback {
+            mem.save_oauth_token(token);
+            return;
+        }
+        let payload = token.to_json().to_string_compact();
+        let updated_at = token.updated_at.to_string();
+        let _ = self.run_query(
+            "INSERT INTO omni_oauth_tokens (server_name, payload, updated_at) VALUES ($1, $2::jsonb, $3::double precision) \
+             ON CONFLICT (server_name) DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at",
+            &[&token.server_name, &payload, &updated_at],
+        );
+    }
+
+    fn load_all_oauth_tokens(&self) -> Vec<OAuthTokenRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.load_all_oauth_tokens();
+        }
+        let rows = match self.run_query(
+            "SELECT payload::text FROM omni_oauth_tokens ORDER BY server_name ASC",
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| OAuthTokenRecord::from_json(&j))
+            .collect()
+    }
+
+    fn get_oauth_token(&self, server_name: &str) -> Option<OAuthTokenRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.get_oauth_token(server_name);
+        }
+        let rows = self
+            .run_query(
+                "SELECT payload::text FROM omni_oauth_tokens WHERE server_name = $1",
+                &[server_name],
+            )
+            .ok()?;
+        let payload = rows.into_iter().next()?.into_iter().next().flatten()?;
+        let json = JsonValue::parse(&payload).ok()?;
+        OAuthTokenRecord::from_json(&json)
+    }
+
+    fn delete_oauth_token(&self, server_name: &str) -> Option<OAuthTokenRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.delete_oauth_token(server_name);
+        }
+        let rows = self
+            .run_query(
+                "DELETE FROM omni_oauth_tokens WHERE server_name = $1 RETURNING payload::text",
+                &[server_name],
+            )
+            .ok()?;
+        let payload = rows.into_iter().next()?.into_iter().next().flatten()?;
+        let json = JsonValue::parse(&payload).ok()?;
+        OAuthTokenRecord::from_json(&json)
+    }
+
+    fn save_upstream_callback(&self, cb: &PendingUpstreamCallback) {
+        if let Some(ref mem) = self.memory_fallback {
+            mem.save_upstream_callback(cb);
+            return;
+        }
+        let payload = cb.to_json().to_string_compact();
+        let _ = self.run_query(
+            "INSERT INTO omni_upstream_callbacks (request_id, payload) VALUES ($1, $2::jsonb) \
+             ON CONFLICT (request_id) DO UPDATE SET payload = EXCLUDED.payload",
+            &[&cb.callback_id, &payload],
+        );
+    }
+
+    fn load_all_upstream_callbacks(&self) -> Vec<PendingUpstreamCallback> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.load_all_upstream_callbacks();
+        }
+        let rows = match self.run_query(
+            "SELECT payload::text FROM omni_upstream_callbacks ORDER BY request_id ASC",
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| PendingUpstreamCallback::from_json(&j))
+            .collect()
+    }
+
+    fn delete_upstream_callback(&self, request_id: &str) -> Option<PendingUpstreamCallback> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.delete_upstream_callback(request_id);
+        }
+        let rows = self
+            .run_query(
+                "DELETE FROM omni_upstream_callbacks WHERE request_id = $1 RETURNING payload::text",
+                &[request_id],
+            )
+            .ok()?;
+        let payload = rows.into_iter().next()?.into_iter().next().flatten()?;
+        let json = JsonValue::parse(&payload).ok()?;
+        PendingUpstreamCallback::from_json(&json)
+    }
+
+    fn save_file_blob(&self, blob: &FileBlobRecord) {
+        if let Some(ref mem) = self.memory_fallback {
+            mem.save_file_blob(blob);
+            return;
+        }
+        let payload = blob.to_json().to_string_compact();
+        let expires_at = blob.expires_at.to_string();
+        let _ = self.run_query(
+            "INSERT INTO omni_file_blobs (file_id, expires_at, payload) VALUES ($1, $2::double precision, $3::jsonb) \
+             ON CONFLICT (file_id) DO UPDATE SET expires_at = EXCLUDED.expires_at, payload = EXCLUDED.payload",
+            &[&blob.file_id, &expires_at, &payload],
+        );
+    }
+
+    fn load_all_file_blobs(&self) -> Vec<FileBlobRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.load_all_file_blobs();
+        }
+        let rows = match self.run_query(
+            "SELECT payload::text FROM omni_file_blobs ORDER BY file_id ASC",
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| FileBlobRecord::from_json(&j))
+            .collect()
+    }
+
+    fn get_file_blob(&self, file_id: &str) -> Option<FileBlobRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.get_file_blob(file_id);
+        }
+        let rows = self
+            .run_query(
+                "SELECT payload::text FROM omni_file_blobs WHERE file_id = $1",
+                &[file_id],
+            )
+            .ok()?;
+        let payload = rows.into_iter().next()?.into_iter().next().flatten()?;
+        let json = JsonValue::parse(&payload).ok()?;
+        FileBlobRecord::from_json(&json)
+    }
+
+    fn delete_file_blob(&self, file_id: &str) -> Option<FileBlobRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.delete_file_blob(file_id);
+        }
+        let _ = self.run_query(
+            "DELETE FROM omni_file_blob_chunks WHERE file_id = $1",
+            &[file_id],
+        );
+        let rows = self
+            .run_query(
+                "DELETE FROM omni_file_blobs WHERE file_id = $1 RETURNING payload::text",
+                &[file_id],
+            )
+            .ok()?;
+        let payload = rows.into_iter().next()?.into_iter().next().flatten()?;
+        let json = JsonValue::parse(&payload).ok()?;
+        FileBlobRecord::from_json(&json)
+    }
+
+    fn purge_expired_file_blobs(&self, now_epoch: f64) -> Vec<FileBlobRecord> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.purge_expired_file_blobs(now_epoch);
+        }
+        let now_str = now_epoch.to_string();
+        let rows = self
+            .run_query(
+                "DELETE FROM omni_file_blobs WHERE expires_at <= $1::double precision RETURNING payload::text",
+                &[&now_str],
+            )
+            .unwrap_or_default();
+        let removed: Vec<FileBlobRecord> = rows
+            .into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| FileBlobRecord::from_json(&j))
+            .collect();
+        for blob in &removed {
+            let _ = self.run_query(
+                "DELETE FROM omni_file_blob_chunks WHERE file_id = $1",
+                &[&blob.file_id],
+            );
+        }
+        removed
+    }
+
+    fn save_file_blob_chunk(
+        &self,
+        file_id: &str,
+        chunk_idx: u32,
+        data: &[u8],
+    ) -> Result<(), String> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.save_file_blob_chunk(file_id, chunk_idx, data);
+        }
+        let idx_str = chunk_idx.to_string();
+        let mut hex = String::with_capacity(data.len() * 2 + 2);
+        hex.push_str("\\x");
+        for b in data {
+            hex.push_str(&format!("{:02x}", b));
+        }
+        self.run_query(
+            "INSERT INTO omni_file_blob_chunks (file_id, chunk_idx, data) VALUES ($1, $2::integer, $3::bytea) \
+             ON CONFLICT (file_id, chunk_idx) DO UPDATE SET data = EXCLUDED.data",
+            &[file_id, &idx_str, &hex],
+        )?;
+        Ok(())
+    }
+
+    fn load_file_blob_chunks(&self, file_id: &str) -> Result<Vec<Vec<u8>>, String> {
+        if let Some(ref mem) = self.memory_fallback {
+            return mem.load_file_blob_chunks(file_id);
+        }
+        let rows = self.run_query(
+            "SELECT encode(data, 'hex') FROM omni_file_blob_chunks WHERE file_id = $1 ORDER BY chunk_idx ASC",
+            &[file_id],
+        )?;
+        if rows.is_empty() {
+            return Err(format!("No chunks found for file '{}'", file_id));
+        }
+        let mut chunks = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(hex_str) = row.into_iter().next().flatten() {
+                let mut bytes = Vec::with_capacity(hex_str.len() / 2);
+                let mut chars = hex_str.as_bytes().chunks_exact(2);
+                for pair in &mut chars {
+                    if let Ok(s) = std::str::from_utf8(pair) {
+                        if let Ok(b) = u8::from_str_radix(s, 16) {
+                            bytes.push(b);
+                        }
+                    }
+                }
+                chunks.push(bytes);
+            }
+        }
+        Ok(chunks)
+    }
+
+    fn delete_file_blob_chunks(&self, file_id: &str) {
+        if let Some(ref mem) = self.memory_fallback {
+            mem.delete_file_blob_chunks(file_id);
+            return;
+        }
+        let _ = self.run_query(
+            "DELETE FROM omni_file_blob_chunks WHERE file_id = $1",
+            &[file_id],
+        );
     }
 }
 

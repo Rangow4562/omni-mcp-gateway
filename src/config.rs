@@ -33,6 +33,20 @@ pub struct OmniConfig {
     pub embedding_url: Option<String>,
     pub otlp_endpoint: Option<String>,
     pub otlp_flush_interval_ms: u64,
+    // v6.8.0 Enterprise MCP Extension, Pool, Tasks & File Upload Settings
+    pub pg_pool_size: usize,
+    pub enable_skills_extension: bool,
+    pub enable_tasks_extension: bool,
+    pub enable_file_uploads_extension: bool,
+    pub public_base_url: String,
+    pub task_sync_grace_ms: u64,
+    pub max_concurrent_tasks: usize,
+    pub task_ttl_sec: u64,
+    pub file_upload_max_bytes: usize,
+    pub file_upload_ttl_sec: u64,
+    pub file_storage_backend: String,
+    pub uploads_dir: PathBuf,
+    pub pod_id: String,
 }
 
 impl Default for OmniConfig {
@@ -57,17 +71,32 @@ impl OmniConfig {
             .unwrap_or_else(|_| "true".to_string())
             .to_lowercase();
 
+        let host = env::var("OMNI_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port: u16 = env::var("OMNI_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8080);
+        let data_dir = env::var("OMNI_DATA_DIR").unwrap_or(default_data_dir);
+        let default_uploads_dir = {
+            let mut p = PathBuf::from(&data_dir);
+            p.push("uploads");
+            p
+        };
+        let default_public_base_url = format!("http://{}:{}", host, port);
+        let parse_bool_env = |key: &str, default_val: bool| -> bool {
+            env::var(key)
+                .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(default_val)
+        };
+
         Self {
             env: env::var("OMNI_ENV").unwrap_or_else(|_| "production".to_string()),
-            host: env::var("OMNI_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-            port: env::var("OMNI_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8080),
+            host,
+            port,
             log_level: env::var("OMNI_LOG_LEVEL")
                 .unwrap_or_else(|_| "INFO".to_string())
                 .to_uppercase(),
-            data_dir: env::var("OMNI_DATA_DIR").unwrap_or(default_data_dir),
+            data_dir,
             cache_refresh_interval_sec: env::var("OMNI_CACHE_REFRESH_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -153,6 +182,54 @@ impl OmniConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5000),
+            pg_pool_size: env::var("OMNI_PG_POOL_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|n| n.clamp(1, 128))
+                .unwrap_or(8),
+            enable_skills_extension: parse_bool_env("OMNI_ENABLE_SKILLS_EXTENSION", true),
+            enable_tasks_extension: parse_bool_env("OMNI_ENABLE_TASKS_EXTENSION", true),
+            enable_file_uploads_extension: parse_bool_env(
+                "OMNI_ENABLE_FILE_UPLOADS_EXTENSION",
+                false,
+            ),
+            public_base_url: env::var("OMNI_PUBLIC_BASE_URL")
+                .ok()
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(default_public_base_url),
+            task_sync_grace_ms: env::var("OMNI_TASK_SYNC_GRACE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(250),
+            max_concurrent_tasks: env::var("OMNI_MAX_CONCURRENT_TASKS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|n| n.clamp(1, 1024))
+                .unwrap_or(64),
+            task_ttl_sec: env::var("OMNI_TASK_TTL_SEC")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600),
+            file_upload_max_bytes: env::var("OMNI_FILE_UPLOAD_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64 * 1024 * 1024),
+            file_upload_ttl_sec: env::var("OMNI_FILE_UPLOAD_TTL_SEC")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900),
+            file_storage_backend: env::var("OMNI_FILE_STORAGE_BACKEND")
+                .unwrap_or_else(|_| "local".to_string())
+                .trim()
+                .to_lowercase(),
+            uploads_dir: env::var("OMNI_UPLOADS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or(default_uploads_dir),
+            pod_id: env::var("OMNI_POD_ID")
+                .or_else(|_| env::var("HOSTNAME"))
+                .or_else(|_| env::var("COMPUTERNAME"))
+                .unwrap_or_else(|_| "omni-pod-local".to_string()),
         }
     }
 }

@@ -14,20 +14,20 @@
           "server",
           "security",
           "gateway",
-          "upstream",
-          "fleet"
+          "upstream"
         ],
         "note": "Follow one governed request from an MCP client to the external fleet."
       },
       {
         "id": "control-plane",
-        "label": "Control plane",
+        "label": "Control plane & HA state",
         "focus": [
           "registry",
-          "audit",
+          "skills",
+          "tasks",
           "gateway"
         ],
-        "note": "Registry state is WAL-backed and syncs into the CoW routing table."
+        "note": "Registry, Skills and Tasks state is HA-backed (Postgres / SQLite / WAL) and syncs into the CoW routing table."
       },
       {
         "id": "codemode",
@@ -38,6 +38,17 @@
           "services"
         ],
         "note": "Scripts run in the in-process VM and fan out to translated services."
+      },
+      {
+        "id": "v68-surfaces",
+        "label": "New in v6.8.0",
+        "focus": [
+          "skills",
+          "tasks",
+          "files",
+          "security"
+        ],
+        "note": "Skills over MCP, HA-backed Tasks, elicitation governance, streaming file uploads."
       }
     ]
   },
@@ -46,7 +57,7 @@
       "id": "ui",
       "type": "frontend",
       "label": "Fleet & Studio UI",
-      "sublabel": "React · ui/dist",
+      "sublabel": "Studio v4 · Skills · Tasks · Inbox",
       "pos": [
         15,
         80
@@ -89,7 +100,7 @@
       "id": "security",
       "type": "security",
       "label": "Security Charter",
-      "sublabel": "ABAC · rate limit · PII redaction",
+      "sublabel": "ABAC · elicitation · PII redaction",
       "pos": [
         410,
         235
@@ -116,6 +127,20 @@
       "tag": "canary"
     },
     {
+      "id": "upstream",
+      "type": "external",
+      "label": "External MCP Fleet",
+      "sublabel": "stdio · Streamable HTTP · rustls",
+      "pos": [
+        800,
+        235
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
       "id": "services",
       "type": "external",
       "label": "Enterprise Services",
@@ -133,7 +158,7 @@
       "id": "codemode",
       "type": "backend",
       "label": "Code Mode",
-      "sublabel": "AST VM · wasm sandbox",
+      "sublabel": "AST VM · Wasm ABI v2",
       "pos": [
         800,
         80
@@ -145,52 +170,40 @@
       "tag": "wasmi"
     },
     {
-      "id": "upstream",
+      "id": "skills",
       "type": "backend",
-      "label": "Upstream Clients",
-      "sublabel": "stdio · Streamable HTTP",
+      "label": "Skills Engine",
+      "sublabel": "curated + synthesized · SHA-256",
       "pos": [
-        800,
-        235
-      ],
-      "size": [
-        150,
-        64
-      ]
-    },
-    {
-      "id": "fleet",
-      "type": "external",
-      "label": "External MCP Fleet",
-      "sublabel": "guarded subprocesses · rustls",
-      "pos": [
-        800,
+        215,
         370
       ],
       "size": [
         150,
-        60
-      ]
+        64
+      ],
+      "tag": "SEP-2640"
     },
     {
-      "id": "audit",
-      "type": "database",
-      "label": "Merkle Audit Log",
-      "sublabel": "SHA-256 chain",
+      "id": "files",
+      "type": "backend",
+      "label": "File Uploads",
+      "sublabel": "FileBlobBackend · s3/gcs/azure",
       "pos": [
         410,
         370
       ],
       "size": [
         150,
-        60
-      ]
+        64
+      ],
+      "tag": "SEP-2356"
     },
     {
       "id": "registry",
       "type": "backend",
       "label": "Control Plane",
-      "sublabel": "MCPRegistry · IDL crawler · WAL",
+      "sublabel": "MCPRegistry · IDL · PgWirePool",
       "pos": [
         605,
         370
@@ -200,6 +213,21 @@
         64
       ],
       "tag": "BM25"
+    },
+    {
+      "id": "tasks",
+      "type": "backend",
+      "label": "MCP Tasks",
+      "sublabel": "TaskManager · CAS · TTL reaper",
+      "pos": [
+        800,
+        370
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "GA"
     }
   ],
   "connections": [
@@ -237,13 +265,6 @@
       "label": "proxy"
     },
     {
-      "id": "upstream-fleet",
-      "from": "upstream",
-      "to": "fleet",
-      "label": "connect",
-      "labelDy": 24
-    },
-    {
       "id": "gateway-codemode",
       "from": "gateway",
       "to": "codemode",
@@ -275,10 +296,23 @@
       "label": "routing sync"
     },
     {
-      "id": "server-audit",
+      "id": "server-skills",
       "from": "server",
-      "to": "audit",
-      "label": "audit trail"
+      "to": "skills",
+      "label": "skills/list · get",
+      "labelDy": 24
+    },
+    {
+      "id": "server-files",
+      "from": "server",
+      "to": "files",
+      "label": "chunked upload"
+    },
+    {
+      "id": "gateway-tasks",
+      "from": "gateway",
+      "to": "tasks",
+      "label": "task lifecycle"
     }
   ],
   "cards": [
@@ -286,29 +320,29 @@
       "dot": "cyan",
       "title": "Entry points & governance",
       "items": [
-        "omni-gateway serves HTTP :8080 or runs behind --stdio; omni / aifx CLIs link the same lib",
-        "React Fleet & Studio UI served from ui/dist with OIDC/JWKS, role-scoped access",
-        "ABAC charter policies, 16-shard rate limiting, DFA PII redaction, Merkle-chained audit"
+        "omni-gateway serves HTTP :8080 or runs behind --stdio; unified 2026-07-28 capability negotiation and server/discover parity across /omni/mcp, /groups/<slug>/mcp and /<service>/mcp",
+        "Studio UI v4: Skills Studio, Tasks Monitor and a unified Approval & Elicitation Inbox",
+        "ABAC charter policies plus ElicitationPolicyRule, 16-shard rate limiting, DFA PII redaction, Merkle-chained audit on accept/decline"
       ]
     },
     {
       "dot": "emerald",
-      "title": "Data & control plane",
+      "title": "Control plane & HA state",
       "items": [
-        "CoW Arc routing table with canary routing, fallback, circuit breakers",
-        "In-memory config cache plus semantic TTL response cache",
-        "MCPRegistry diff / approval / rollback backed by a durable WAL store",
-        "IDL AutoCrawler turns Protobuf / Thrift / OpenAPI into MCP tools"
+        "CoW Arc routing table with canary routing, fallback and circuit breakers; bounded PgWirePool (OMNI_PG_POOL_SIZE=8) ends single-connection starvation",
+        "Channel-dispatched LISTEN/NOTIFY (omni_registry_changed vs omni_task_changed) prevents task updates from triggering server catalog reload storms",
+        "Fleet-aware SkillEngine merges curated persisted skills with auto-synthesized Tool Group / Virtual Service Code Mode playbooks, digested to manifest_sha256",
+        "Multi-replica HA OAuth flows and tokens (ChaCha20-Poly1305 AEAD) across Postgres / SQLite / WAL; migrate state with omni migrate --to-v6.8"
       ]
     },
     {
       "dot": "violet",
-      "title": "Code Mode & external fleet",
+      "title": "Code Mode, tasks & files",
       "items": [
-        "In-process AST VM (~100 µs) with optional wasmi sandbox",
-        "SSA auto-parallelization, columnar pushdown, resumable continuations",
-        "HITL approval gates with LIFO Saga rollback",
-        "stdio subprocesses under omni-process-guard; secrets from {env:} / {file:} only"
+        "In-process AST VM (~100 µs) with optional wasmi sandbox; Wasm Guest ABI v2 adds omni::file_stat and omni::file_read_chunk (max 256 KiB/call, fuel-metered, no ambient FS access)",
+        "GA MCP Tasks: durable Postgres HA persistence, atomic CAS transitions, 60-second TTL reaper, 64-task concurrency cap, cooperative cancellation with LIFO Saga unwind",
+        "Elicitation form/url modes: resultType input_required, strict secret-safety and primitive-schema validation, decline triggers Saga rollback",
+        "Opt-in file uploads (SEP-2356): 64 MiB chunked streaming bypass with FileBlobBackend for local, postgres, s3, gcs, azure and http/WebDAV"
       ]
     }
   ]

@@ -219,6 +219,30 @@ impl GrpcDownstreamClient {
         }
     }
 
+    /// Invokes a gRPC/Connect downstream endpoint while forwarding chunked binary metadata headers
+    /// (`x-omni-file-id`, `x-omni-file-sha256`, `x-omni-file-size`, `x-omni-file-mime`,
+    /// `x-omni-file-chunks`) for uploaded `FileBlobRecord` attachments (`v6.8.0`).
+    pub fn invoke_grpc_with_file_metadata(
+        &self,
+        endpoint: &str,
+        service_method: &str,
+        arguments: &JsonValue,
+        file_meta: &crate::models::FileBlobRecord,
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> Result<Vec<u8>, String> {
+        let mut hdrs = extra_headers.cloned().unwrap_or_default();
+        let chunk_count = (file_meta.size_bytes as usize).div_ceil(H2_DEFAULT_MAX_FRAME_SIZE);
+        hdrs.insert("x-omni-file-id".to_string(), file_meta.file_id.clone());
+        hdrs.insert("x-omni-file-sha256".to_string(), file_meta.sha256.clone());
+        hdrs.insert(
+            "x-omni-file-size".to_string(),
+            file_meta.size_bytes.to_string(),
+        );
+        hdrs.insert("x-omni-file-mime".to_string(), file_meta.mime_type.clone());
+        hdrs.insert("x-omni-file-chunks".to_string(), chunk_count.to_string());
+        self.invoke(endpoint, service_method, arguments, Some(&hdrs))
+    }
+
     fn invoke_h2_grpc(
         &self,
         use_tls: bool,

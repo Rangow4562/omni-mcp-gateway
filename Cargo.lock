@@ -190,7 +190,7 @@ checksum = "685a9ac4b61f4e728e1d2c6a7844609c16527aeb5e6c865915c08e619c16410f"
 
 [[package]]
 name = "omni-mcp"
-version = "6.5.0"
+version = "6.8.0"
 dependencies = [
  "getrandom",
  "omni-process-guard",

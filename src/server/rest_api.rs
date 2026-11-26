@@ -1,7 +1,7 @@
 //! Control Plane REST Management API (`/api/...`, `/healthz`, `/readyz`, `/metrics`).
 
 use super::auth::{AuthPrincipal, AuthRole};
-use super::http_codec::percent_decode;
+use super::http_codec::{get_header, percent_decode};
 use super::{OAuthPendingFlow, ProductionGatewayContext};
 use crate::data_plane::{FaultInjectionConfig, PIIRedactor, SandboxLimits};
 use crate::json::JsonValue;
@@ -197,12 +197,84 @@ impl ProductionGatewayContext {
                     p95_us,
                     p99_us,
                 );
+                let full_metrics = format!("{}{}", metrics_payload, self.task_manager.prometheus_lines());
                 (
                     200,
                     "text/plain; version=0.0.4; charset=utf-8".to_string(),
                     Vec::new(),
-                    metrics_payload.into_bytes(),
+                    full_metrics.into_bytes(),
                 )
+            }
+            "/api/skills" => {
+                let qparams = parse_query_params(query);
+                let scope = crate::control_plane::SkillAccessScope {
+                    group_slug: qparams.get("group").cloned().filter(|s| !s.is_empty()),
+                    server_scope: qparams.get("server").cloned().filter(|s| !s.is_empty()),
+                };
+                let skills: Vec<JsonValue> = self
+                    .skills
+                    .list_skills(&scope)
+                    .iter()
+                    .map(|s| s.to_json())
+                    .collect();
+                self.json_response(
+                    200,
+                    json!({
+                        "skills": JsonValue::Array(skills),
+                        "max_files": crate::models::SKILL_MAX_FILES as i64,
+                        "max_total_bytes": crate::models::SKILL_MAX_TOTAL_BYTES as i64,
+                    }),
+                )
+            }
+            _ if path.starts_with("/api/skills/") => {
+                let slug = percent_decode(path.strip_prefix("/api/skills/").unwrap_or("").trim());
+                let scope = crate::control_plane::SkillAccessScope::default();
+                match self.skills.get_skill(&slug, &scope) {
+                    Some(sk) => self.json_response(200, sk.to_json()),
+                    None => self.json_response(404, json!({"error": format!("Skill '{}' not found", slug)})),
+                }
+            }
+            "/api/tasks" => {
+                let tasks: Vec<JsonValue> = self
+                    .task_manager
+                    .list_tasks()
+                    .iter()
+                    .map(|t| t.to_json())
+                    .collect();
+                self.json_response(200, json!({"tasks": JsonValue::Array(tasks)}))
+            }
+            _ if path.starts_with("/api/files/download/") => {
+                if !self.config.enable_file_uploads_extension {
+                    return self.json_response(
+                        404,
+                        json!({"error": "File uploads extension (OMNI_ENABLE_FILE_UPLOADS_EXTENSION) is disabled"}),
+                    );
+                }
+                let file_id = percent_decode(
+                    path.strip_prefix("/api/files/download/")
+                        .unwrap_or("")
+                        .trim(),
+                );
+                let qparams = parse_query_params(query);
+                let token_ok = qparams
+                    .get("token")
+                    .map(|t| crate::storage::FileBlobStore::verify_token("download", &file_id, t))
+                    .unwrap_or(false);
+                if !token_ok && self.authenticate(headers).is_err() {
+                    return self.json_response(401, json!({"error": "Invalid or missing download token"}));
+                }
+                match self.file_store.read_all(&file_id) {
+                    Ok((meta, bytes)) => (
+                        200,
+                        meta.mime_type,
+                        vec![
+                            ("X-Omni-File-Id".to_string(), meta.file_id),
+                            ("X-Omni-File-Sha256".to_string(), meta.sha256),
+                        ],
+                        bytes,
+                    ),
+                    Err(e) => self.json_response(404, json!({"error": e})),
+                }
             }
             "/api/stats" => {
                 let servers = self.registry.list_servers(None);
@@ -696,18 +768,38 @@ impl ProductionGatewayContext {
                 if state.is_empty() {
                     return self.json_response(400, json!({"error": "Missing OAuth 'state' parameter"}));
                 }
-                let flow = {
-                    let mut guard = self.oauth_pending_flows.write().unwrap();
-                    guard.remove(&state)
-                };
-                let Some(flow) = flow else {
-                    return self.json_response(400, json!({"error": "Invalid or expired OAuth state"}));
+                // Multi-replica HA lookup: check durable `omni_oauth_flows` first, then local map
+                let flow = if let Some(rec) = self.registry.take_oauth_flow(&state) {
+                    OAuthPendingFlow {
+                        server_name: rec.server_name,
+                        code_verifier: rec.code_verifier,
+                        redirect_uri: rec.redirect_uri,
+                        token_endpoint: rec.token_url,
+                        client_id: rec.client_id,
+                        scope: "mcp:tools".to_string(),
+                        created_at: rec.created_at,
+                    }
+                } else {
+                    let local = {
+                        let mut guard = self.oauth_pending_flows.write().unwrap();
+                        guard.remove(&state)
+                    };
+                    match local {
+                        Some(f) => f,
+                        None => {
+                            return self.json_response(
+                                400,
+                                json!({"error": "Invalid or expired OAuth state"}),
+                            );
+                        }
+                    }
                 };
                 if now_epoch_secs() - flow.created_at > 600.0 {
                     return self.json_response(400, json!({"error": "OAuth PKCE state expired"}));
                 }
 
-                let token_store = UpstreamOAuthTokenStore::new(&self.config.secrets_dir, None);
+                let token_store = UpstreamOAuthTokenStore::new(&self.config.secrets_dir, None)
+                    .with_registry(self.registry.clone());
                 let token_record = if let Some(tok) = direct_token.filter(|s| !s.is_empty()) {
                     OAuthTokenRecord {
                         access_token: tok,
@@ -838,8 +930,8 @@ impl ProductionGatewayContext {
                     .unwrap_or_else(|| "mcp:tools".to_string());
                 let redirect_uri = qparams.get("redirect_uri").cloned().unwrap_or_else(|| {
                     format!(
-                        "http://{}:{}/api/v1/oauth/callback",
-                        self.config.host, self.config.port
+                        "{}/api/v1/oauth/callback",
+                        self.config.public_base_url.trim_end_matches('/')
                     )
                 });
 
@@ -853,6 +945,19 @@ impl ProductionGatewayContext {
                     &state,
                     &challenge,
                 );
+                let now_ts = now_epoch_secs();
+                self.registry
+                    .save_oauth_flow(&crate::models::OAuthFlowRecord {
+                        state: state.clone(),
+                        server_name: server_name.clone(),
+                        elicitation_id: qparams.get("elicitation_id").cloned(),
+                        code_verifier: verifier.clone(),
+                        token_url: token_endpoint.clone(),
+                        client_id: client_id.clone(),
+                        redirect_uri: redirect_uri.clone(),
+                        created_at: now_ts,
+                        expires_at: now_ts + 600.0,
+                    });
                 self.oauth_pending_flows.write().unwrap().insert(
                     state.clone(),
                     OAuthPendingFlow {
@@ -862,7 +967,7 @@ impl ProductionGatewayContext {
                         token_endpoint,
                         client_id,
                         scope,
-                        created_at: now_epoch_secs(),
+                        created_at: now_ts,
                     },
                 );
                 self.json_response(
@@ -920,6 +1025,21 @@ impl ProductionGatewayContext {
                 200,
                 json!({"success": removed.is_some(), "execution_id": exec_id}),
             );
+        }
+        if let Some(slug) = path
+            .strip_prefix("/api/skills/")
+            .or_else(|| path.strip_prefix("/api/v1/skills/"))
+        {
+            let slug = percent_decode(slug.trim());
+            if slug.is_empty() {
+                return self.json_response(400, json!({"error": "Skill slug is required"}));
+            }
+            let removed = self.registry.delete_skill(&slug);
+            if removed.is_some() {
+                self.event_bus
+                    .publish("skills.deleted", json!({"slug": slug.clone()}));
+            }
+            return self.json_response(200, json!({"success": removed.is_some(), "slug": slug}));
         }
         if let Some(slug) = path
             .strip_prefix("/api/groups/")
@@ -1853,7 +1973,191 @@ impl ProductionGatewayContext {
                     }),
                 )
             }
+            "/api/skills" => {
+                let mut record = match crate::models::SkillRecord::from_json(&body) {
+                    Some(r) => r,
+                    None => {
+                        return self.json_response(
+                            400,
+                            json!({"error": "Invalid skill payload: 'slug' and 'files' (including SKILL.md) are required"}),
+                        );
+                    }
+                };
+                record.updated_at = now_epoch_secs();
+                match self.registry.save_skill(record) {
+                    Ok(saved) => {
+                        self.event_bus.publish("skills.saved", saved.to_json());
+                        self.json_response(200, saved.to_json())
+                    }
+                    Err(e) => self.json_response(400, json!({"error": e})),
+                }
+            }
+            "/api/skills/sync-dir" => {
+                let dir_str = body.get("dir").and_then(|v| v.as_str()).unwrap_or("");
+                if dir_str.trim().is_empty() {
+                    return self.json_response(400, json!({"error": "Missing 'dir' path"}));
+                }
+                let slug_override = body
+                    .get("slug")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let group_slug = body
+                    .get("group_slug")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                let server_scope = body
+                    .get("server_scope")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                match self.skills.publish_from_dir(
+                    std::path::Path::new(dir_str),
+                    slug_override,
+                    group_slug,
+                    server_scope,
+                ) {
+                    Ok(saved) => {
+                        self.event_bus.publish("skills.saved", saved.to_json());
+                        self.json_response(200, saved.to_json())
+                    }
+                    Err(e) => self.json_response(400, json!({"error": e})),
+                }
+            }
+            _ if path.starts_with("/api/tasks/") && path.ends_with("/cancel") => {
+                let task_id = path
+                    .strip_prefix("/api/tasks/")
+                    .and_then(|s| s.strip_suffix("/cancel"))
+                    .map(|s| percent_decode(s.trim()))
+                    .unwrap_or_default();
+                if task_id.is_empty() {
+                    return self.json_response(400, json!({"error": "task_id is required"}));
+                }
+                match self.task_manager.cancel_task_scoped(&task_id, None, None) {
+                    Ok(cancelled) => self.json_response(
+                        200,
+                        json!({"cancelled": true, "task": cancelled.to_json()}),
+                    ),
+                    Err(e) => self.json_response(404, json!({"error": e})),
+                }
+            }
+            _ if path.starts_with("/api/tasks/") && path.ends_with("/respond") => {
+                let task_id = path
+                    .strip_prefix("/api/tasks/")
+                    .and_then(|s| s.strip_suffix("/respond"))
+                    .map(|s| percent_decode(s.trim()))
+                    .unwrap_or_default();
+                if task_id.is_empty() {
+                    return self.json_response(400, json!({"error": "task_id is required"}));
+                }
+                let action = body
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("accept");
+                let content = body
+                    .get("content")
+                    .cloned()
+                    .unwrap_or_else(JsonValue::object);
+                let rpc_req = crate::models::RPCRequest::new(
+                    json!(1),
+                    "tasks/update",
+                    json!({
+                        "taskId": task_id.clone(),
+                        "inputResponses": [
+                            {
+                                "action": action,
+                                "content": content
+                            }
+                        ]
+                    }),
+                );
+                let rpc_resp = self.omni_mcp.handle_request(&rpc_req, actor, Some(token));
+                if let Some(err) = rpc_resp.error {
+                    self.json_response(400, json!({"error": err.message}))
+                } else {
+                    self.json_response(
+                        200,
+                        json!({"ok": true, "task_id": task_id, "action": action}),
+                    )
+                }
+            }
             _ => self.json_response(404, json!({"error": "Endpoint not found"})),
+        }
+    }
+
+    /// Handles streaming file uploads (`PUT/POST /api/v1/files/upload/:upload_id`) up to
+    /// `OMNI_FILE_UPLOAD_MAX_BYTES` (64 MiB), authenticated by HMAC-signed upload token or Bearer auth.
+    pub(crate) fn handle_file_upload(
+        &self,
+        raw_upload_id: &str,
+        query: Option<&str>,
+        headers: &HashMap<String, String>,
+        body_bytes: &[u8],
+    ) -> (u16, String, Vec<(String, String)>, Vec<u8>) {
+        if !self.config.enable_file_uploads_extension {
+            return self.json_response(
+                404,
+                json!({"error": "File uploads extension (OMNI_ENABLE_FILE_UPLOADS_EXTENSION) is disabled"}),
+            );
+        }
+        let upload_id = percent_decode(raw_upload_id.trim());
+        if upload_id.is_empty() {
+            return self.json_response(400, json!({"error": "upload_id is required"}));
+        }
+        let qparams = parse_query_params(query);
+        let token_ok = qparams
+            .get("token")
+            .map(|t| crate::storage::FileBlobStore::verify_token("upload", &upload_id, t))
+            .unwrap_or(false);
+        let actor = if token_ok {
+            "signed-upload".to_string()
+        } else {
+            match self.authenticate(headers) {
+                Ok(p) => p.id,
+                Err(_) => {
+                    return self.json_response(
+                        401,
+                        json!({"error": "Unauthorized: valid signed upload token or Bearer auth required"}),
+                    );
+                }
+            }
+        };
+
+        let filename = qparams
+            .get("filename")
+            .cloned()
+            .or_else(|| get_header(headers, "x-omni-filename").map(String::from))
+            .unwrap_or_else(|| format!("{}.bin", upload_id));
+        let mime_type = get_header(headers, "content-type")
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        match self
+            .file_store
+            .put_file(Some(upload_id), &filename, &mime_type, &actor, body_bytes)
+        {
+            Ok(rec) => {
+                let dl_token = crate::storage::FileBlobStore::sign_token("download", &rec.file_id);
+                let download_url = format!(
+                    "{}/api/v1/files/download/{}?token={}",
+                    self.config.public_base_url.trim_end_matches('/'),
+                    rec.file_id,
+                    dl_token
+                );
+                let mut out = rec.to_json();
+                out.insert("download_url", download_url);
+                out.insert("fileId", rec.file_id);
+                self.json_response(200, out)
+            }
+            Err(e) => {
+                let code = if e.contains("exceeds") || e.contains("limit") {
+                    413
+                } else {
+                    500
+                };
+                self.json_response(code, json!({"error": e}))
+            }
         }
     }
 }

@@ -637,6 +637,181 @@ impl PendingUpstreamCallback {
             "created_at": self.created_at,
         })
     }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let callback_id = v.get("callback_id")?.as_str()?.to_string();
+        let server_name = v
+            .get("server_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let upstream_request_id = v
+            .get("upstream_request_id")
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        let method = v
+            .get("method")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let params = v.get("params").cloned().unwrap_or_else(JsonValue::object);
+        let mode = v
+            .get("mode")
+            .and_then(|x| x.as_str())
+            .unwrap_or("approval_gate")
+            .to_string();
+        let status = v
+            .get("status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("pending")
+            .to_string();
+        let created_at = v
+            .get("created_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or_else(now_epoch_secs);
+        Some(Self {
+            callback_id,
+            server_name,
+            upstream_request_id,
+            method,
+            params,
+            mode,
+            status,
+            created_at,
+        })
+    }
+}
+
+/// Governance-driven Elicitation policy rule (`v6.8.0`).
+/// Defines when a tool/server should emit an MCP `elicitation/create` (`form` or `url`)
+/// request before executing a protected or missing-parameter action.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElicitationPolicyRule {
+    pub mode: String, // "form" | "url"
+    pub message: String,
+    pub requested_schema: Option<JsonValue>,
+    pub require_on_approval: bool,
+}
+
+impl ElicitationPolicyRule {
+    /// Strict Secret-Safety & Primitive-Schema Validator for `form`-mode elicitations.
+    /// Rejects any `requestedSchema` property whose name matches secret key patterns
+    /// (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASS`, `AUTH`, `CREDENTIAL`) or uses
+    /// non-primitive JSON schema types (only `string`, `number`, `integer`, `boolean` are allowed).
+    pub fn validate_elicitation_schema(schema: &JsonValue) -> Result<(), String> {
+        if !schema.is_object() {
+            return Err("requestedSchema must be a JSON object".to_string());
+        }
+        if let Some(t) = schema.get("type").and_then(|v| v.as_str()) {
+            if t != "object" {
+                return Err(format!(
+                    "requestedSchema top-level type must be 'object', got '{}'",
+                    t
+                ));
+            }
+        }
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .ok_or_else(|| "requestedSchema must contain a 'properties' object".to_string())?;
+        for (prop_name, prop_def) in props {
+            if is_elicitation_secret_key(prop_name) {
+                return Err(format!(
+                    "Secret-safety violation: form elicitation property '{}' is forbidden (use url-mode OAuth instead)",
+                    prop_name
+                ));
+            }
+            if !prop_def.is_object() {
+                return Err(format!(
+                    "requestedSchema property '{}' must be a JSON schema object",
+                    prop_name
+                ));
+            }
+            let prop_type = prop_def.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if !matches!(prop_type, "string" | "number" | "integer" | "boolean") {
+                return Err(format!(
+                    "Primitive-schema violation: property '{}' has non-primitive type '{}' (allowed: string, number, integer, boolean)",
+                    prop_name, prop_type
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self.mode.as_str() {
+            "form" => {
+                if let Some(ref schema) = self.requested_schema {
+                    Self::validate_elicitation_schema(schema)?;
+                }
+                Ok(())
+            }
+            "url" => Ok(()),
+            other => Err(format!(
+                "Unsupported elicitation mode '{}' (expected 'form' or 'url')",
+                other
+            )),
+        }
+    }
+
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "mode": self.mode.clone(),
+            "message": self.message.clone(),
+            "requested_schema": self.requested_schema.clone().unwrap_or(JsonValue::Null),
+            "require_on_approval": self.require_on_approval,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let mode = v
+            .get("mode")
+            .and_then(|x| x.as_str())
+            .unwrap_or("form")
+            .to_string();
+        let message = v
+            .get("message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let requested_schema =
+            v.get("requested_schema").and_then(
+                |x| {
+                    if x.is_null() {
+                        None
+                    } else {
+                        Some(x.clone())
+                    }
+                },
+            );
+        let require_on_approval = v
+            .get("require_on_approval")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
+        Some(Self {
+            mode,
+            message,
+            requested_schema,
+            require_on_approval,
+        })
+    }
+}
+
+/// Returns `true` if a property/key name looks like a credential or secret that must NEVER
+/// be collected via MCP `form`-mode elicitation.
+pub fn is_elicitation_secret_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASS",
+        "AUTH",
+        "CREDENTIAL",
+    ]
+    .iter()
+    .any(|kw| upper.contains(kw))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -648,6 +823,7 @@ pub struct CharterPolicy {
     pub custom_attributes: JsonValue,
     pub argument_rules: Vec<ArgumentPolicyRule>,
     pub tenant_quota: Option<TenantQuotaPolicy>,
+    pub elicitation_rules: Vec<ElicitationPolicyRule>,
 }
 
 impl Default for CharterPolicy {
@@ -660,6 +836,7 @@ impl Default for CharterPolicy {
             custom_attributes: JsonValue::object(),
             argument_rules: Vec::new(),
             tenant_quota: None,
+            elicitation_rules: Vec::new(),
         }
     }
 }
@@ -692,6 +869,8 @@ impl CharterPolicy {
             .map(|t| JsonValue::from(t.as_str()))
             .collect();
         let arg_rules: Vec<JsonValue> = self.argument_rules.iter().map(|r| r.to_json()).collect();
+        let elicit_rules: Vec<JsonValue> =
+            self.elicitation_rules.iter().map(|r| r.to_json()).collect();
         json!({
             "allowed_actors": JsonValue::Array(actors),
             "allowed_tools": JsonValue::Array(tools),
@@ -700,6 +879,7 @@ impl CharterPolicy {
             "custom_attributes": self.custom_attributes.clone(),
             "argument_rules": JsonValue::Array(arg_rules),
             "tenant_quota": self.tenant_quota.as_ref().map(|q| q.to_json()).unwrap_or(JsonValue::Null),
+            "elicitation_rules": JsonValue::Array(elicit_rules),
         })
     }
 
@@ -757,6 +937,16 @@ impl CharterPolicy {
             }
         });
 
+        let elicitation_rules = v
+            .get("elicitation_rules")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(ElicitationPolicyRule::from_json)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
             allowed_actors,
             allowed_tools,
@@ -765,6 +955,7 @@ impl CharterPolicy {
             custom_attributes,
             argument_rules,
             tenant_quota,
+            elicitation_rules,
         }
     }
 }
@@ -2047,6 +2238,783 @@ impl ServerRecord {
             health,
             external_resources,
             external_prompts,
+        })
+    }
+}
+
+// ============================================================================
+// v6.8.0 Data Models: Skills over MCP, Postgres HA Tasks, Multi-Pod OAuth, File Blobs
+// ============================================================================
+
+/// Maximum number of files permitted in a single MCP Skill bundle (SEP-2640).
+pub const SKILL_MAX_FILES: usize = 512;
+/// Maximum total payload size (16 MiB) permitted in a single MCP Skill bundle (SEP-2640).
+pub const SKILL_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// A single file entry within an MCP Skill bundle (`io.modelcontextprotocol/skills`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillFileEntry {
+    pub path: String,
+    pub mime_type: String,
+    pub content: String,
+    pub size_bytes: usize,
+    pub sha256: String,
+}
+
+impl SkillFileEntry {
+    pub fn new(
+        path: impl Into<String>,
+        mime_type: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        let path = path.into();
+        let mime_type = mime_type.into();
+        let content = content.into();
+        let size_bytes = content.len();
+        let sha256 = crate::storage::audit_log::sha256_hex(content.as_bytes());
+        Self {
+            path,
+            mime_type,
+            content,
+            size_bytes,
+            sha256,
+        }
+    }
+
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "path": self.path.clone(),
+            "mime_type": self.mime_type.clone(),
+            "content": self.content.clone(),
+            "size_bytes": self.size_bytes as i64,
+            "sha256": self.sha256.clone(),
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let path = v.get("path")?.as_str()?.to_string();
+        let mime_type = v
+            .get("mime_type")
+            .or_else(|| v.get("mimeType"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("text/markdown")
+            .to_string();
+        let content = v
+            .get("content")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let size_bytes = v
+            .get("size_bytes")
+            .or_else(|| v.get("sizeBytes"))
+            .and_then(|x| x.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or_else(|| content.len());
+        let sha256 = v
+            .get("sha256")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| crate::storage::audit_log::sha256_hex(content.as_bytes()));
+        Some(Self {
+            path,
+            mime_type,
+            content,
+            size_bytes,
+            sha256,
+        })
+    }
+}
+
+/// Validates a relative skill file path against traversal, absolute paths, backslashes, or NUL bytes.
+pub fn validate_skill_file_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("Skill file path cannot be empty".to_string());
+    }
+    if path.contains('\0') {
+        return Err(format!("Skill file path '{}' contains NUL byte", path));
+    }
+    if path.starts_with('/') || path.contains('\\') || path.starts_with('~') {
+        return Err(format!(
+            "Skill file path '{}' must be a relative POSIX path",
+            path
+        ));
+    }
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(format!(
+                "Skill file path '{}' contains invalid traversal or empty segment",
+                path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Extracts `(name, description)` from `SKILL.md` YAML frontmatter (`---\n...\n---`).
+pub fn parse_skill_frontmatter(markdown: &str) -> Result<(String, String), String> {
+    let trimmed = markdown.trim_start_matches('\u{feff}');
+    let mut lines = trimmed.lines();
+    let first = lines.next().unwrap_or("").trim();
+    if first != "---" {
+        return Err("SKILL.md must begin with YAML frontmatter delimiter '---'".to_string());
+    }
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut closed = false;
+    for line in lines {
+        let t = line.trim();
+        if t == "---" || t == "..." {
+            closed = true;
+            break;
+        }
+        if let Some((k, v)) = t.split_once(':') {
+            let key = k.trim();
+            let val = v.trim().trim_matches('"').trim_matches('\'').trim();
+            if key == "name" && !val.is_empty() {
+                name = Some(val.to_string());
+            } else if key == "description" && !val.is_empty() {
+                description = Some(val.to_string());
+            }
+        }
+    }
+    if !closed {
+        return Err("SKILL.md YAML frontmatter is missing closing '---' delimiter".to_string());
+    }
+    let name =
+        name.ok_or_else(|| "SKILL.md frontmatter missing required 'name' field".to_string())?;
+    let description = description
+        .ok_or_else(|| "SKILL.md frontmatter missing required 'description' field".to_string())?;
+    Ok((name, description))
+}
+
+/// Enterprise MCP Skill bundle record (`io.modelcontextprotocol/skills`, SEP-2640).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillRecord {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub group_slug: Option<String>,
+    pub server_scope: Option<String>,
+    pub auto_generated: bool,
+    pub files: Vec<SkillFileEntry>,
+    pub manifest_sha256: String,
+    pub updated_at: f64,
+}
+
+impl SkillRecord {
+    /// Computes the deterministic SHA-256 manifest digest over sorted
+    /// `path + "\0" + size_bytes + "\0" + file.sha256 + "\n"`.
+    pub fn compute_manifest_sha256(files: &[SkillFileEntry]) -> String {
+        let mut sorted: Vec<&SkillFileEntry> = files.iter().collect();
+        sorted.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut buf = String::new();
+        for f in sorted {
+            let file_hash = if f.sha256.is_empty() {
+                crate::storage::audit_log::sha256_hex(f.content.as_bytes())
+            } else {
+                f.sha256.clone()
+            };
+            buf.push_str(&f.path);
+            buf.push('\0');
+            buf.push_str(&f.content.len().to_string());
+            buf.push('\0');
+            buf.push_str(&file_hash);
+            buf.push('\n');
+        }
+        crate::storage::audit_log::sha256_hex(buf.as_bytes())
+    }
+
+    /// Validates SEP-2640 limits, path safety, duplicate paths, and `SKILL.md` YAML frontmatter,
+    /// then refreshes `manifest_sha256` deterministically.
+    pub fn validate(&mut self) -> Result<(), String> {
+        if self.slug.trim().is_empty()
+            || !self
+                .slug
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(format!(
+                "Invalid skill slug '{}': only [a-zA-Z0-9._-] allowed",
+                self.slug
+            ));
+        }
+        if self.files.is_empty() {
+            return Err("Skill bundle must contain at least SKILL.md".to_string());
+        }
+        if self.files.len() > SKILL_MAX_FILES {
+            return Err(format!(
+                "Skill '{}' has {} files, exceeding maximum of {} files",
+                self.slug,
+                self.files.len(),
+                SKILL_MAX_FILES
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut total_bytes: usize = 0;
+        let mut root_skill_md: Option<String> = None;
+
+        for f in &mut self.files {
+            validate_skill_file_path(&f.path)?;
+            if !seen.insert(f.path.clone()) {
+                return Err(format!(
+                    "Duplicate file path '{}' in skill '{}'",
+                    f.path, self.slug
+                ));
+            }
+            f.size_bytes = f.content.len();
+            f.sha256 = crate::storage::audit_log::sha256_hex(f.content.as_bytes());
+            total_bytes = total_bytes.saturating_add(f.size_bytes);
+            if total_bytes > SKILL_MAX_TOTAL_BYTES {
+                return Err(format!(
+                    "Skill '{}' total size {} bytes exceeds 16 MiB ({} bytes) limit",
+                    self.slug, total_bytes, SKILL_MAX_TOTAL_BYTES
+                ));
+            }
+            if f.path == "SKILL.md" {
+                root_skill_md = Some(f.content.clone());
+            }
+        }
+
+        let skill_md = root_skill_md
+            .ok_or_else(|| format!("Skill '{}' is missing required root SKILL.md", self.slug))?;
+        let (fm_name, fm_desc) = parse_skill_frontmatter(&skill_md)?;
+        if self.name.trim().is_empty() {
+            self.name = fm_name;
+        }
+        if self.description.trim().is_empty() {
+            self.description = fm_desc;
+        }
+        self.files.sort_by(|a, b| a.path.cmp(&b.path));
+        self.manifest_sha256 = Self::compute_manifest_sha256(&self.files);
+        if self.version.trim().is_empty() {
+            self.version = format!("sha256:{}", &self.manifest_sha256[..12]);
+        }
+        Ok(())
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.files.iter().map(|f| f.size_bytes).sum()
+    }
+
+    pub fn to_json(&self) -> JsonValue {
+        let files_arr: Vec<JsonValue> = self.files.iter().map(|f| f.to_json()).collect();
+        json!({
+            "slug": self.slug.clone(),
+            "name": self.name.clone(),
+            "description": self.description.clone(),
+            "version": self.version.clone(),
+            "group_slug": self.group_slug.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "server_scope": self.server_scope.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "auto_generated": self.auto_generated,
+            "files": JsonValue::Array(files_arr),
+            "file_count": self.files.len() as i64,
+            "total_bytes": self.total_bytes() as i64,
+            "manifest_sha256": self.manifest_sha256.clone(),
+            "updated_at": self.updated_at,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let slug = v.get("slug")?.as_str()?.to_string();
+        let name = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let description = v
+            .get("description")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let version = v
+            .get("version")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let group_slug = v
+            .get("group_slug")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let server_scope = v
+            .get("server_scope")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let auto_generated = v
+            .get("auto_generated")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let files: Vec<SkillFileEntry> = v
+            .get("files")
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(SkillFileEntry::from_json).collect())
+            .unwrap_or_default();
+        let manifest_sha256 = v
+            .get("manifest_sha256")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| Self::compute_manifest_sha256(&files));
+        let updated_at = v
+            .get("updated_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or_else(now_epoch_secs);
+        Some(Self {
+            slug,
+            name,
+            description,
+            version,
+            group_slug,
+            server_scope,
+            auto_generated,
+            files,
+            manifest_sha256,
+            updated_at,
+        })
+    }
+}
+
+/// Lifecycle state of an MCP Task (`io.modelcontextprotocol/tasks`, GA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpTaskStatus {
+    Working,
+    InputRequired,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl McpTaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            McpTaskStatus::Working => "working",
+            McpTaskStatus::InputRequired => "input_required",
+            McpTaskStatus::Completed => "completed",
+            McpTaskStatus::Failed => "failed",
+            McpTaskStatus::Cancelled => "cancelled",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "input_required" | "suspended" => McpTaskStatus::InputRequired,
+            "completed" | "done" | "ok" => McpTaskStatus::Completed,
+            "failed" | "error" => McpTaskStatus::Failed,
+            "cancelled" | "canceled" => McpTaskStatus::Cancelled,
+            _ => McpTaskStatus::Working,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            McpTaskStatus::Completed | McpTaskStatus::Failed | McpTaskStatus::Cancelled
+        )
+    }
+}
+
+/// Durable, multi-replica MCP Task record persisted in `omni_mcp_tasks`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpTaskRecord {
+    pub task_id: String,
+    pub owner_pod_id: String,
+    pub caller_actor: String,
+    pub group_slug: Option<String>,
+    pub server_scope: Option<String>,
+    pub status: McpTaskStatus,
+    pub status_message: Option<String>,
+    pub progress_pct: u8,
+    pub poll_interval_ms: u64,
+    pub input_requests: Option<JsonValue>,
+    pub input_responses: Option<JsonValue>,
+    pub result_payload: Option<JsonValue>,
+    pub error_payload: Option<JsonValue>,
+    pub cancel_requested: bool,
+    pub created_at: f64,
+    pub updated_at: f64,
+    pub expires_at: f64,
+}
+
+impl McpTaskRecord {
+    pub fn new(
+        task_id: impl Into<String>,
+        owner_pod_id: impl Into<String>,
+        caller_actor: impl Into<String>,
+        group_slug: Option<String>,
+        server_scope: Option<String>,
+        ttl_sec: u64,
+    ) -> Self {
+        let now = now_epoch_secs();
+        Self {
+            task_id: task_id.into(),
+            owner_pod_id: owner_pod_id.into(),
+            caller_actor: caller_actor.into(),
+            group_slug,
+            server_scope,
+            status: McpTaskStatus::Working,
+            status_message: None,
+            progress_pct: 0,
+            poll_interval_ms: 500,
+            input_requests: None,
+            input_responses: None,
+            result_payload: None,
+            error_payload: None,
+            cancel_requested: false,
+            created_at: now,
+            updated_at: now,
+            expires_at: now + ttl_sec as f64,
+        }
+    }
+
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "task_id": self.task_id.clone(),
+            "owner_pod_id": self.owner_pod_id.clone(),
+            "caller_actor": self.caller_actor.clone(),
+            "group_slug": self.group_slug.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "server_scope": self.server_scope.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "status": self.status.as_str(),
+            "status_message": self.status_message.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "progress_pct": self.progress_pct as i64,
+            "poll_interval_ms": self.poll_interval_ms as i64,
+            "input_requests": self.input_requests.clone().unwrap_or(JsonValue::Null),
+            "input_responses": self.input_responses.clone().unwrap_or(JsonValue::Null),
+            "result_payload": self.result_payload.clone().unwrap_or(JsonValue::Null),
+            "error_payload": self.error_payload.clone().unwrap_or(JsonValue::Null),
+            "cancel_requested": self.cancel_requested,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "expires_at": self.expires_at,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let task_id = v
+            .get("task_id")
+            .or_else(|| v.get("taskId"))?
+            .as_str()?
+            .to_string();
+        let owner_pod_id = v
+            .get("owner_pod_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("omni-pod-local")
+            .to_string();
+        let caller_actor = v
+            .get("caller_actor")
+            .and_then(|x| x.as_str())
+            .unwrap_or("agent")
+            .to_string();
+        let group_slug = v
+            .get("group_slug")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let server_scope = v
+            .get("server_scope")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let status = v
+            .get("status")
+            .and_then(|x| x.as_str())
+            .map(McpTaskStatus::from_str)
+            .unwrap_or(McpTaskStatus::Working);
+        let status_message = v
+            .get("status_message")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let progress_pct = v
+            .get("progress_pct")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+            .min(100) as u8;
+        let poll_interval_ms = v
+            .get("poll_interval_ms")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(500);
+        let input_requests =
+            v.get("input_requests")
+                .and_then(|x| if x.is_null() { None } else { Some(x.clone()) });
+        let input_responses =
+            v.get("input_responses")
+                .and_then(|x| if x.is_null() { None } else { Some(x.clone()) });
+        let result_payload =
+            v.get("result_payload")
+                .and_then(|x| if x.is_null() { None } else { Some(x.clone()) });
+        let error_payload =
+            v.get("error_payload")
+                .and_then(|x| if x.is_null() { None } else { Some(x.clone()) });
+        let cancel_requested = v
+            .get("cancel_requested")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let created_at = v
+            .get("created_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or_else(now_epoch_secs);
+        let updated_at = v
+            .get("updated_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(created_at);
+        let expires_at = v
+            .get("expires_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(created_at + 3600.0);
+
+        Some(Self {
+            task_id,
+            owner_pod_id,
+            caller_actor,
+            group_slug,
+            server_scope,
+            status,
+            status_message,
+            progress_pct,
+            poll_interval_ms,
+            input_requests,
+            input_responses,
+            result_payload,
+            error_payload,
+            cancel_requested,
+            created_at,
+            updated_at,
+            expires_at,
+        })
+    }
+
+    /// Formats the record as a GA `io.modelcontextprotocol/tasks` wire response for `tasks/get`.
+    pub fn to_mcp_wire_json(&self) -> JsonValue {
+        let mut obj = json!({
+            "taskId": self.task_id.clone(),
+            "status": self.status.as_str(),
+            "progressPct": self.progress_pct as i64,
+            "pollInterval": self.poll_interval_ms as i64,
+            "createdAtEpochMs": (self.created_at * 1000.0) as i64,
+            "updatedAtEpochMs": (self.updated_at * 1000.0) as i64,
+            "expiresAtEpochMs": (self.expires_at * 1000.0) as i64,
+            "resultType": "complete"
+        });
+        if let Some(ref msg) = self.status_message {
+            obj.insert("statusMessage", JsonValue::from(msg.as_str()));
+        }
+        if let Some(ref g) = self.group_slug {
+            obj.insert("groupSlug", JsonValue::from(g.as_str()));
+        }
+        if let Some(ref s) = self.server_scope {
+            obj.insert("serverScope", JsonValue::from(s.as_str()));
+        }
+        if self.status == McpTaskStatus::InputRequired {
+            if let Some(ref reqs) = self.input_requests {
+                obj.insert("inputRequests", reqs.clone());
+            }
+        }
+        if self.status == McpTaskStatus::Completed {
+            if let Some(ref res) = self.result_payload {
+                obj.insert("result", res.clone());
+            }
+        }
+        if self.status == McpTaskStatus::Failed {
+            if let Some(ref err) = self.error_payload {
+                obj.insert("error", err.clone());
+            }
+        }
+        obj
+    }
+}
+
+/// Persisted multi-replica OAuth2 PKCE pending flow (`omni_oauth_flows`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OAuthFlowRecord {
+    pub state: String,
+    pub server_name: String,
+    pub elicitation_id: Option<String>,
+    pub code_verifier: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub created_at: f64,
+    pub expires_at: f64,
+}
+
+impl OAuthFlowRecord {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "state": self.state.clone(),
+            "server_name": self.server_name.clone(),
+            "elicitation_id": self.elicitation_id.as_ref().map(|s| JsonValue::from(s.as_str())).unwrap_or(JsonValue::Null),
+            "code_verifier": self.code_verifier.clone(),
+            "token_url": self.token_url.clone(),
+            "client_id": self.client_id.clone(),
+            "redirect_uri": self.redirect_uri.clone(),
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let state = v.get("state")?.as_str()?.to_string();
+        let server_name = v.get("server_name")?.as_str()?.to_string();
+        let elicitation_id = v
+            .get("elicitation_id")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let code_verifier = v.get("code_verifier")?.as_str()?.to_string();
+        let token_url = v.get("token_url")?.as_str()?.to_string();
+        let client_id = v.get("client_id")?.as_str()?.to_string();
+        let redirect_uri = v.get("redirect_uri")?.as_str()?.to_string();
+        let created_at = v
+            .get("created_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or_else(now_epoch_secs);
+        let expires_at = v
+            .get("expires_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(created_at + 600.0);
+        Some(Self {
+            state,
+            server_name,
+            elicitation_id,
+            code_verifier,
+            token_url,
+            client_id,
+            redirect_uri,
+            created_at,
+            expires_at,
+        })
+    }
+}
+
+/// Persisted multi-replica sealed AEAD OAuth2 token envelope (`omni_oauth_tokens`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OAuthTokenRecord {
+    pub server_name: String,
+    /// Hex-encoded sealed ChaCha20-Poly1305 AEAD envelope (or JSON plaintext fallback when crypto disabled).
+    pub sealed_envelope_hex: String,
+    pub updated_at: f64,
+}
+
+impl OAuthTokenRecord {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "server_name": self.server_name.clone(),
+            "sealed_envelope_hex": self.sealed_envelope_hex.clone(),
+            "updated_at": self.updated_at,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let server_name = v.get("server_name")?.as_str()?.to_string();
+        let sealed_envelope_hex = v.get("sealed_envelope_hex")?.as_str()?.to_string();
+        let updated_at = v
+            .get("updated_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or_else(now_epoch_secs);
+        Some(Self {
+            server_name,
+            sealed_envelope_hex,
+            updated_at,
+        })
+    }
+}
+
+/// Metadata record for an uploaded binary/text file blob (`io.modelcontextprotocol/files`, `omni_file_blobs`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileBlobRecord {
+    pub file_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub backend: String,
+    pub storage_key: String,
+    pub caller_actor: String,
+    pub created_at: f64,
+    pub expires_at: f64,
+}
+
+impl FileBlobRecord {
+    pub fn to_json(&self) -> JsonValue {
+        json!({
+            "file_id": self.file_id.clone(),
+            "filename": self.filename.clone(),
+            "mime_type": self.mime_type.clone(),
+            "size_bytes": self.size_bytes as i64,
+            "sha256": self.sha256.clone(),
+            "backend": self.backend.clone(),
+            "storage_key": self.storage_key.clone(),
+            "caller_actor": self.caller_actor.clone(),
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+        })
+    }
+
+    pub fn from_json(v: &JsonValue) -> Option<Self> {
+        let file_id = v
+            .get("file_id")
+            .or_else(|| v.get("fileId"))?
+            .as_str()?
+            .to_string();
+        let filename = v
+            .get("filename")
+            .and_then(|x| x.as_str())
+            .unwrap_or("upload.bin")
+            .to_string();
+        let mime_type = v
+            .get("mime_type")
+            .or_else(|| v.get("mimeType"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let size_bytes = v
+            .get("size_bytes")
+            .or_else(|| v.get("sizeBytes"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let sha256 = v
+            .get("sha256")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let backend = v
+            .get("backend")
+            .and_then(|x| x.as_str())
+            .unwrap_or("local")
+            .to_string();
+        let storage_key = v
+            .get("storage_key")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let caller_actor = v
+            .get("caller_actor")
+            .and_then(|x| x.as_str())
+            .unwrap_or("agent")
+            .to_string();
+        let created_at = v
+            .get("created_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or_else(now_epoch_secs);
+        let expires_at = v
+            .get("expires_at")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(created_at + 900.0);
+        Some(Self {
+            file_id,
+            filename,
+            mime_type,
+            size_bytes,
+            sha256,
+            backend,
+            storage_key,
+            caller_actor,
+            created_at,
+            expires_at,
         })
     }
 }

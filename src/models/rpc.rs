@@ -410,6 +410,213 @@ impl RPCResponse {
     }
 }
 
+/// Extension capability identifiers for MCP `2026-07-28`.
+pub const EXT_MCP_TASKS: &str = "io.modelcontextprotocol/tasks";
+pub const EXT_MCP_SKILLS: &str = "io.modelcontextprotocol/skills";
+pub const EXT_MCP_FILES: &str = "io.modelcontextprotocol/files";
+
+/// Scope for unified server capability advertisement across `/omni/mcp`, `/groups/<slug>/mcp`,
+/// and `/<service>/mcp`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityScope {
+    Global,
+    ToolGroup(String),
+    VirtualService(String),
+}
+
+/// Normalized client capability declaration parsed from `initialize` `params.capabilities`,
+/// `params.clientCapabilities`, or stateless `2026-07-28` `_meta.clientCapabilities`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientCapabilitiesMeta {
+    pub elicitation_form: bool,
+    pub elicitation_url: bool,
+    pub tasks: bool,
+    pub skills: bool,
+    pub files: bool,
+}
+
+impl ClientCapabilitiesMeta {
+    /// Extracts client capabilities from JSON-RPC `params`.
+    /// Enforces backward compatibility: empty `"elicitation": {}` enables `elicitation_form` only;
+    /// `"elicitation": { "url": {} }` is strictly required before emitting `url`-mode elicitations.
+    pub fn from_params(params: &JsonValue) -> Self {
+        let mut meta = Self::default();
+        let cap_sources = [
+            params.get("capabilities"),
+            params.get("clientCapabilities"),
+            params
+                .get("_meta")
+                .and_then(|m| m.get("clientCapabilities")),
+            params.get("_meta").and_then(|m| m.get("capabilities")),
+        ];
+
+        for caps in cap_sources.into_iter().flatten() {
+            if let Some(elicit) = caps.get("elicitation") {
+                if let Some(obj) = elicit.as_object() {
+                    if obj.is_empty() {
+                        meta.elicitation_form = true;
+                    } else {
+                        if let Some(form_val) = elicit.get("form") {
+                            if !matches!(form_val, JsonValue::Bool(false)) {
+                                meta.elicitation_form = true;
+                            }
+                        }
+                        if let Some(url_val) = elicit.get("url") {
+                            if !matches!(url_val, JsonValue::Bool(false)) {
+                                meta.elicitation_url = true;
+                            }
+                        }
+                    }
+                } else if matches!(elicit, JsonValue::Bool(true)) {
+                    meta.elicitation_form = true;
+                }
+            }
+
+            if caps.get("tasks").is_some()
+                && !matches!(caps.get("tasks"), Some(JsonValue::Bool(false)))
+            {
+                meta.tasks = true;
+            }
+            if caps.get("skills").is_some()
+                && !matches!(caps.get("skills"), Some(JsonValue::Bool(false)))
+            {
+                meta.skills = true;
+            }
+            if caps.get("files").is_some()
+                && !matches!(caps.get("files"), Some(JsonValue::Bool(false)))
+            {
+                meta.files = true;
+            }
+
+            if let Some(exts) = caps.get("extensions") {
+                if exts.get(EXT_MCP_TASKS).is_some() {
+                    meta.tasks = true;
+                }
+                if exts.get(EXT_MCP_SKILLS).is_some() {
+                    meta.skills = true;
+                }
+                if exts.get(EXT_MCP_FILES).is_some() {
+                    meta.files = true;
+                }
+            }
+            if let Some(req_arr) = caps.get("required").and_then(|a| a.as_array()) {
+                for item in req_arr {
+                    match item.as_str().unwrap_or("") {
+                        EXT_MCP_TASKS | "tasks" => meta.tasks = true,
+                        EXT_MCP_SKILLS | "skills" => meta.skills = true,
+                        EXT_MCP_FILES | "files" => meta.files = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        meta
+    }
+}
+
+/// Returns `true` if a `clientCapabilities.required` capability string is supported by this gateway
+/// under the current `OmniConfig`.
+pub fn is_required_capability_supported(cap: &str, config: &crate::config::OmniConfig) -> bool {
+    match cap {
+        "tools" | "resources" | "prompts" | "logging" => true,
+        EXT_MCP_TASKS | "tasks" => config.enable_tasks_extension,
+        EXT_MCP_SKILLS | "skills" => config.enable_skills_extension,
+        EXT_MCP_FILES | "files" => config.enable_file_uploads_extension,
+        _ => false,
+    }
+}
+
+/// Builds the unified MCP `2026-07-28` server `capabilities` object for `/omni/mcp`,
+/// `/groups/<slug>/mcp`, and `/<service>/mcp`.
+pub fn build_server_capabilities(
+    config: &crate::config::OmniConfig,
+    scope: CapabilityScope,
+) -> JsonValue {
+    let list_changed = !matches!(scope, CapabilityScope::ToolGroup(_));
+    let mut extensions = JsonValue::object();
+
+    if config.enable_tasks_extension {
+        extensions.insert(
+            EXT_MCP_TASKS,
+            json!({
+                "version": LATEST_MCP_PROTOCOL_VERSION,
+                "list": {},
+                "cancel": {},
+                "requests": {
+                    "tools": {
+                        "call": {}
+                    }
+                }
+            }),
+        );
+    }
+
+    if config.enable_skills_extension {
+        extensions.insert(
+            EXT_MCP_SKILLS,
+            json!({
+                "version": LATEST_MCP_PROTOCOL_VERSION,
+                "maxFiles": 512i64,
+                "maxTotalBytes": (16 * 1024 * 1024) as i64,
+                "directoryRead": true
+            }),
+        );
+    }
+
+    if config.enable_file_uploads_extension {
+        extensions.insert(
+            EXT_MCP_FILES,
+            json!({
+                "version": LATEST_MCP_PROTOCOL_VERSION,
+                "maxFileBytes": config.file_upload_max_bytes as i64,
+                "inlineMaxBytes": (256 * 1024) as i64,
+                "uploadBasePath": "/api/v1/files/upload"
+            }),
+        );
+    }
+
+    let mut caps = json!({
+        "tools": {"listChanged": list_changed},
+        "resources": {"subscribe": false, "listChanged": list_changed},
+        "prompts": {"listChanged": list_changed},
+        "logging": {}
+    });
+    if extensions
+        .as_object()
+        .map(|o| !o.is_empty())
+        .unwrap_or(false)
+    {
+        caps.insert("extensions", extensions);
+    }
+    caps
+}
+
+/// Builds a unified `server/discover` result payload across all MCP surfaces.
+pub fn build_server_discover_result(
+    config: &crate::config::OmniConfig,
+    scope: CapabilityScope,
+    server_name: &str,
+    version: &str,
+    description: &str,
+) -> JsonValue {
+    let supported: Vec<JsonValue> = SUPPORTED_MCP_PROTOCOL_VERSIONS
+        .iter()
+        .map(|v| JsonValue::from(*v))
+        .collect();
+    let capabilities = build_server_capabilities(config, scope);
+    json!({
+        "supportedVersions": JsonValue::Array(supported),
+        "capabilities": capabilities,
+        "serverInfo": {
+            "name": server_name,
+            "version": version,
+            "description": description,
+            "runtime": "rust"
+        },
+        "resultType": "complete"
+    })
+}
+
 #[cfg(test)]
 mod protocol_table_tests {
     use super::*;

@@ -194,3 +194,54 @@ export async function importMcpConfig(configJson: string, dryRun: boolean): Prom
 export async function initOAuthAuthorize(serverName: string): Promise<any> {
   return apiFetch(`/api/v1/oauth/authorize/${encodeURIComponent(serverName)}`);
 }
+
+export async function fetchSkills(groupSlug?: string): Promise<{
+  skills: any[];
+  max_files: number;
+  max_total_bytes: number;
+}> {
+  const qs = groupSlug ? `?group=${encodeURIComponent(groupSlug)}` : '';
+  return apiFetch(`/api/v1/skills${qs}`);
+}
+
+export async function saveSkill(payload: {
+  slug: string;
+  name?: string;
+  description?: string;
+  group_slug?: string | null;
+  files: Array<{ path: string; mime_type: string; content: string }>;
+}): Promise<any> {
+  return apiFetch('/api/v1/skills', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteSkill(slug: string): Promise<any> {
+  return apiFetch(`/api/v1/skills/${encodeURIComponent(slug)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function fetchTasks(): Promise<any[]> {
+  const res = await apiFetch<{ tasks?: any[] }>('/api/v1/tasks');
+  return res.tasks || [];
+}
+
+export async function cancelTask(taskId: string): Promise<any> {
+  return apiFetch(`/api/v1/tasks/${encodeURIComponent(taskId)}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function respondTask(
+  taskId: string,
+  action: 'accept' | 'decline' | 'cancel',
+  content?: Record<string, any>
+): Promise<any> {
+  return apiFetch(`/api/v1/tasks/${encodeURIComponent(taskId)}/respond`, {
+    method: 'POST',
+    body: JSON.stringify({ action, content: content ?? {} }),
+  });
+}

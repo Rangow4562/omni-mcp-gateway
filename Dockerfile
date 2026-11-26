@@ -14,7 +14,7 @@ COPY src/ ./src/
 RUN cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc"
 
 FROM debian:trixie-slim AS runner
-LABEL org.opencontainers.image.version="6.5.0"
+LABEL org.opencontainers.image.version="6.8.0"
 WORKDIR /app
 
 ENV OMNI_HOST=0.0.0.0 \

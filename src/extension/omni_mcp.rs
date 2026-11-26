@@ -11,18 +11,26 @@
 //!
 //! Full MCP Resources (`resources/list`, `resources/read`) and MCP Prompts (`prompts/list`, `prompts/get`).
 
+use crate::control_plane::{SkillAccessScope, SkillEngine};
 use crate::data_plane::cache::InMemoryConfigCache;
 use crate::data_plane::codemode::{CodeModeTypeGenerator, SandboxLimits};
 use crate::data_plane::dst::FaultInjectionConfig;
 use crate::data_plane::gateway::MCPProxyGateway;
+use crate::data_plane::task_runner::{TaskDispatchOutcome, TaskManager};
+use crate::extension::file_uploads::{
+    build_upload_required_mrtr, find_mcp_file_properties, resolve_file_argument,
+};
 use crate::json::JsonValue;
 use crate::models::{
-    negotiate_protocol_version, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse,
+    build_server_capabilities, build_server_discover_result, is_required_capability_supported,
+    negotiate_protocol_version, CapabilityScope, ClientCapabilitiesMeta, ElicitationPolicyRule,
+    McpTaskRecord, McpTaskStatus, RPCBatchOrSingle, RPCError, RPCRequest, RPCResponse,
     SamplingElicitationPolicy, ToolStatus, APPROVAL_INVALID, APPROVAL_REQUIRED, CIRCUIT_OPEN,
     FUEL_EXHAUSTED, INTERNAL_ERROR, INVALID_PARAMS, MEMORY_EXHAUSTED, METHOD_NOT_FOUND,
     MISSING_REQUIRED_CLIENT_CAPABILITY, OUTBOUND_BLOCKED, SAGA_COMPENSATED,
     SCHEMA_PREFLIGHT_FAILED, TIMEOUT, TOOL_DISABLED, UNAUTHORIZED, UNSUPPORTED_PROTOCOL_VERSION,
 };
+use crate::storage::FileBlobStore;
 
 pub fn apply_sampling_elicitation_policy(
     req_id: JsonValue,
@@ -69,11 +77,46 @@ pub fn apply_sampling_elicitation_policy(
 pub struct OmniMCPServer {
     pub cache: InMemoryConfigCache,
     pub gateway: MCPProxyGateway,
+    pub skills: SkillEngine,
+    pub task_manager: TaskManager,
+    pub file_store: FileBlobStore,
 }
 
 impl OmniMCPServer {
     pub fn new(cache: InMemoryConfigCache, gateway: MCPProxyGateway) -> Self {
-        Self { cache, gateway }
+        let cfg = crate::config::get_config();
+        let skills = SkillEngine::new(cache.registry.clone());
+        let task_manager = TaskManager::new(
+            cache.registry.clone(),
+            cfg.pod_id.clone(),
+            cfg.max_concurrent_tasks,
+            cfg.task_sync_grace_ms,
+            cfg.task_ttl_sec,
+        );
+        let file_store = FileBlobStore::from_config(&cfg, cache.registry.clone());
+        Self {
+            cache,
+            gateway,
+            skills,
+            task_manager,
+            file_store,
+        }
+    }
+
+    pub fn with_runtime(
+        cache: InMemoryConfigCache,
+        gateway: MCPProxyGateway,
+        skills: SkillEngine,
+        task_manager: TaskManager,
+        file_store: FileBlobStore,
+    ) -> Self {
+        Self {
+            cache,
+            gateway,
+            skills,
+            task_manager,
+            file_store,
+        }
     }
 
     pub fn omni_tools_spec() -> Vec<JsonValue> {
@@ -350,6 +393,17 @@ impl OmniMCPServer {
         caller_actor: &str,
         user_token: Option<&str>,
     ) -> RPCResponse {
+        self.handle_request_scoped(request, caller_actor, user_token, None, None)
+    }
+
+    pub fn handle_request_scoped(
+        &self,
+        request: &RPCRequest,
+        caller_actor: &str,
+        user_token: Option<&str>,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
+    ) -> RPCResponse {
         let requested_proto = if let Some(meta) = request.params.get("_meta") {
             if let Some(proto) = meta
                 .get("io.modelcontextprotocol/protocolVersion")
@@ -394,38 +448,29 @@ impl OmniMCPServer {
             );
         }
 
+        let cfg = crate::config::get_config();
+        let cap_scope = if let Some(g) = group_slug {
+            CapabilityScope::ToolGroup(g.to_string())
+        } else if let Some(s) = server_scope {
+            CapabilityScope::VirtualService(s.to_string())
+        } else {
+            CapabilityScope::Global
+        };
+
         match request.method.as_str() {
             "server/discover" => {
-                let supported: Vec<JsonValue> = crate::models::SUPPORTED_MCP_PROTOCOL_VERSIONS
-                    .iter()
-                    .map(|v| JsonValue::from(*v))
-                    .collect();
-                RPCResponse::ok(
-                    request.id.clone(),
-                    json!({
-                        "supportedVersions": JsonValue::Array(supported),
-                        "capabilities": {
-                            "tools": {"listChanged": true},
-                            "resources": {"subscribe": false, "listChanged": true},
-                            "prompts": {"listChanged": true},
-                            "logging": {},
-                            "extensions": {
-                                "io.modelcontextprotocol/tasks": {"version": "2026-07-28"}
-                            }
-                        },
-                        "serverInfo": {
-                            "name": "omni-mcp-gateway",
-                            "version": env!("CARGO_PKG_VERSION"),
-                            "description": concat!(
-                                "Omni MCP Autonomous Mesh Gateway & Code Mode Runtime (Rust Engine v",
-                                env!("CARGO_PKG_VERSION"),
-                                ")"
-                            ),
-                            "runtime": "rust"
-                        },
-                        "resultType": "complete"
-                    }),
-                )
+                let result = build_server_discover_result(
+                    &cfg,
+                    cap_scope,
+                    "omni-mcp-gateway",
+                    env!("CARGO_PKG_VERSION"),
+                    concat!(
+                        "Omni MCP Autonomous Mesh Gateway & Code Mode Runtime (Rust Engine v",
+                        env!("CARGO_PKG_VERSION"),
+                        ")"
+                    ),
+                );
+                RPCResponse::ok(request.id.clone(), result)
             }
             "subscriptions/listen" => RPCResponse::ok(
                 request.id.clone(),
@@ -442,7 +487,7 @@ impl OmniMCPServer {
                     if let Some(req_arr) = client_caps.get("required").and_then(|a| a.as_array()) {
                         for req_cap in req_arr {
                             let cap_str = req_cap.as_str().unwrap_or("");
-                            if !["tools", "resources", "prompts"].contains(&cap_str) {
+                            if !is_required_capability_supported(cap_str, &cfg) {
                                 return RPCResponse::err(
                                     request.id.clone(),
                                     RPCError::new(
@@ -458,19 +503,12 @@ impl OmniMCPServer {
                     }
                 }
 
+                let capabilities = build_server_capabilities(&cfg, cap_scope);
                 RPCResponse::ok(
                     request.id.clone(),
                     json!({
                         "protocolVersion": negotiated,
-                        "capabilities": {
-                            "tools": {"listChanged": true},
-                            "resources": {"subscribe": false, "listChanged": true},
-                            "prompts": {"listChanged": true},
-                            "logging": {},
-                            "extensions": {
-                                "io.modelcontextprotocol/tasks": {"version": "2026-07-28"}
-                            }
-                        },
+                        "capabilities": capabilities,
                         "serverInfo": {
                             "name": "omni-mcp-gateway",
                             "version": env!("CARGO_PKG_VERSION"),
@@ -538,11 +576,25 @@ impl OmniMCPServer {
             }
             "resources/list" => self.handle_resources_list(request),
             "resources/templates/list" => self.handle_resources_templates_list(request),
-            "resources/read" => self.handle_resources_read(request, caller_actor),
+            "resources/read" => {
+                self.handle_resources_read(request, caller_actor, group_slug, server_scope)
+            }
+            "resources/directory/read" => {
+                self.handle_resources_directory_read(request, group_slug, server_scope)
+            }
+            "skills/list" => self.handle_skills_list(request, group_slug, server_scope),
+            "skills/get" => self.handle_skills_get(request, group_slug, server_scope),
             "prompts/list" => self.handle_prompts_list(request),
             "prompts/get" => self.handle_prompts_get(request, caller_actor),
-            "tasks/get" => self.handle_tasks_get(request),
-            "tasks/update" => self.handle_tasks_update(request, caller_actor, user_token),
+            "tasks/get" => self.handle_tasks_get(request, group_slug, server_scope),
+            "tasks/update" => self.handle_tasks_update(
+                request,
+                caller_actor,
+                user_token,
+                group_slug,
+                server_scope,
+            ),
+            "tasks/cancel" => self.handle_tasks_cancel(request, group_slug, server_scope),
             "sampling/createMessage" | "elicitation/create" => {
                 let server_name = request.params.get("server").and_then(|s| s.as_str());
                 let policy = server_name
@@ -750,13 +802,188 @@ impl OmniMCPServer {
         )
     }
 
-    fn handle_tasks_get(&self, request: &RPCRequest) -> RPCResponse {
+    fn handle_skills_list(
+        &self,
+        request: &RPCRequest,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
+    ) -> RPCResponse {
+        if !crate::config::get_config().enable_skills_extension {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(
+                    METHOD_NOT_FOUND,
+                    "Skills extension (io.modelcontextprotocol/skills) is disabled",
+                ),
+            );
+        }
+        let scope = SkillAccessScope {
+            group_slug: group_slug.map(String::from),
+            server_scope: server_scope.map(String::from),
+        };
+        let skills: Vec<JsonValue> = self
+            .skills
+            .list_skills(&scope)
+            .iter()
+            .map(SkillEngine::to_mcp_summary)
+            .collect();
+        RPCResponse::ok(
+            request.id.clone(),
+            json!({
+                "skills": JsonValue::Array(skills),
+                "resultType": "complete"
+            }),
+        )
+    }
+
+    fn handle_skills_get(
+        &self,
+        request: &RPCRequest,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
+    ) -> RPCResponse {
+        if !crate::config::get_config().enable_skills_extension {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(
+                    METHOD_NOT_FOUND,
+                    "Skills extension (io.modelcontextprotocol/skills) is disabled",
+                ),
+            );
+        }
+        let slug = request
+            .params
+            .get("slug")
+            .or_else(|| request.params.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if slug.is_empty() {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(INVALID_PARAMS, "Missing 'slug' parameter in skills/get"),
+            );
+        }
+        let scope = SkillAccessScope {
+            group_slug: group_slug.map(String::from),
+            server_scope: server_scope.map(String::from),
+        };
+        match self.skills.get_skill(slug, &scope) {
+            Some(skill) => RPCResponse::ok(request.id.clone(), SkillEngine::to_mcp_detail(&skill)),
+            None => RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(
+                    INVALID_PARAMS,
+                    format!(
+                        "Skill '{}' not found or not accessible in current scope",
+                        slug
+                    ),
+                ),
+            ),
+        }
+    }
+
+    fn handle_resources_directory_read(
+        &self,
+        request: &RPCRequest,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
+    ) -> RPCResponse {
+        let uri = match request.params.get("uri").and_then(|u| u.as_str()) {
+            Some(u) => u,
+            None => {
+                return RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::new(
+                        INVALID_PARAMS,
+                        "Missing 'uri' parameter in resources/directory/read",
+                    ),
+                )
+            }
+        };
+        let scope = SkillAccessScope {
+            group_slug: group_slug.map(String::from),
+            server_scope: server_scope.map(String::from),
+        };
+        match self.skills.read_skill_directory(uri, &scope) {
+            Ok(entries) => RPCResponse::ok(
+                request.id.clone(),
+                json!({
+                    "uri": uri,
+                    "entries": JsonValue::Array(entries),
+                    "resultType": "complete"
+                }),
+            ),
+            Err(e) => RPCResponse::err(request.id.clone(), RPCError::new(INVALID_PARAMS, e)),
+        }
+    }
+
+    fn check_suspended_frame_scope(
+        &self,
+        frame: &crate::models::SuspendedExecutionFrame,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(req_grp) = group_slug {
+            let allowed_in_group = self
+                .cache
+                .registry
+                .get_tool_group(req_grp)
+                .map(|g| {
+                    g.entries
+                        .iter()
+                        .any(|e| e.server_name == frame.pending_server)
+                })
+                .unwrap_or(false);
+            if !allowed_in_group {
+                return Err(format!(
+                    "Task '{}' (server '{}') is not accessible from tool group '{}'",
+                    frame.execution_id, frame.pending_server, req_grp
+                ));
+            }
+        }
+        if let Some(req_srv) = server_scope {
+            if frame.pending_server != req_srv {
+                return Err(format!(
+                    "Task '{}' (server '{}') is not accessible from service '{}'",
+                    frame.execution_id, frame.pending_server, req_srv
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_tasks_get(
+        &self,
+        request: &RPCRequest,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
+    ) -> RPCResponse {
         let task_id = request
             .params
             .get("taskId")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        if task_id.is_empty() {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(INVALID_PARAMS, "Missing 'taskId' parameter in tasks/get"),
+            );
+        }
+
+        // 1. Check durable HA MCP Task record with strict group/service scope isolation
+        if let Some(task) = self.cache.registry.get_mcp_task(task_id) {
+            if let Err(err_msg) = TaskManager::check_scope(&task, group_slug, server_scope) {
+                return RPCResponse::err(request.id.clone(), RPCError::new(UNAUTHORIZED, err_msg));
+            }
+            return RPCResponse::ok(request.id.clone(), task.to_mcp_wire_json());
+        }
+
+        // 2. Fallback to legacy v6.5 SuspendedExecutionFrame (enforcing group/service scope isolation)
         if let Some(frame) = self.gateway.get_suspended_codemode_frame(task_id) {
+            if let Err(err_msg) = self.check_suspended_frame_scope(&frame, group_slug, server_scope)
+            {
+                return RPCResponse::err(request.id.clone(), RPCError::new(UNAUTHORIZED, err_msg));
+            }
             RPCResponse::ok(
                 request.id.clone(),
                 json!({
@@ -777,17 +1004,196 @@ impl OmniMCPServer {
         }
     }
 
-    fn handle_tasks_update(
+    fn handle_tasks_cancel(
         &self,
         request: &RPCRequest,
-        caller_actor: &str,
-        user_token: Option<&str>,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
     ) -> RPCResponse {
         let task_id = request
             .params
             .get("taskId")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        if task_id.is_empty() {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(INVALID_PARAMS, "Missing 'taskId' parameter in tasks/cancel"),
+            );
+        }
+
+        match self
+            .task_manager
+            .cancel_task_scoped(task_id, group_slug, server_scope)
+        {
+            Ok(_task) => {
+                // Also delete any paired suspended frame so it cannot be resumed later
+                let _ = self.gateway.delete_suspended_codemode_frame(task_id);
+                // Spec-compliant GA `tasks/cancel` returns `{}` acknowledgement
+                RPCResponse::ok(request.id.clone(), JsonValue::object())
+            }
+            Err(e) => {
+                if e.contains("does not belong") {
+                    return RPCResponse::err(request.id.clone(), RPCError::new(UNAUTHORIZED, e));
+                }
+                // Legacy suspended frame cancel fallback (strictly enforcing group/service scope)
+                if let Some(frame) = self.gateway.get_suspended_codemode_frame(task_id) {
+                    if let Err(err_msg) =
+                        self.check_suspended_frame_scope(&frame, group_slug, server_scope)
+                    {
+                        return RPCResponse::err(
+                            request.id.clone(),
+                            RPCError::new(UNAUTHORIZED, err_msg),
+                        );
+                    }
+                    let _ = self.gateway.delete_suspended_codemode_frame(task_id);
+                    RPCResponse::ok(request.id.clone(), JsonValue::object())
+                } else {
+                    RPCResponse::err(request.id.clone(), RPCError::new(INVALID_PARAMS, e))
+                }
+            }
+        }
+    }
+
+    fn handle_tasks_update(
+        &self,
+        request: &RPCRequest,
+        caller_actor: &str,
+        user_token: Option<&str>,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
+    ) -> RPCResponse {
+        let task_id = request
+            .params
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if task_id.is_empty() {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(INVALID_PARAMS, "Missing 'taskId' parameter in tasks/update"),
+            );
+        }
+
+        // Enforce scope isolation on tracked HA MCP task OR legacy suspended frame
+        if let Some(existing_task) = self.cache.registry.get_mcp_task(task_id) {
+            if let Err(err_msg) = TaskManager::check_scope(&existing_task, group_slug, server_scope)
+            {
+                return RPCResponse::err(request.id.clone(), RPCError::new(UNAUTHORIZED, err_msg));
+            }
+        } else if let Some(existing_frame) = self.gateway.get_suspended_codemode_frame(task_id) {
+            if let Err(err_msg) =
+                self.check_suspended_frame_scope(&existing_frame, group_slug, server_scope)
+            {
+                return RPCResponse::err(request.id.clone(), RPCError::new(UNAUTHORIZED, err_msg));
+            }
+        }
+
+        // 1. July 2026 GA `io.modelcontextprotocol/tasks` wire path: `inputResponses` -> `{}` ack
+        if let Some(input_responses) = request.params.get("inputResponses") {
+            let first_resp = input_responses
+                .as_array()
+                .and_then(|a| a.first())
+                .unwrap_or(input_responses);
+            let elicit_action = first_resp
+                .get("action")
+                .or_else(|| first_resp.get("result").and_then(|r| r.get("action")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("accept");
+            let content = first_resp
+                .get("content")
+                .or_else(|| first_resp.get("result").and_then(|r| r.get("content")))
+                .cloned()
+                .unwrap_or_else(JsonValue::object);
+            let justification = content
+                .get("justification")
+                .or_else(|| content.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let approver = first_resp
+                .get("approver")
+                .and_then(|v| v.as_str())
+                .unwrap_or(caller_actor);
+            let digest = first_resp.get("digest").and_then(|v| v.as_str());
+
+            // Submit input responses on HA task record (if present)
+            if self.cache.registry.get_mcp_task(task_id).is_some() {
+                if let Err(e) = self.task_manager.submit_input_responses_scoped(
+                    task_id,
+                    input_responses.clone(),
+                    group_slug,
+                    server_scope,
+                ) {
+                    return RPCResponse::err(request.id.clone(), RPCError::new(INVALID_PARAMS, e));
+                }
+            }
+
+            if elicit_action.eq_ignore_ascii_case("accept") {
+                if let Some(ref audit) = self.gateway.audit_store {
+                    let _ = audit.record_invocation(
+                        approver,
+                        "codemode",
+                        "elicitation_accept",
+                        &json!({"task_id": task_id, "justification": justification}),
+                        "APPROVED:elicitation_accepted",
+                        0,
+                    );
+                }
+                if self.gateway.get_suspended_codemode_frame(task_id).is_some() {
+                    let out = self
+                        .gateway
+                        .resume_codemode(task_id, approver, None, user_token, None, digest);
+                    if let Some(mut task) = self.cache.registry.get_mcp_task(task_id) {
+                        task.updated_at = crate::logging::now_epoch_secs();
+                        if out.status == "OK" {
+                            task.status = McpTaskStatus::Completed;
+                            task.progress_pct = 100;
+                            task.result_payload = Some(out.to_json());
+                        } else {
+                            task.status = McpTaskStatus::Failed;
+                            task.error_payload = Some(json!({
+                                "code": out.error_code.unwrap_or(INTERNAL_ERROR),
+                                "message": out.error.clone().unwrap_or_else(|| "Resume failed".to_string())
+                            }));
+                        }
+                        self.cache.registry.save_mcp_task(&task);
+                    }
+                }
+            } else {
+                // Decline or Cancel -> record Merkle audit & run LIFO Saga rollback
+                if let Some(ref audit) = self.gateway.audit_store {
+                    let _ = audit.record_invocation(
+                        approver,
+                        "codemode",
+                        "elicitation_decline",
+                        &json!({"task_id": task_id, "action": elicit_action, "justification": justification}),
+                        "REJECTED:elicitation_declined",
+                        0,
+                    );
+                }
+                if let Some(mut frame) = self.gateway.delete_suspended_codemode_frame(task_id) {
+                    if !frame.completed_mutations.is_empty() {
+                        let _ = self.gateway.unwind_saga_compensations(
+                            &mut frame.completed_mutations,
+                            &frame.caller_actor,
+                            user_token,
+                            "",
+                        );
+                    }
+                }
+                if let Some(mut task) = self.cache.registry.get_mcp_task(task_id) {
+                    task.status = McpTaskStatus::Cancelled;
+                    task.status_message = Some(format!("Elicitation {}", elicit_action));
+                    task.updated_at = crate::logging::now_epoch_secs();
+                    self.cache.registry.save_mcp_task(&task);
+                }
+            }
+
+            // Spec-compliant GA `tasks/update` returns `{}` acknowledgement
+            return RPCResponse::ok(request.id.clone(), JsonValue::object());
+        }
+
+        // 2. Backward-compatible v6.5 `action: "resume"|"cancel"` fallback
         let action = request
             .params
             .get("action")
@@ -861,7 +1267,13 @@ impl OmniMCPServer {
         }
     }
 
-    fn handle_resources_read(&self, request: &RPCRequest, caller_actor: &str) -> RPCResponse {
+    fn handle_resources_read(
+        &self,
+        request: &RPCRequest,
+        caller_actor: &str,
+        group_slug: Option<&str>,
+        server_scope: Option<&str>,
+    ) -> RPCResponse {
         let uri = match request.params.get("uri").and_then(|u| u.as_str()) {
             Some(u) => u,
             None => {
@@ -871,6 +1283,29 @@ impl OmniMCPServer {
                 )
             }
         };
+
+        if uri.starts_with("skill://") {
+            let scope = SkillAccessScope {
+                group_slug: group_slug.map(String::from),
+                server_scope: server_scope.map(String::from),
+            };
+            return match self.skills.read_skill_resource(uri, &scope) {
+                Ok((resolved_uri, mime, text)) => RPCResponse::ok(
+                    request.id.clone(),
+                    json!({
+                        "contents": [
+                            {
+                                "uri": resolved_uri,
+                                "mimeType": mime,
+                                "text": text
+                            }
+                        ],
+                        "resultType": "complete"
+                    }),
+                ),
+                Err(e) => RPCResponse::err(request.id.clone(), RPCError::new(INVALID_PARAMS, e)),
+            };
+        }
 
         if uri == "omni://codemode/types.d.ts" {
             let ts = self.gateway.generate_codemode_types(None, None);
@@ -1518,6 +1953,58 @@ impl OmniMCPServer {
             .cloned()
             .unwrap_or_else(JsonValue::object);
 
+        // v6.8.0 Experimental File Uploads (io.modelcontextprotocol/files):
+        // Resolve `x-mcp-file` properties (inline <= 256 KiB or existing fileId), or emit
+        // SEP-2356 `resultType: "upload_required"` MRTR if a required file argument is missing.
+        let cfg = crate::config::get_config();
+        if cfg.enable_file_uploads_extension {
+            if let Some(srv) = self.cache.get_server_arc(server_name) {
+                if let Some(tool) = srv.tools.get(tool_name) {
+                    let file_props = find_mcp_file_properties(&tool.input_schema);
+                    if !file_props.is_empty() {
+                        let required_fields: Vec<&str> = tool
+                            .input_schema
+                            .get("required")
+                            .and_then(|r| r.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                            .unwrap_or_default();
+                        for field in file_props {
+                            match tool_args.get(&field).cloned() {
+                                Some(val) if !val.is_null() => {
+                                    match resolve_file_argument(
+                                        &self.file_store,
+                                        &val,
+                                        caller_actor,
+                                    ) {
+                                        Ok(resolved) => {
+                                            tool_args.insert(field, resolved);
+                                        }
+                                        Err(e) => {
+                                            return RPCResponse::err(
+                                                request.id.clone(),
+                                                RPCError::new(INVALID_PARAMS, e),
+                                            );
+                                        }
+                                    }
+                                }
+                                _ if required_fields.contains(&field.as_str()) => {
+                                    return RPCResponse::ok(
+                                        request.id.clone(),
+                                        build_upload_required_mrtr(
+                                            &cfg.public_base_url,
+                                            &field,
+                                            cfg.file_upload_max_bytes,
+                                        ),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(proj) = args.get("_projection").cloned() {
             tool_args.insert("_projection", proj);
         }
@@ -1533,6 +2020,7 @@ impl OmniMCPServer {
             })
             .and_then(|tp| tp.as_str());
 
+        let client_caps = ClientCapabilitiesMeta::from_params(&request.params);
         let call_req = RPCRequest::new(
             request.id.clone(),
             "tools/call",
@@ -1541,12 +2029,196 @@ impl OmniMCPServer {
                 "arguments": tool_args,
             }),
         );
-        self.gateway.handle_request_with_trace(
-            server_name,
-            &call_req,
-            caller_actor,
-            user_token,
-            traceparent,
+
+        // v6.8.0 URL-mode Elicitation (Milestone 4):
+        // If the target server is an external StreamableHttp server using OAuth (no static bearer_ref)
+        // and no token exists in the shared multi-replica OAuth store, emit `elicitation/create`
+        // (`mode: "url"`) when the client declared `elicitation.url`.
+        if client_caps.elicitation_url {
+            if let Some(srv) = self.cache.get_server_arc(server_name) {
+                if let Some(crate::models::UpstreamTransportConfig::StreamableHttp {
+                    url: upstream_url,
+                    bearer_ref: None,
+                    ..
+                }) = &srv.upstream_config
+                {
+                    let tok_store =
+                        crate::upstream::UpstreamOAuthTokenStore::new(&cfg.secrets_dir, None)
+                            .with_registry(self.cache.registry.clone());
+                    if tok_store.load_token(server_name).is_err() {
+                        return self.build_url_elicitation_response(
+                            request.id.clone(),
+                            server_name,
+                            upstream_url,
+                            &cfg,
+                        );
+                    }
+                }
+            }
+        }
+
+        let is_long_running = self
+            .cache
+            .get_server_arc(server_name)
+            .and_then(|srv| srv.tools.get(tool_name).cloned())
+            .map(|t| {
+                t.metadata
+                    .get("long_running")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                    || t.metadata
+                        .get("taskSupport")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == "optional" || s == "required")
+                        .unwrap_or(false)
+                    || t.tags
+                        .iter()
+                        .any(|tag| tag == "long_running" || tag == "long-running")
+            })
+            .unwrap_or(false);
+        let force_async_tool = request.params.get("task").is_some();
+        let resp = if cfg.enable_tasks_extension
+            && (force_async_tool || (client_caps.tasks && is_long_running))
+        {
+            let mut gw = self.gateway.clone();
+            gw.task_manager = None;
+            let srv_owned = server_name.to_string();
+            let req_owned = call_req.clone();
+            let actor_owned = caller_actor.to_string();
+            let tok_owned = user_token.map(String::from);
+            let tp_owned = traceparent.map(String::from);
+            let grace_ms = if force_async_tool {
+                Some(0)
+            } else {
+                Some(cfg.task_sync_grace_ms)
+            };
+            match self.task_manager.run_with_grace(
+                caller_actor,
+                None,
+                Some(server_name.to_string()),
+                force_async_tool,
+                grace_ms,
+                move |_cancel_flag| {
+                    let r = gw.handle_request_with_trace(
+                        &srv_owned,
+                        &req_owned,
+                        &actor_owned,
+                        tok_owned.as_deref(),
+                        tp_owned.as_deref(),
+                    );
+                    if let Some(err) = r.error {
+                        Err((err.code, err.message))
+                    } else {
+                        Ok(r.result.unwrap_or_else(JsonValue::object))
+                    }
+                },
+            ) {
+                Ok(TaskDispatchOutcome::PromotedAsync(task)) => {
+                    return RPCResponse::ok(
+                        request.id.clone(),
+                        json!({
+                            "resultType": "task",
+                            "taskId": task.task_id,
+                            "status": task.status.as_str(),
+                            "pollInterval": task.poll_interval_ms as i64,
+                            "statusMessage": task.status_message.unwrap_or_else(|| "Task running".to_string())
+                        }),
+                    );
+                }
+                Ok(TaskDispatchOutcome::CompletedSync(val)) => {
+                    RPCResponse::ok(request.id.clone(), val)
+                }
+                Err(e) => RPCResponse::err(request.id.clone(), RPCError::new(INTERNAL_ERROR, e)),
+            }
+        } else {
+            self.gateway.handle_request_with_trace(
+                server_name,
+                &call_req,
+                caller_actor,
+                user_token,
+                traceparent,
+            )
+        };
+
+        // Fallback URL-mode elicitation if upstream returned HTTP 401 / UNAUTHORIZED
+        if client_caps.elicitation_url {
+            if let Some(ref err) = resp.error {
+                let is_oauth_401 = err.code == UNAUTHORIZED
+                    || err.message.contains("401")
+                    || err.message.to_lowercase().contains("unauthorized");
+                if is_oauth_401 {
+                    if let Some(srv) = self.cache.get_server_arc(server_name) {
+                        if let Some(crate::models::UpstreamTransportConfig::StreamableHttp {
+                            url: upstream_url,
+                            ..
+                        }) = &srv.upstream_config
+                        {
+                            return self.build_url_elicitation_response(
+                                request.id.clone(),
+                                server_name,
+                                upstream_url,
+                                &cfg,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        resp
+    }
+
+    fn build_url_elicitation_response(
+        &self,
+        req_id: JsonValue,
+        server_name: &str,
+        upstream_url: &str,
+        cfg: &crate::config::OmniConfig,
+    ) -> RPCResponse {
+        let (verifier, _challenge) = crate::upstream::UpstreamOAuthTokenStore::generate_pkce_pair();
+        let state = format!("st_{}", crate::models::generate_ulid());
+        let elicitation_id = format!("elicit_{}", crate::models::generate_ulid());
+        let base = cfg.public_base_url.trim_end_matches('/');
+        let redirect_uri = format!("{}/api/v1/oauth/callback", base);
+        let now_ts = crate::logging::now_epoch_secs();
+        self.cache
+            .registry
+            .save_oauth_flow(&crate::models::OAuthFlowRecord {
+                state: state.clone(),
+                server_name: server_name.to_string(),
+                elicitation_id: Some(elicitation_id.clone()),
+                code_verifier: verifier,
+                token_url: format!("{}/oauth/token", upstream_url.trim_end_matches('/')),
+                client_id: "omni-mcp-gateway".to_string(),
+                redirect_uri,
+                created_at: now_ts,
+                expires_at: now_ts + 600.0,
+            });
+        let elicit_url = format!(
+            "{}/api/v1/oauth/start?server={}&state={}&elicitation_id={}",
+            base, server_name, state, elicitation_id
+        );
+        let input_requests = json!([
+            {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "url",
+                    "elicitationId": elicitation_id.clone(),
+                    "url": elicit_url,
+                    "message": format!(
+                        "OAuth authorization required for '{}'. Complete sign-in in your browser and retry.",
+                        server_name
+                    )
+                }
+            }
+        ]);
+        RPCResponse::ok(
+            req_id,
+            json!({
+                "resultType": "input_required",
+                "requestState": elicitation_id,
+                "inputRequests": input_requests,
+                "isError": false
+            }),
         )
     }
 
@@ -1957,6 +2629,95 @@ impl OmniMCPServer {
             limits.max_operations = max_ops.clamp(100, 500_000);
         }
 
+        let client_caps = ClientCapabilitiesMeta::from_params(&request.params);
+        let cfg = crate::config::get_config();
+        let force_async = cfg.enable_tasks_extension
+            && (request.params.get("task").is_some()
+                || args.get("async").and_then(|v| v.as_bool()).unwrap_or(false));
+        let use_tasks_grace = cfg.enable_tasks_extension && (force_async || client_caps.tasks);
+
+        if use_tasks_grace {
+            let gw = self.gateway.clone();
+            let code_owned = code.to_string();
+            let actor_owned = caller_actor.to_string();
+            let token_owned = user_token.map(String::from);
+            let grace_ms = if force_async {
+                Some(0)
+            } else {
+                Some(cfg.task_sync_grace_ms)
+            };
+            match self.task_manager.run_with_grace(
+                caller_actor,
+                None,
+                None,
+                force_async,
+                grace_ms,
+                move |cancel_flag| {
+                    let out = gw.execute_codemode_with_cancel(
+                        &code_owned,
+                        Some(limits),
+                        require_mutation_approval,
+                        &actor_owned,
+                        token_owned.as_deref(),
+                        None,
+                        Some(cancel_flag),
+                    );
+                    if out.status == "ERROR" {
+                        Err((
+                            out.error_code.unwrap_or(INTERNAL_ERROR),
+                            out.error
+                                .unwrap_or_else(|| "Code Mode execution failed".to_string()),
+                        ))
+                    } else {
+                        Ok(out.to_json())
+                    }
+                },
+            ) {
+                Ok(TaskDispatchOutcome::PromotedAsync(task)) => {
+                    return RPCResponse::ok(
+                        request.id.clone(),
+                        json!({
+                            "resultType": "task",
+                            "taskId": task.task_id,
+                            "status": task.status.as_str(),
+                            "pollInterval": task.poll_interval_ms as i64,
+                            "statusMessage": task.status_message.unwrap_or_else(|| "Task running".to_string())
+                        }),
+                    );
+                }
+                Ok(TaskDispatchOutcome::CompletedSync(val)) => {
+                    let is_approval =
+                        val.get("status").and_then(|s| s.as_str()) == Some("APPROVAL_REQUIRED");
+                    if !is_approval {
+                        return RPCResponse::ok(
+                            request.id.clone(),
+                            json!({
+                                "content": [{"type": "text", "text": val.to_string_pretty()}],
+                                "resultType": "complete",
+                                "isError": false
+                            }),
+                        );
+                    }
+                    let exec_id = val
+                        .get("execution_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    return RPCResponse::ok(
+                        request.id.clone(),
+                        json!({
+                            "content": [{"type": "text", "text": val.to_string_pretty()}],
+                            "resultType": "input_required",
+                            "requestState": exec_id.map(JsonValue::from).unwrap_or(JsonValue::Null),
+                            "isError": false
+                        }),
+                    );
+                }
+                Err(e) => {
+                    return RPCResponse::err(request.id.clone(), RPCError::new(INTERNAL_ERROR, e));
+                }
+            }
+        }
+
         let output = self.gateway.execute_codemode(
             code,
             Some(limits),
@@ -1969,29 +2730,82 @@ impl OmniMCPServer {
         let is_err = output.status == "ERROR";
         let is_approval = output.status == "APPROVAL_REQUIRED";
         let mut payload = output.to_json();
+        let mut input_requests: Option<JsonValue> = None;
+
         if is_approval {
             payload.insert("resultType", "input_required");
             if let Some(ref frame) = output.suspended_frame {
                 payload.insert("requestState", frame.execution_id.clone());
+                if client_caps.elicitation_form {
+                    let schema = json!({
+                        "type": "object",
+                        "properties": {
+                            "approved": {
+                                "type": "boolean",
+                                "description": "Confirm whether to approve this mutating operation"
+                            },
+                            "justification": {
+                                "type": "string",
+                                "description": "Audit justification recorded in Merkle audit log"
+                            }
+                        },
+                        "required": ["approved"]
+                    });
+                    if ElicitationPolicyRule::validate_elicitation_schema(&schema).is_ok() {
+                        let reqs = json!([
+                            {
+                                "method": "elicitation/create",
+                                "params": {
+                                    "mode": "form",
+                                    "message": format!(
+                                        "Approve mutating tool call '{}.{}'? ({})",
+                                        frame.pending_server,
+                                        frame.pending_tool,
+                                        frame.pending_reason
+                                    ),
+                                    "requestedSchema": schema
+                                }
+                            }
+                        ]);
+                        let mut task = McpTaskRecord::new(
+                            frame.execution_id.clone(),
+                            cfg.pod_id.clone(),
+                            caller_actor,
+                            None,
+                            Some(frame.pending_server.clone()),
+                            cfg.task_ttl_sec,
+                        );
+                        task.status = McpTaskStatus::InputRequired;
+                        task.status_message = Some(frame.pending_reason.clone());
+                        task.input_requests = Some(reqs.clone());
+                        self.task_manager.record_task(&task);
+                        input_requests = Some(reqs);
+                    }
+                }
             }
         } else {
             payload.insert("resultType", "complete");
         }
 
-        RPCResponse::ok(
-            request.id.clone(),
-            json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": payload.to_string_pretty()
-                    }
-                ],
-                "resultType": if is_approval { "input_required" } else { "complete" },
-                "requestState": if is_approval { output.suspended_frame.as_ref().map(|f| JsonValue::from(f.execution_id.as_str())).unwrap_or(JsonValue::Null) } else { JsonValue::Null },
-                "isError": is_err
-            }),
-        )
+        let mut resp_obj = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": payload.to_string_pretty()
+                }
+            ],
+            "resultType": if is_approval { "input_required" } else { "complete" },
+            "requestState": if is_approval { output.suspended_frame.as_ref().map(|f| JsonValue::from(f.execution_id.as_str())).unwrap_or(JsonValue::Null) } else { JsonValue::Null },
+            "isError": is_err
+        });
+        if let Some(reqs) = input_requests {
+            resp_obj.insert("inputRequests", reqs);
+            if let Some(ref frame) = output.suspended_frame {
+                resp_obj.insert("taskId", JsonValue::from(frame.execution_id.as_str()));
+            }
+        }
+
+        RPCResponse::ok(request.id.clone(), resp_obj)
     }
 
     fn call_get_codemode_types(&self, request: &RPCRequest, args: &JsonValue) -> RPCResponse {

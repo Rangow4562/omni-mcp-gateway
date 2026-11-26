@@ -198,3 +198,46 @@ export interface ImportConfigResponse {
   imported_count: number;
   servers: ImportConfigPreviewItem[];
 }
+
+export interface SkillFileEntryItem {
+  path: string;
+  mime_type: string;
+  content: string;
+  size_bytes: number;
+  sha256: string;
+}
+
+export interface SkillRecordItem {
+  slug: string;
+  name: string;
+  description: string;
+  version: string;
+  group_slug?: string | null;
+  server_scope?: string | null;
+  auto_generated: boolean;
+  files: SkillFileEntryItem[];
+  file_count: number;
+  total_bytes: number;
+  manifest_sha256: string;
+  updated_at: number;
+}
+
+export interface McpTaskItem {
+  task_id: string;
+  owner_pod_id: string;
+  caller_actor: string;
+  group_slug?: string | null;
+  server_scope?: string | null;
+  status: 'working' | 'input_required' | 'completed' | 'failed' | 'cancelled';
+  status_message?: string | null;
+  progress_pct: number;
+  poll_interval_ms: number;
+  input_requests?: any;
+  input_responses?: any;
+  result_payload?: any;
+  error_payload?: any;
+  cancel_requested: boolean;
+  created_at: number;
+  updated_at: number;
+  expires_at: number;
+}

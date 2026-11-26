@@ -10,6 +10,7 @@ pub mod projection;
 pub mod rate_limiter;
 pub mod security;
 pub mod semantic_index;
+pub mod task_runner;
 pub mod translators;
 
 pub use cache::InMemoryConfigCache;
@@ -32,4 +33,5 @@ pub use security::{PIIRedactor, SecurityCharterEngine};
 pub use semantic_index::{
     cosine_similarity, embed_local, embed_text, rank_hybrid_rrf, HybridDocument, HybridRankedItem,
 };
+pub use task_runner::{TaskDispatchOutcome, TaskEventSink, TaskManager, TaskMetrics};
 pub use translators::ProtocolTranslator;

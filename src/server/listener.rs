@@ -14,7 +14,7 @@ use super::sse::stream_sse_async;
 use super::sse::stream_sse_sync;
 use super::{get_gateway_context, AutoSyncScheduler, ProductionGatewayContext};
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(not(feature = "async-runtime"))]
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -737,37 +737,76 @@ pub async fn handle_async_stream<S>(
             return;
         }
 
-        if seen_transfer_encoding && !seen_content_length {
-            send_raw_error_response_async(
-                reader.get_mut(),
-                501,
-                "Not Implemented",
-                "Not Implemented: Transfer-Encoding not supported",
-            )
-            .await;
-            return;
-        }
+        let path_base_pre = path.split('?').next().unwrap_or(&path);
+        let is_file_upload_route = ctx.config.enable_file_uploads_extension
+            && (method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("POST"))
+            && (path_base_pre.starts_with("/api/v1/files/upload/")
+                || path_base_pre.starts_with("/api/files/upload/"));
+        let is_chunked_te = get_header(&headers, "transfer-encoding")
+            .map(|v| v.trim().eq_ignore_ascii_case("chunked"))
+            .unwrap_or(false);
+        let effective_max_body = if is_file_upload_route {
+            ctx.config.file_upload_max_bytes
+        } else {
+            ctx.config.max_body_size_bytes
+        };
 
-        if content_length > ctx.config.max_body_size_bytes {
-            send_raw_error_response_async(
-                reader.get_mut(),
-                413,
-                "Payload Too Large",
-                "Payload Too Large (Exceeds Limit)",
-            )
-            .await;
-            return;
-        }
-
-        let mut body_bytes = vec![0u8; content_length];
-        if content_length > 0 {
-            let body_res =
-                tokio::time::timeout(Duration::from_secs(30), reader.read_exact(&mut body_bytes))
-                    .await;
-            if !matches!(body_res, Ok(Ok(_))) {
+        let body_bytes: Vec<u8> = if seen_transfer_encoding && !seen_content_length {
+            if !is_file_upload_route || !is_chunked_te {
+                send_raw_error_response_async(
+                    reader.get_mut(),
+                    501,
+                    "Not Implemented",
+                    "Not Implemented: Transfer-Encoding not supported",
+                )
+                .await;
                 return;
             }
-        }
+            match read_chunked_body_async(&mut reader, effective_max_body).await {
+                Ok(buf) => buf,
+                Err(413) => {
+                    send_raw_error_response_async(
+                        reader.get_mut(),
+                        413,
+                        "Payload Too Large",
+                        "Payload Too Large (Exceeds File Upload Limit)",
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    send_raw_error_response_async(
+                        reader.get_mut(),
+                        400,
+                        "Bad Request",
+                        "Bad Request: Malformed chunked transfer encoding",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            if content_length > effective_max_body {
+                send_raw_error_response_async(
+                    reader.get_mut(),
+                    413,
+                    "Payload Too Large",
+                    "Payload Too Large (Exceeds Limit)",
+                )
+                .await;
+                return;
+            }
+            let mut buf = vec![0u8; content_length];
+            if content_length > 0 {
+                let body_res =
+                    tokio::time::timeout(Duration::from_secs(60), reader.read_exact(&mut buf))
+                        .await;
+                if !matches!(body_res, Ok(Ok(_))) {
+                    return;
+                }
+            }
+            buf
+        };
 
         let path_base = path.split('?').next().unwrap_or(&path).to_string();
         let is_sse_route =
@@ -973,30 +1012,67 @@ pub fn handle_stream<S: Read + Write>(stream: S, ctx: &ProductionGatewayContext)
             return;
         }
 
-        if seen_transfer_encoding && !seen_content_length {
-            send_raw_error_response(
-                reader.get_mut(),
-                501,
-                "Not Implemented",
-                "Not Implemented: Transfer-Encoding not supported",
-            );
-            return;
-        }
+        let path_base_pre = path.split('?').next().unwrap_or(&path);
+        let is_file_upload_route = ctx.config.enable_file_uploads_extension
+            && (method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("POST"))
+            && (path_base_pre.starts_with("/api/v1/files/upload/")
+                || path_base_pre.starts_with("/api/files/upload/"));
+        let is_chunked_te = get_header(&headers, "transfer-encoding")
+            .map(|v| v.trim().eq_ignore_ascii_case("chunked"))
+            .unwrap_or(false);
+        let effective_max_body = if is_file_upload_route {
+            ctx.config.file_upload_max_bytes
+        } else {
+            ctx.config.max_body_size_bytes
+        };
 
-        if content_length > ctx.config.max_body_size_bytes {
-            send_raw_error_response(
-                reader.get_mut(),
-                413,
-                "Payload Too Large",
-                "Payload Too Large (Exceeds Limit)",
-            );
-            return;
-        }
-
-        let mut body_bytes = vec![0u8; content_length];
-        if content_length > 0 && reader.read_exact(&mut body_bytes).is_err() {
-            return;
-        }
+        let body_bytes: Vec<u8> = if seen_transfer_encoding && !seen_content_length {
+            if !is_file_upload_route || !is_chunked_te {
+                send_raw_error_response(
+                    reader.get_mut(),
+                    501,
+                    "Not Implemented",
+                    "Not Implemented: Transfer-Encoding not supported",
+                );
+                return;
+            }
+            match read_chunked_body_sync(&mut reader, effective_max_body) {
+                Ok(buf) => buf,
+                Err(413) => {
+                    send_raw_error_response(
+                        reader.get_mut(),
+                        413,
+                        "Payload Too Large",
+                        "Payload Too Large (Exceeds File Upload Limit)",
+                    );
+                    return;
+                }
+                Err(_) => {
+                    send_raw_error_response(
+                        reader.get_mut(),
+                        400,
+                        "Bad Request",
+                        "Bad Request: Malformed chunked transfer encoding",
+                    );
+                    return;
+                }
+            }
+        } else {
+            if content_length > effective_max_body {
+                send_raw_error_response(
+                    reader.get_mut(),
+                    413,
+                    "Payload Too Large",
+                    "Payload Too Large (Exceeds Limit)",
+                );
+                return;
+            }
+            let mut buf = vec![0u8; content_length];
+            if content_length > 0 && reader.read_exact(&mut buf).is_err() {
+                return;
+            }
+            buf
+        };
 
         let path_base = path.split('?').next().unwrap_or(&path);
         let is_sse_route =
@@ -1057,7 +1133,8 @@ pub fn handle_stream<S: Read + Write>(stream: S, ctx: &ProductionGatewayContext)
                         origin
                     ));
                 }
-                header_str.push_str("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
+                header_str
+                    .push_str("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n");
                 header_str
                     .push_str("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
             }
@@ -1079,6 +1156,129 @@ pub fn handle_stream<S: Read + Write>(stream: S, ctx: &ProductionGatewayContext)
 
         if !keep_alive || status >= 400 {
             return;
+        }
+    }
+}
+
+/// Decodes an HTTP/1.1 `Transfer-Encoding: chunked` body up to `max_bytes` (sync listener).
+fn read_chunked_body_sync<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Vec<u8>, u16> {
+    const MAX_CHUNK_LINE_BYTES: usize = 4096;
+    let mut out = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .take(MAX_CHUNK_LINE_BYTES as u64)
+            .read_line(&mut line)
+            .map_err(|_| 400u16)?;
+        if n == 0 || !line.ends_with('\n') {
+            return Err(400);
+        }
+        let size_str = line.trim().split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_str, 16).map_err(|_| 400u16)?;
+        if chunk_size == 0 {
+            // Drain trailing CRLF / optional trailers (bounded)
+            let mut trailer_lines = 0usize;
+            loop {
+                line.clear();
+                let tn = reader
+                    .take(MAX_CHUNK_LINE_BYTES as u64)
+                    .read_line(&mut line)
+                    .map_err(|_| 400u16)?;
+                if tn == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                trailer_lines += 1;
+                if trailer_lines > 64 || !line.ends_with('\n') {
+                    return Err(400);
+                }
+            }
+            return Ok(out);
+        }
+        if out.len().saturating_add(chunk_size) > max_bytes {
+            return Err(413);
+        }
+        let start = out.len();
+        out.resize(start + chunk_size, 0);
+        reader
+            .read_exact(&mut out[start..start + chunk_size])
+            .map_err(|_| 400u16)?;
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf).map_err(|_| 400u16)?;
+        if crlf != *b"\r\n" {
+            return Err(400);
+        }
+    }
+}
+
+/// Decodes an HTTP/1.1 `Transfer-Encoding: chunked` body up to `max_bytes` (async Tokio listener).
+#[cfg(feature = "async-runtime")]
+async fn read_chunked_body_async<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, u16> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    const MAX_CHUNK_LINE_BYTES: usize = 4096;
+    let mut out = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = tokio::time::timeout(
+            Duration::from_secs(30),
+            reader
+                .take(MAX_CHUNK_LINE_BYTES as u64)
+                .read_line(&mut line),
+        )
+        .await
+        .map_err(|_| 400u16)?
+        .map_err(|_| 400u16)?;
+        if n == 0 || !line.ends_with('\n') {
+            return Err(400);
+        }
+        let size_str = line.trim().split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_str, 16).map_err(|_| 400u16)?;
+        if chunk_size == 0 {
+            let mut trailer_lines = 0usize;
+            loop {
+                line.clear();
+                let tn = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    reader
+                        .take(MAX_CHUNK_LINE_BYTES as u64)
+                        .read_line(&mut line),
+                )
+                .await
+                .map_err(|_| 400u16)?
+                .map_err(|_| 400u16)?;
+                if tn == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                trailer_lines += 1;
+                if trailer_lines > 64 || !line.ends_with('\n') {
+                    return Err(400);
+                }
+            }
+            return Ok(out);
+        }
+        if out.len().saturating_add(chunk_size) > max_bytes {
+            return Err(413);
+        }
+        let start = out.len();
+        out.resize(start + chunk_size, 0);
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            reader.read_exact(&mut out[start..start + chunk_size]),
+        )
+        .await
+        .map_err(|_| 400u16)?
+        .map_err(|_| 400u16)?;
+        let mut crlf = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(10), reader.read_exact(&mut crlf))
+            .await
+            .map_err(|_| 400u16)?
+            .map_err(|_| 400u16)?;
+        if crlf != *b"\r\n" {
+            return Err(400);
         }
     }
 }

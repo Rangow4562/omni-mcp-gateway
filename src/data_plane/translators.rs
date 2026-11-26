@@ -9,9 +9,45 @@ use crate::data_plane::downstream_http::HttpDownstreamClient;
 use crate::data_plane::muttley::MuttleyMeshClient;
 use crate::json::JsonValue;
 use crate::models::{ProtocolType, ToolRecord};
+use crate::storage::FileBlobStore;
 use crate::upstream::UpstreamManager;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+thread_local! {
+    static ACTIVE_CANCEL_FLAG: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+struct ActiveCancelFlagGuard {
+    prev: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for ActiveCancelFlagGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        ACTIVE_CANCEL_FLAG.with(|cell| {
+            *cell.borrow_mut() = prev;
+        });
+    }
+}
+
+/// Runs `f` with `flag` installed as the thread-local cooperative cancellation flag
+/// for Wasm ABI v2 and downstream tool execution.
+pub fn with_active_cancel_flag<F, R>(flag: Arc<AtomicBool>, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let prev = ACTIVE_CANCEL_FLAG.with(|cell| cell.borrow_mut().replace(flag));
+    let _guard = ActiveCancelFlagGuard { prev };
+    f()
+}
+
+/// Returns the active cooperative cancellation flag for the current execution thread, if any.
+pub fn current_cancel_flag() -> Option<Arc<AtomicBool>> {
+    ACTIVE_CANCEL_FLAG.with(|cell| cell.borrow().clone())
+}
 
 #[derive(Clone, Default)]
 pub struct ProtocolTranslator {
@@ -21,6 +57,7 @@ pub struct ProtocolTranslator {
     pub auth_exchange: ThirdPartyAuthExchange,
     pub upstream_manager: Option<Arc<UpstreamManager>>,
     pub config_cache: Option<InMemoryConfigCache>,
+    pub file_store: Option<FileBlobStore>,
 }
 
 impl ProtocolTranslator {
@@ -35,6 +72,7 @@ impl ProtocolTranslator {
             auth_exchange: auth_exchange.unwrap_or_default(),
             upstream_manager: None,
             config_cache: None,
+            file_store: None,
         }
     }
 
@@ -45,6 +83,11 @@ impl ProtocolTranslator {
     ) -> Self {
         self.upstream_manager = Some(upstream_manager);
         self.config_cache = Some(cache);
+        self
+    }
+
+    pub fn with_file_store(mut self, file_store: FileBlobStore) -> Self {
+        self.file_store = Some(file_store);
         self
     }
 
@@ -249,7 +292,30 @@ impl ProtocolTranslator {
                     },
                 );
 
-                let out = executor.execute_wasm_abi_v1(&wasm_bytes, arguments, Some(cb));
+                let mut attached_files = Vec::new();
+                if let Some(ref fs) = self.file_store {
+                    let file_ids = Self::collect_file_ids(arguments);
+                    for fid in file_ids {
+                        if let Some(meta) = fs.get_metadata(&fid) {
+                            let fs_clone = fs.clone();
+                            attached_files.push(crate::data_plane::codemode::WasmAttachedFile {
+                                file_id: meta.file_id.clone(),
+                                size_bytes: meta.size_bytes,
+                                reader: Arc::new(move |id: &str, offset: u64, len: usize| {
+                                    fs_clone.read_range(id, offset, len)
+                                }),
+                            });
+                        }
+                    }
+                }
+                let cancel_flag = current_cancel_flag();
+                let out = executor.execute_wasm_abi_v2(
+                    &wasm_bytes,
+                    arguments,
+                    Some(cb),
+                    attached_files,
+                    cancel_flag,
+                );
                 if let Some(err) = out.error {
                     return Err(err);
                 }
@@ -316,6 +382,24 @@ impl ProtocolTranslator {
             && protocol == ProtocolType::Http
             && is_live_http_url
         {
+            if let Some(ref fs) = self.file_store {
+                if let Some((field_name, file_id)) = Self::find_primary_file_arg(tool, arguments) {
+                    if fs.get_metadata(&file_id).is_some() {
+                        let timeout_sec = tool.timeout_ms.map(|ms| ms.div_ceil(1000));
+                        let streamed = self.http_client.post_stream_file(
+                            &tool.downstream_endpoint,
+                            fs,
+                            &file_id,
+                            Some(&field_name),
+                            Some(&headers),
+                            timeout_sec,
+                        )?;
+                        let resp_str = String::from_utf8(streamed)
+                            .map_err(|e| format!("Invalid UTF-8 from downstream: {}", e))?;
+                        return JsonValue::parse(&resp_str);
+                    }
+                }
+            }
             let http_verb = tool
                 .http_method
                 .as_deref()
@@ -331,6 +415,22 @@ impl ProtocolTranslator {
             && protocol == ProtocolType::Grpc
             && is_live_grpc_url
         {
+            if let Some(ref fs) = self.file_store {
+                if let Some((_field_name, file_id)) = Self::find_primary_file_arg(tool, arguments) {
+                    if let Some(file_meta) = fs.get_metadata(&file_id) {
+                        let streamed = self.grpc_client.invoke_grpc_with_file_metadata(
+                            &tool.downstream_endpoint,
+                            method_name,
+                            arguments,
+                            &file_meta,
+                            Some(&headers),
+                        )?;
+                        let resp_str = String::from_utf8(streamed)
+                            .map_err(|e| format!("Invalid UTF-8 from downstream: {}", e))?;
+                        return JsonValue::parse(&resp_str);
+                    }
+                }
+            }
             self.grpc_client.invoke(
                 &tool.downstream_endpoint,
                 method_name,
@@ -383,5 +483,73 @@ impl ProtocolTranslator {
         frame.extend_from_slice(method_bytes);
         frame.extend_from_slice(&body);
         frame
+    }
+
+    #[cfg(feature = "sandbox-wasm")]
+    fn collect_file_ids(val: &JsonValue) -> Vec<String> {
+        fn walk(v: &JsonValue, out: &mut Vec<String>) {
+            match v {
+                JsonValue::Object(map) => {
+                    for key in ["fileId", "file_id"] {
+                        if let Some(fid) = v.get(key).and_then(|x| x.as_str()) {
+                            if !fid.is_empty() && !out.iter().any(|existing| existing == fid) {
+                                out.push(fid.to_string());
+                            }
+                        }
+                    }
+                    for (_, child) in map {
+                        walk(child, out);
+                    }
+                }
+                JsonValue::Array(arr) => {
+                    for child in arr {
+                        walk(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(val, &mut out);
+        out
+    }
+
+    #[allow(dead_code)]
+    fn find_primary_file_arg(tool: &ToolRecord, arguments: &JsonValue) -> Option<(String, String)> {
+        let schema_props =
+            crate::extension::file_uploads::find_mcp_file_properties(&tool.input_schema);
+        for prop in schema_props {
+            if let Some(val) = arguments.get(&prop) {
+                if let Some(fid) = val
+                    .get("fileId")
+                    .or_else(|| val.get("file_id"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some((prop, fid.to_string()));
+                }
+            }
+        }
+        if let Some(obj) = arguments.as_object() {
+            for (k, v) in obj {
+                if let Some(fid) = v
+                    .get("fileId")
+                    .or_else(|| v.get("file_id"))
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some((k.clone(), fid.to_string()));
+                }
+            }
+            if let Some(fid) = arguments
+                .get("fileId")
+                .or_else(|| arguments.get("file_id"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(("file".to_string(), fid.to_string()));
+            }
+        }
+        None
     }
 }

@@ -393,6 +393,7 @@ impl DeterministicSimulator {
                     invoke_parallel_batch: &mut invoke_parallel_cb,
                     search_catalog: &search_cb,
                     describe_types: &describe_cb,
+                    cancel_flag: None,
                 };
 
                 executor.execute(code, &mut host, &format!("dst-seed-{}", seed))

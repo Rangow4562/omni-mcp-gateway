@@ -47,6 +47,7 @@ pub struct MCPProxyGateway {
     pub audit_store: Option<Arc<MerkleAuditStore>>,
     pub traces: Option<Arc<RwLock<VecDeque<TraceSpan>>>>,
     pub otlp_worker: Option<Arc<crate::telemetry::OtlpBatchWorker>>,
+    pub task_manager: Option<crate::data_plane::TaskManager>,
 }
 
 impl MCPProxyGateway {
@@ -64,6 +65,7 @@ impl MCPProxyGateway {
             audit_store: None,
             traces: None,
             otlp_worker: None,
+            task_manager: None,
         }
     }
 
@@ -85,11 +87,22 @@ impl MCPProxyGateway {
             audit_store: None,
             traces: None,
             otlp_worker: None,
+            task_manager: None,
         }
     }
 
     pub fn with_otlp_worker(mut self, worker: Arc<crate::telemetry::OtlpBatchWorker>) -> Self {
         self.otlp_worker = Some(worker);
+        self
+    }
+
+    pub fn with_file_store(mut self, file_store: crate::storage::FileBlobStore) -> Self {
+        self.translator.file_store = Some(file_store);
+        self
+    }
+
+    pub fn with_task_manager(mut self, task_manager: crate::data_plane::TaskManager) -> Self {
+        self.task_manager = Some(task_manager);
         self
     }
 
@@ -203,6 +216,7 @@ impl MCPProxyGateway {
         };
 
         match request.method.as_str() {
+            "server/discover" => self.handle_server_discover(&server, request),
             "initialize" => self.handle_initialize(&server, request),
             "notifications/initialized" | "ping" => {
                 RPCResponse::ok(request.id.clone(), JsonValue::object())
@@ -213,6 +227,10 @@ impl MCPProxyGateway {
             }
             "resources/list" => RPCResponse::ok(request.id.clone(), json!({"resources": []})),
             "prompts/list" => RPCResponse::ok(request.id.clone(), json!({"prompts": []})),
+            "skills/list" => self.handle_service_skills_list(&server, request),
+            "skills/get" => self.handle_service_skills_get(&server, request),
+            "resources/read" => self.handle_service_resources_read(&server, request),
+            "resources/directory/read" => self.handle_service_directory_read(&server, request),
             other => RPCResponse::err(
                 request.id.clone(),
                 RPCError::new(
@@ -223,26 +241,195 @@ impl MCPProxyGateway {
         }
     }
 
+    fn handle_server_discover(&self, server: &ServerRecord, request: &RPCRequest) -> RPCResponse {
+        let cfg = crate::config::get_config();
+        let result = crate::models::build_server_discover_result(
+            &cfg,
+            crate::models::CapabilityScope::VirtualService(server.name.clone()),
+            &format!("omni-mcp/{}", server.name),
+            &server.version.to_string(),
+            &server.description,
+        );
+        RPCResponse::ok(request.id.clone(), result)
+    }
+
+    fn handle_service_skills_list(
+        &self,
+        server: &ServerRecord,
+        request: &RPCRequest,
+    ) -> RPCResponse {
+        let cfg = crate::config::get_config();
+        if !cfg.enable_skills_extension {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(METHOD_NOT_FOUND, "Skills extension is disabled"),
+            );
+        }
+        let engine = crate::control_plane::SkillEngine::new(self.cache.registry.clone());
+        let scope = crate::control_plane::SkillAccessScope {
+            group_slug: None,
+            server_scope: Some(server.name.clone()),
+        };
+        let skills: Vec<JsonValue> = engine
+            .list_skills(&scope)
+            .iter()
+            .map(crate::control_plane::SkillEngine::to_mcp_summary)
+            .collect();
+        RPCResponse::ok(
+            request.id.clone(),
+            json!({"skills": JsonValue::Array(skills), "resultType": "complete"}),
+        )
+    }
+
+    fn handle_service_skills_get(
+        &self,
+        server: &ServerRecord,
+        request: &RPCRequest,
+    ) -> RPCResponse {
+        let cfg = crate::config::get_config();
+        if !cfg.enable_skills_extension {
+            return RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(METHOD_NOT_FOUND, "Skills extension is disabled"),
+            );
+        }
+        let slug = request
+            .params
+            .get("slug")
+            .or_else(|| request.params.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let engine = crate::control_plane::SkillEngine::new(self.cache.registry.clone());
+        let scope = crate::control_plane::SkillAccessScope {
+            group_slug: None,
+            server_scope: Some(server.name.clone()),
+        };
+        match engine.get_skill(slug, &scope) {
+            Some(skill) => RPCResponse::ok(
+                request.id.clone(),
+                crate::control_plane::SkillEngine::to_mcp_detail(&skill),
+            ),
+            None => RPCResponse::err(
+                request.id.clone(),
+                RPCError::new(
+                    INVALID_PARAMS,
+                    format!("Skill '{}' not found in service '{}'", slug, server.name),
+                ),
+            ),
+        }
+    }
+
+    fn handle_service_resources_read(
+        &self,
+        server: &ServerRecord,
+        request: &RPCRequest,
+    ) -> RPCResponse {
+        let uri = request
+            .params
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if uri.starts_with("skill://") {
+            let engine = crate::control_plane::SkillEngine::new(self.cache.registry.clone());
+            let scope = crate::control_plane::SkillAccessScope {
+                group_slug: None,
+                server_scope: Some(server.name.clone()),
+            };
+            return match engine.read_skill_resource(uri, &scope) {
+                Ok((resolved_uri, mime, text)) => RPCResponse::ok(
+                    request.id.clone(),
+                    json!({
+                        "contents": [{
+                            "uri": resolved_uri,
+                            "mimeType": mime,
+                            "text": text
+                        }],
+                        "resultType": "complete"
+                    }),
+                ),
+                Err(e) => RPCResponse::err(request.id.clone(), RPCError::new(INVALID_PARAMS, e)),
+            };
+        }
+        RPCResponse::err(
+            request.id.clone(),
+            RPCError::new(INVALID_PARAMS, format!("Resource '{}' not found", uri)),
+        )
+    }
+
+    fn handle_service_directory_read(
+        &self,
+        server: &ServerRecord,
+        request: &RPCRequest,
+    ) -> RPCResponse {
+        let uri = request
+            .params
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let engine = crate::control_plane::SkillEngine::new(self.cache.registry.clone());
+        let scope = crate::control_plane::SkillAccessScope {
+            group_slug: None,
+            server_scope: Some(server.name.clone()),
+        };
+        match engine.read_skill_directory(uri, &scope) {
+            Ok(entries) => RPCResponse::ok(
+                request.id.clone(),
+                json!({
+                    "entries": JsonValue::Array(entries),
+                    "resultType": "complete"
+                }),
+            ),
+            Err(e) => RPCResponse::err(request.id.clone(), RPCError::new(INVALID_PARAMS, e)),
+        }
+    }
+
     fn handle_initialize(&self, server: &ServerRecord, request: &RPCRequest) -> RPCResponse {
+        let cfg = crate::config::get_config();
+        if let Some(required) = request
+            .params
+            .get("clientCapabilities")
+            .and_then(|c| c.get("required"))
+            .and_then(|r| r.as_array())
+        {
+            let unsupported: Vec<&str> = required
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|cap| !crate::models::is_required_capability_supported(cap, &cfg))
+                .collect();
+            if !unsupported.is_empty() {
+                return RPCResponse::err(
+                    request.id.clone(),
+                    RPCError::new(
+                        crate::models::MISSING_REQUIRED_CLIENT_CAPABILITY,
+                        format!(
+                            "Missing required client capabilities: {}",
+                            unsupported.join(", ")
+                        ),
+                    ),
+                );
+            }
+        }
         let client_ver = request
             .params
             .get("protocolVersion")
             .and_then(|v| v.as_str());
         let negotiated = negotiate_protocol_version(client_ver);
+        let capabilities = crate::models::build_server_capabilities(
+            &cfg,
+            crate::models::CapabilityScope::VirtualService(server.name.clone()),
+        );
         RPCResponse::ok(
             request.id.clone(),
             json!({
                 "protocolVersion": negotiated,
-                "capabilities": {
-                    "tools": {"listChanged": true},
-                    "logging": {}
-                },
+                "capabilities": capabilities,
                 "serverInfo": {
                     "name": format!("omni-mcp/{}", server.name),
                     "version": server.version.to_string(),
                     "description": server.description.clone(),
                     "runtime": "rust"
-                }
+                },
+                "resultType": "complete"
             }),
         )
     }
@@ -337,6 +524,149 @@ impl MCPProxyGateway {
                         tool.status.as_str()
                     ),
                 ),
+            );
+        }
+
+        let cfg = crate::config::get_config();
+        let client_caps = crate::models::ClientCapabilitiesMeta::from_params(&request.params);
+
+        // 1.2. Experimental File Uploads (io.modelcontextprotocol/files, SEP-2356)
+        if cfg.enable_file_uploads_extension {
+            if let Some(ref fs) = self.translator.file_store {
+                let file_props =
+                    crate::extension::file_uploads::find_mcp_file_properties(&tool.input_schema);
+                if !file_props.is_empty() {
+                    let required_fields: Vec<&str> = tool
+                        .input_schema
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    for field in file_props {
+                        match arguments.get(&field).cloned() {
+                            Some(val) if !val.is_null() => {
+                                match crate::extension::file_uploads::resolve_file_argument(
+                                    fs,
+                                    &val,
+                                    caller_actor,
+                                ) {
+                                    Ok(resolved) => {
+                                        arguments.insert(field, resolved);
+                                    }
+                                    Err(e) => {
+                                        return RPCResponse::err(
+                                            request.id.clone(),
+                                            RPCError::new(INVALID_PARAMS, e),
+                                        );
+                                    }
+                                }
+                            }
+                            _ if required_fields.contains(&field.as_str()) => {
+                                return RPCResponse::ok(
+                                    request.id.clone(),
+                                    crate::extension::file_uploads::build_upload_required_mrtr(
+                                        &cfg.public_base_url,
+                                        &field,
+                                        cfg.file_upload_max_bytes,
+                                    ),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1.3. URL-mode OAuth Elicitation pre-flight when client declared `elicitation.url`
+        if client_caps.elicitation_url {
+            if let Some(crate::models::UpstreamTransportConfig::StreamableHttp {
+                url: upstream_url,
+                bearer_ref: None,
+                ..
+            }) = &server.upstream_config
+            {
+                let tok_store =
+                    crate::upstream::UpstreamOAuthTokenStore::new(&cfg.secrets_dir, None)
+                        .with_registry(self.cache.registry.clone());
+                if tok_store.load_token(&server.name).is_err() {
+                    return self.build_url_elicitation_response(
+                        request.id.clone(),
+                        &server.name,
+                        upstream_url,
+                        caller_actor,
+                        &cfg,
+                    );
+                }
+            }
+        }
+
+        // 1.4. Form-mode Elicitation MRTR for mutating tools when explicitly requested
+        let require_mutation_approval = request
+            .params
+            .get("require_mutation_approval")
+            .or_else(|| {
+                request
+                    .params
+                    .get("_meta")
+                    .and_then(|m| m.get("require_mutation_approval"))
+            })
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if require_mutation_approval && tool.is_mutation && client_caps.elicitation_form {
+            let elicit_id = format!("elicit_{}", crate::models::generate_ulid());
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "approved": {
+                        "type": "boolean",
+                        "description": "Confirm whether to approve this mutating operation"
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Audit justification recorded in Merkle audit log"
+                    }
+                },
+                "required": ["approved"]
+            });
+            let reqs = json!([
+                {
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "form",
+                        "message": format!(
+                            "Approve mutating tool call '{}.{}'?",
+                            server.name, tool.name
+                        ),
+                        "requestedSchema": schema
+                    }
+                }
+            ]);
+            if let Some(ref tm) = self.task_manager {
+                let mut task = crate::models::McpTaskRecord::new(
+                    elicit_id.clone(),
+                    cfg.pod_id.clone(),
+                    caller_actor,
+                    None,
+                    Some(server.name.clone()),
+                    cfg.task_ttl_sec,
+                );
+                task.status = crate::models::McpTaskStatus::InputRequired;
+                task.status_message = Some(format!(
+                    "Approval required for mutating tool '{}.{}'",
+                    server.name, tool.name
+                ));
+                task.input_requests = Some(reqs.clone());
+                tm.record_task(&task);
+            }
+            return RPCResponse::ok(
+                request.id.clone(),
+                json!({
+                    "resultType": "input_required",
+                    "requestState": elicit_id,
+                    "inputRequests": reqs,
+                    "isError": false
+                }),
             );
         }
 
@@ -460,6 +790,87 @@ impl MCPProxyGateway {
             downstream_headers.insert("x-omni-version".to_string(), effective_version.to_string());
         }
 
+        // 5.5. Task Grace-Window Promotion (`io.modelcontextprotocol/tasks`)
+        let is_long_running = tool
+            .metadata
+            .get("long_running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || tool
+                .metadata
+                .get("taskSupport")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "optional" || s == "required")
+                .unwrap_or(false)
+            || tool
+                .tags
+                .iter()
+                .any(|t| t == "long_running" || t == "long-running");
+        let force_async_task = request.params.get("task").is_some();
+        if cfg.enable_tasks_extension
+            && (force_async_task || (client_caps.tasks && is_long_running))
+        {
+            if let Some(ref tm) = self.task_manager {
+                let mut clean_req = request.clone();
+                clean_req.params.remove("task");
+                clean_req.params.insert("arguments", arguments.clone());
+                let mut gw_clone = self.clone();
+                gw_clone.task_manager = None; // prevent re-entering task wrapper inside worker
+                let srv_name_owned = server.name.clone();
+                let actor_owned = caller_actor.to_string();
+                let tok_owned = user_token.map(String::from);
+                let tp_owned = traceparent.map(String::from);
+                let grace_ms = if force_async_task {
+                    Some(0)
+                } else {
+                    Some(cfg.task_sync_grace_ms)
+                };
+                match tm.run_with_grace(
+                    caller_actor,
+                    None,
+                    Some(server.name.clone()),
+                    force_async_task,
+                    grace_ms,
+                    move |_cancel_flag| {
+                        let resp = gw_clone.handle_request_with_trace(
+                            &srv_name_owned,
+                            &clean_req,
+                            &actor_owned,
+                            tok_owned.as_deref(),
+                            tp_owned.as_deref(),
+                        );
+                        if let Some(err) = resp.error {
+                            Err((err.code, err.message))
+                        } else {
+                            Ok(resp.result.unwrap_or_else(JsonValue::object))
+                        }
+                    },
+                ) {
+                    Ok(crate::data_plane::TaskDispatchOutcome::PromotedAsync(task)) => {
+                        return RPCResponse::ok(
+                            request.id.clone(),
+                            json!({
+                                "resultType": "task",
+                                "taskId": task.task_id,
+                                "status": task.status.as_str(),
+                                "pollInterval": task.poll_interval_ms as i64,
+                                "statusMessage": task.status_message.unwrap_or_else(|| "Task running".to_string())
+                            }),
+                        );
+                    }
+                    Ok(crate::data_plane::TaskDispatchOutcome::CompletedSync(val)) => {
+                        return RPCResponse::ok(request.id.clone(), val);
+                    }
+                    Err(e) => {
+                        return RPCResponse::err(
+                            request.id.clone(),
+                            RPCError::new(INTERNAL_ERROR, e),
+                        );
+                    }
+                }
+            }
+        }
+
         // 6. Protocol Translation & Downstream Execution via Muttley (with semantic cache & resilient fallback)
         let cache_key = SemanticResponseCache::make_key(&server.name, &tool.name, &arguments);
         let mut fallback_invoked = false;
@@ -513,6 +924,24 @@ impl MCPProxyGateway {
                         fallback_invoked = true;
                         (fallback_response, false)
                     } else {
+                        if client_caps.elicitation_url
+                            && (primary_err.contains("401")
+                                || primary_err.to_lowercase().contains("unauthorized"))
+                        {
+                            if let Some(crate::models::UpstreamTransportConfig::StreamableHttp {
+                                url: upstream_url,
+                                ..
+                            }) = &server.upstream_config
+                            {
+                                return self.build_url_elicitation_response(
+                                    request.id.clone(),
+                                    &server.name,
+                                    upstream_url,
+                                    caller_actor,
+                                    &cfg,
+                                );
+                            }
+                        }
                         self.circuit_breaker.record_failure(&server.name);
                         let elapsed_us = t0.elapsed().as_micros() as u64;
                         self.record_telemetry_and_audit(
@@ -639,6 +1068,79 @@ impl MCPProxyGateway {
                 "isError": false,
                 "resultType": "complete",
                 "_metadata": meta
+            }),
+        )
+    }
+
+    fn build_url_elicitation_response(
+        &self,
+        req_id: JsonValue,
+        server_name: &str,
+        upstream_url: &str,
+        caller_actor: &str,
+        cfg: &crate::config::OmniConfig,
+    ) -> RPCResponse {
+        let (verifier, _challenge) = crate::upstream::UpstreamOAuthTokenStore::generate_pkce_pair();
+        let state = format!("st_{}", crate::models::generate_ulid());
+        let elicitation_id = format!("elicit_{}", crate::models::generate_ulid());
+        let base = cfg.public_base_url.trim_end_matches('/');
+        let redirect_uri = format!("{}/api/v1/oauth/callback", base);
+        let now_ts = crate::logging::now_epoch_secs();
+        self.cache
+            .registry
+            .save_oauth_flow(&crate::models::OAuthFlowRecord {
+                state: state.clone(),
+                server_name: server_name.to_string(),
+                elicitation_id: Some(elicitation_id.clone()),
+                code_verifier: verifier,
+                token_url: format!("{}/oauth/token", upstream_url.trim_end_matches('/')),
+                client_id: "omni-mcp-gateway".to_string(),
+                redirect_uri,
+                created_at: now_ts,
+                expires_at: now_ts + 600.0,
+            });
+        let elicit_url = format!(
+            "{}/api/v1/oauth/start?server={}&state={}&elicitation_id={}",
+            base, server_name, state, elicitation_id
+        );
+        let input_requests = json!([
+            {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "url",
+                    "elicitationId": elicitation_id.clone(),
+                    "url": elicit_url,
+                    "message": format!(
+                        "OAuth authorization required for '{}'. Complete sign-in in your browser and retry.",
+                        server_name
+                    )
+                }
+            }
+        ]);
+        if let Some(ref tm) = self.task_manager {
+            let mut task = crate::models::McpTaskRecord::new(
+                elicitation_id.clone(),
+                cfg.pod_id.clone(),
+                caller_actor,
+                None,
+                Some(server_name.to_string()),
+                cfg.task_ttl_sec,
+            );
+            task.status = crate::models::McpTaskStatus::InputRequired;
+            task.status_message = Some(format!(
+                "OAuth authorization required for '{}'",
+                server_name
+            ));
+            task.input_requests = Some(input_requests.clone());
+            tm.record_task(&task);
+        }
+        RPCResponse::ok(
+            req_id,
+            json!({
+                "resultType": "input_required",
+                "requestState": elicitation_id,
+                "inputRequests": input_requests,
+                "isError": false
             }),
         )
     }
@@ -909,7 +1411,7 @@ impl MCPProxyGateway {
     /// Unwinds completed mutations in reverse (`LIFO`) order when a multi-step script fails mid-flight,
     /// invoking each tool's declarative `MutationCompensationSpec` and logging `"COMPENSATED:saga_rollback"`
     /// in the cryptographic Merkle Audit Store.
-    fn unwind_saga_compensations(
+    pub fn unwind_saga_compensations(
         &self,
         completed_mutations: &mut Vec<CompletedMutationRecord>,
         caller_actor: &str,
@@ -1047,6 +1549,29 @@ impl MCPProxyGateway {
         user_token: Option<&str>,
         traceparent: Option<&str>,
     ) -> CodeOutput {
+        self.execute_codemode_with_cancel(
+            code,
+            limits,
+            require_mutation_approval,
+            caller_actor,
+            user_token,
+            traceparent,
+            None,
+        )
+    }
+
+    /// Executes an Omni Code Mode script with an optional cooperative cancellation flag (`v6.8.0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_codemode_with_cancel(
+        &self,
+        code: &str,
+        limits: Option<SandboxLimits>,
+        require_mutation_approval: bool,
+        caller_actor: &str,
+        user_token: Option<&str>,
+        traceparent: Option<&str>,
+        cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> CodeOutput {
         let start_micros = now_epoch_micros();
         let (trace_id, parent_span_id) = if let Some(tp) = traceparent {
             parse_traceparent(tp)
@@ -1183,6 +1708,7 @@ impl MCPProxyGateway {
                 invoke_parallel_batch: &mut invoke_parallel_cb,
                 search_catalog: &search_cb,
                 describe_types: &describe_cb,
+                cancel_flag,
             };
 
             let executor = CodeModeExecutor::new(limits.unwrap_or_default());
@@ -1586,6 +2112,7 @@ impl MCPProxyGateway {
                 invoke_parallel_batch: &mut invoke_parallel_cb,
                 search_catalog: &search_cb,
                 describe_types: &describe_cb,
+                cancel_flag: None,
             };
 
             let executor = CodeModeExecutor::new(limits.unwrap_or_default());

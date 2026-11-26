@@ -15,6 +15,8 @@ interface HeaderProps {
   onOpenApprovalInbox?: () => void;
   onOpenObservability?: () => void;
   onOpenImportConfig?: () => void;
+  onOpenSkillsStudio?: () => void;
+  onOpenTasksMonitor?: () => void;
   sseConnected?: boolean;
   pendingDiffCount: number;
   pendingApprovalCount?: number;
@@ -34,6 +36,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenApprovalInbox,
   onOpenObservability,
   onOpenImportConfig,
+  onOpenSkillsStudio,
+  onOpenTasksMonitor,
   sseConnected = false,
   pendingDiffCount,
   pendingApprovalCount = 0,
@@ -109,7 +113,7 @@ export const Header: React.FC<HeaderProps> = ({
               borderRadius: '12px',
               fontWeight: 600,
             }}>
-              v6.5.0 FLEET READY
+              v6.8.0 FLEET READY
             </span>
             <span
               data-testid="sse-status"
@@ -302,6 +306,44 @@ export const Header: React.FC<HeaderProps> = ({
             }}
           >
             ⚡ Code Mode
+          </button>
+        )}
+
+        {onOpenSkillsStudio && (
+          <button
+            data-testid="open-skills-studio-btn"
+            onClick={onOpenSkillsStudio}
+            style={{
+              backgroundColor: '#1e2235',
+              color: '#a5f3fc',
+              border: '1px solid #303652',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+            }}
+          >
+            📚 Skills
+          </button>
+        )}
+
+        {onOpenTasksMonitor && (
+          <button
+            data-testid="open-tasks-monitor-btn"
+            onClick={onOpenTasksMonitor}
+            style={{
+              backgroundColor: '#1e2235',
+              color: '#fde68a',
+              border: '1px solid #303652',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+            }}
+          >
+            ⏱️ Tasks
           </button>
         )}
 

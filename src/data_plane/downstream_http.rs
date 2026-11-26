@@ -551,6 +551,156 @@ impl HttpDownstreamClient {
 
         Ok((body, keep_alive))
     }
+
+    /// Streams a file from `FileBlobStore` to a downstream HTTP/HTTPS endpoint in 64 KiB chunks
+    /// as either `application/octet-stream` or `multipart/form-data`, bypassing the 10 MiB JSON cap (`v6.8.0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_stream_file(
+        &self,
+        url: &str,
+        file_store: &crate::storage::FileBlobStore,
+        file_id: &str,
+        multipart_field: Option<&str>,
+        extra_headers: Option<&HashMap<String, String>>,
+        timeout_sec: Option<u64>,
+    ) -> Result<Vec<u8>, String> {
+        let meta = file_store
+            .get_metadata(file_id)
+            .ok_or_else(|| format!("File '{}' not found or expired", file_id))?;
+        let (host, port, path) = Self::parse_url(url)?;
+        let addr_key = format!("{}:{}", host, port);
+        let addrs: Vec<_> = addr_key
+            .to_socket_addrs()
+            .map_err(|e| format!("DNS resolution failed for {}: {}", addr_key, e))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("No socket addresses resolved for {}", addr_key));
+        }
+
+        let boundary = format!("----OmniMcpBoundary{}", meta.file_id);
+        let (content_type, prefix_bytes, suffix_bytes) = if let Some(field) = multipart_field {
+            let safe_filename = meta.filename.replace(['"', '\r', '\n'], "_");
+            let prefix = format!(
+                "--{}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
+                boundary, field, safe_filename, meta.mime_type
+            )
+            .into_bytes();
+            let suffix = format!("\r\n--{}--\r\n", boundary).into_bytes();
+            (
+                format!("multipart/form-data; boundary={}", boundary),
+                prefix,
+                suffix,
+            )
+        } else {
+            (meta.mime_type.clone(), Vec::new(), Vec::new())
+        };
+
+        let total_len = (prefix_bytes.len() as u64)
+            .saturating_add(meta.size_bytes)
+            .saturating_add(suffix_bytes.len() as u64);
+
+        let mut req_head = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nX-Omni-File-Id: {}\r\nX-Omni-File-Sha256: {}\r\nConnection: close\r\n",
+            path, host, content_type, total_len, meta.file_id, meta.sha256
+        );
+        if let Some(hdrs) = extra_headers {
+            for (k, v) in hdrs {
+                if !k.eq_ignore_ascii_case("content-length")
+                    && !k.eq_ignore_ascii_case("content-type")
+                    && !k.eq_ignore_ascii_case("host")
+                {
+                    req_head.push_str(&format!("{}: {}\r\n", k, v));
+                }
+            }
+        }
+        req_head.push_str("\r\n");
+
+        let io_timeout = Duration::from_secs(timeout_sec.unwrap_or(60).max(5));
+        let mut tcp = TcpStream::connect_timeout(&addrs[0], self.connect_timeout)
+            .map_err(|e| format!("Failed to connect to {}: {}", addr_key, e))?;
+        let _ = tcp.set_read_timeout(Some(io_timeout));
+        let _ = tcp.set_write_timeout(Some(io_timeout));
+
+        let is_https = url.trim().starts_with("https://");
+        let stream_chunks = |writer: &mut dyn Write| -> Result<(), String> {
+            writer
+                .write_all(req_head.as_bytes())
+                .map_err(|e| format!("Failed to write upload headers: {}", e))?;
+            if !prefix_bytes.is_empty() {
+                writer
+                    .write_all(&prefix_bytes)
+                    .map_err(|e| format!("Failed to write multipart prefix: {}", e))?;
+            }
+            const CHUNK: usize = 64 * 1024;
+            let mut offset = 0u64;
+            while offset < meta.size_bytes {
+                let to_read = ((meta.size_bytes - offset) as usize).min(CHUNK);
+                let chunk = file_store.read_range(&meta.file_id, offset, to_read)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                writer
+                    .write_all(&chunk)
+                    .map_err(|e| format!("Failed to stream file chunk: {}", e))?;
+                offset = offset.saturating_add(chunk.len() as u64);
+            }
+            if !suffix_bytes.is_empty() {
+                writer
+                    .write_all(&suffix_bytes)
+                    .map_err(|e| format!("Failed to write multipart suffix: {}", e))?;
+            }
+            writer
+                .flush()
+                .map_err(|e| format!("Failed to flush upload stream: {}", e))
+        };
+
+        let mut raw_resp = Vec::new();
+        if is_https {
+            #[cfg(feature = "tls-rustls")]
+            {
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let tls_cfg = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+                let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                    .map_err(|_| format!("Invalid TLS host '{}'", host))?;
+                let conn = rustls::ClientConnection::new(Arc::new(tls_cfg), server_name)
+                    .map_err(|e| format!("TLS init failed: {}", e))?;
+                let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+                stream_chunks(&mut tls_stream)?;
+                let _ = tls_stream.read_to_end(&mut raw_resp);
+            }
+            #[cfg(not(feature = "tls-rustls"))]
+            {
+                return Err("HTTPS post_stream_file requires 'tls-rustls' feature".to_string());
+            }
+        } else {
+            stream_chunks(&mut tcp)?;
+            let _ = tcp.read_to_end(&mut raw_resp);
+        }
+
+        let hdr_end = raw_resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| "Malformed HTTP response from downstream file endpoint".to_string())?;
+        let head = String::from_utf8_lossy(&raw_resp[..hdr_end]);
+        let status_code: u16 = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
+        let body = raw_resp[hdr_end + 4..].to_vec();
+        if status_code >= 400 {
+            return Err(format!(
+                "Downstream file upload HTTP {} error: {}",
+                status_code,
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        Ok(body)
+    }
 }
 
 fn json_scalar_to_string(v: &JsonValue) -> String {

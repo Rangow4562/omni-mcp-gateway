@@ -14,6 +14,8 @@ pub struct HostCallbacks<'a> {
     pub search_catalog: &'a dyn Fn(&str) -> JsonValue,
     /// Executes `codemode.describe(server, Option<tool>)` -> `String`
     pub describe_types: &'a dyn Fn(&str, Option<&str>) -> String,
+    /// Optional cooperative cancellation flag checked on every VM operation (`v6.8.0`).
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,6 +128,7 @@ impl CodeModeExecutor {
             rows_scanned_vectorized: 0,
             auto_parallel_waves: 0,
             parallelized_tool_calls: 0,
+            cancel_flag: host.cancel_flag.clone(),
         };
 
         let eval_res =
@@ -406,6 +409,7 @@ impl CodeModeExecutor {
             rows_scanned_vectorized: 0,
             auto_parallel_waves: 0,
             parallelized_tool_calls: 0,
+            cancel_flag: host.cancel_flag.clone(),
         };
 
         let eval_res = if remaining_stmts.is_empty() {
@@ -506,11 +510,19 @@ pub(super) struct VmState<'a> {
     rows_scanned_vectorized: usize,
     auto_parallel_waves: usize,
     parallelized_tool_calls: usize,
+    cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<'a> VmState<'a> {
     #[inline]
     pub(super) fn burn_fuel(&mut self, cost: u64) -> Result<(), CodeModeError> {
+        if let Some(ref flag) = self.cancel_flag {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(CodeModeError::Cancelled(
+                    "Task execution cancelled cooperatively via tasks/cancel".to_string(),
+                ));
+            }
+        }
         self.ops_consumed += cost;
         if self.ops_consumed > self.limits.max_operations {
             return Err(CodeModeError::FuelExhausted(self.limits.max_operations));

@@ -194,6 +194,7 @@ pub struct HttpUpstreamSession {
     progress_notifications: Mutex<Vec<JsonValue>>,
     callback_hub: Option<Arc<UpstreamCallbackHub>>,
     sampling_policy: SamplingElicitationPolicy,
+    registry: Option<crate::control_plane::MCPRegistry>,
     next_request_id: AtomicU64,
 }
 
@@ -225,6 +226,7 @@ impl HttpUpstreamSession {
             progress_notifications: Mutex::new(Vec::new()),
             callback_hub: None,
             sampling_policy: SamplingElicitationPolicy::Deny,
+            registry: None,
             next_request_id: AtomicU64::new(1),
         }
     }
@@ -236,6 +238,11 @@ impl HttpUpstreamSession {
     ) -> Self {
         self.callback_hub = Some(hub);
         self.sampling_policy = policy;
+        self
+    }
+
+    pub fn with_registry(mut self, registry: Option<crate::control_plane::MCPRegistry>) -> Self {
+        self.registry = registry;
         self
     }
 
@@ -291,7 +298,10 @@ impl HttpUpstreamSession {
         let bearer_val = if let Some(ref b_ref) = self.bearer_ref {
             Some(resolve_secret_ref(b_ref, &self.secrets_dir)?)
         } else {
-            let store = UpstreamOAuthTokenStore::new(&self.secrets_dir, None);
+            let mut store = UpstreamOAuthTokenStore::new(&self.secrets_dir, None);
+            if let Some(ref reg) = self.registry {
+                store = store.with_registry(reg.clone());
+            }
             store
                 .load_fresh_access_token(&self.server_name, self.allow_loopback)
                 .ok()
@@ -723,7 +733,10 @@ impl HttpUpstreamSession {
 
         // Automatic OAuth 2.1 refresh_token rotation on HTTP 401 Unauthorized (retry once) (v6.5.0)
         if status == 401 && self.bearer_ref.is_none() {
-            let store = UpstreamOAuthTokenStore::new(&self.secrets_dir, None);
+            let mut store = UpstreamOAuthTokenStore::new(&self.secrets_dir, None);
+            if let Some(ref reg) = self.registry {
+                store = store.with_registry(reg.clone());
+            }
             if store
                 .refresh_access_token(&self.server_name, self.allow_loopback)
                 .is_ok()
@@ -1050,6 +1063,7 @@ impl OAuthTokenRecord {
 pub struct UpstreamOAuthTokenStore {
     store_dir: PathBuf,
     master_key: [u8; 32],
+    registry: Option<crate::control_plane::MCPRegistry>,
 }
 
 impl UpstreamOAuthTokenStore {
@@ -1063,7 +1077,13 @@ impl UpstreamOAuthTokenStore {
         Self {
             store_dir: store_dir.into(),
             master_key,
+            registry: None,
         }
+    }
+
+    pub fn with_registry(mut self, registry: crate::control_plane::MCPRegistry) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     pub fn generate_pkce_pair() -> (String, String) {
@@ -1211,7 +1231,15 @@ impl UpstreamOAuthTokenStore {
                 "nonce_hex": hex_encode_bytes(&nonce_bytes),
                 "ciphertext_hex": hex_encode_bytes(&in_out),
             });
-            std::fs::write(&path, payload.to_string_compact())
+            let compact = payload.to_string_compact();
+            if let Some(ref reg) = self.registry {
+                reg.save_oauth_token(&crate::models::OAuthTokenRecord {
+                    server_name: server_name.to_string(),
+                    sealed_envelope_hex: hex_encode_bytes(compact.as_bytes()),
+                    updated_at: crate::logging::now_epoch_secs(),
+                });
+            }
+            std::fs::write(&path, compact)
                 .map_err(|e| format!("Failed to write AEAD OAuth token: {}", e))
         }
 
@@ -1242,7 +1270,15 @@ impl UpstreamOAuthTokenStore {
                 "ciphertext_hex": hex_encode_bytes(&ciphertext),
                 "hmac_sha256": mac,
             });
-            std::fs::write(&path, payload.to_string_compact())
+            let compact = payload.to_string_compact();
+            if let Some(ref reg) = self.registry {
+                reg.save_oauth_token(&crate::models::OAuthTokenRecord {
+                    server_name: server_name.to_string(),
+                    sealed_envelope_hex: hex_encode_bytes(compact.as_bytes()),
+                    updated_at: crate::logging::now_epoch_secs(),
+                });
+            }
+            std::fs::write(&path, compact)
                 .map_err(|e| format!("Failed to write encrypted OAuth token: {}", e))
         }
     }
@@ -1251,12 +1287,24 @@ impl UpstreamOAuthTokenStore {
         self.load_token_record(server_name).map(|r| r.access_token)
     }
 
-    /// Loads and decrypts an `OAuthTokenRecord`, supporting both `v2` (`ChaCha20-Poly1305` AEAD)
-    /// and legacy `v6.0.0` (SHA-256 CTR + HMAC) envelopes transparently.
+    /// Loads and decrypts an `OAuthTokenRecord`, checking shared multi-replica `omni_oauth_tokens`
+    /// first and falling back to local `.oauth.enc` files (`v6.0.0` / `v6.5.0` / `v6.8.0`).
     pub fn load_token_record(&self, server_name: &str) -> Result<OAuthTokenRecord, String> {
-        let path = self.token_file_path(server_name);
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read encrypted OAuth token: {}", e))?;
+        let raw = if let Some(ref reg) = self.registry {
+            if let Some(rec) = reg.get_oauth_token(server_name) {
+                let bytes = hex_decode_bytes(&rec.sealed_envelope_hex)?;
+                String::from_utf8(bytes)
+                    .map_err(|_| "Corrupt UTF-8 in distributed OAuth token envelope".to_string())?
+            } else {
+                let path = self.token_file_path(server_name);
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("Failed to read encrypted OAuth token: {}", e))?
+            }
+        } else {
+            let path = self.token_file_path(server_name);
+            std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read encrypted OAuth token: {}", e))?
+        };
         let parsed = JsonValue::parse(&raw)?;
         let alg = parsed.get("alg").and_then(|v| v.as_str()).unwrap_or("");
 

@@ -158,6 +158,10 @@ pub struct ProductionGatewayContext {
     pub event_bus: Arc<EventBus>,
     pub otlp_worker: Option<Arc<crate::telemetry::OtlpBatchWorker>>,
     pub oauth_pending_flows: Arc<RwLock<HashMap<String, OAuthPendingFlow>>>,
+    // v6.8.0 Extensions Runtime
+    pub skills: crate::control_plane::SkillEngine,
+    pub task_manager: crate::data_plane::TaskManager,
+    pub file_store: crate::storage::FileBlobStore,
 }
 
 impl ProductionGatewayContext {
@@ -258,22 +262,57 @@ impl ProductionGatewayContext {
         let auth_exchange = ThirdPartyAuthExchange::new();
         let crawler = AutoCrawler::new(registry.clone(), Some(native_monitor.clone()), None);
         let cache = InMemoryConfigCache::new(registry.clone(), config.cache_refresh_interval_sec);
+        let event_bus = Arc::new(EventBus::new());
 
-        // Wire PostgreSQL LISTEN/NOTIFY cluster cache invalidation (<50ms convergence)
+        // v6.8.0: Initialize Fleet-aware Skills Engine, HA TaskManager, and Multi-Cloud FileBlobStore
+        let skills = crate::control_plane::SkillEngine::new(registry.clone());
+        let task_manager = crate::data_plane::TaskManager::new(
+            registry.clone(),
+            config.pod_id.clone(),
+            config.max_concurrent_tasks,
+            config.task_sync_grace_ms,
+            config.task_ttl_sec,
+        );
+        {
+            let eb_task = event_bus.clone();
+            task_manager.set_event_sink(Arc::new(
+                move |kind: &str, task: &crate::models::McpTaskRecord| {
+                    eb_task.publish(kind, task.to_json());
+                },
+            ));
+        }
+        task_manager.start_ttl_reaper();
+        let file_store = crate::storage::FileBlobStore::from_config(&config, registry.clone());
+        {
+            let fs_reaper = file_store.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                let _ = fs_reaper.purge_expired();
+            });
+        }
+
+        // Wire channel-dispatched PostgreSQL LISTEN/NOTIFY:
+        // - `omni_registry_changed` -> reload registry & cache (<50ms convergence)
+        // - `omni_task_changed` -> wake TaskManager cancellation flags + SSE (NO catalog reload storm!)
         #[cfg(feature = "storage-postgres")]
         if let Some(pg_arc) = pg_backend_for_listener {
             let reg_cb = registry.clone();
             let cache_cb = cache.clone();
-            let _ = pg_arc.start_invalidation_listener(move |_payload| {
-                reg_cb.reload_from_backend();
-                cache_cb.refresh_now();
+            let task_cb = task_manager.clone();
+            let _ = pg_arc.start_channel_invalidation_listener(move |channel, payload| {
+                if channel == crate::storage::PostgresRegistryBackend::NOTIFY_TASK_CHANNEL {
+                    task_cb.handle_remote_task_notification(payload);
+                } else {
+                    reg_cb.reload_from_backend();
+                    cache_cb.refresh_now();
+                }
             });
         }
 
         let upstream_manager = Arc::new(crate::upstream::UpstreamManager::new(Arc::new(
             config.clone(),
         )));
-        let event_bus = Arc::new(EventBus::new());
+        upstream_manager.set_registry(registry.clone());
 
         // Wire Bidirectional Upstream Callback Hub -> EventBus + live policy resolver (v6.5.0)
         {
@@ -309,7 +348,8 @@ impl ProductionGatewayContext {
         }
 
         let translator = ProtocolTranslator::new(None, Some(auth_exchange.clone()))
-            .with_upstream(upstream_manager.clone(), cache.clone());
+            .with_upstream(upstream_manager.clone(), cache.clone())
+            .with_file_store(file_store.clone());
         if config.demo_seed {
             translator.mesh_client.set_allow_synthetic_mocks(true);
         }
@@ -343,11 +383,19 @@ impl ProductionGatewayContext {
         let mut gateway =
             MCPProxyGateway::with_resilience(cache.clone(), translator, cb, sem_cache)
                 .with_observability(audit_store.clone(), traces.clone())
-                .with_upstream(upstream_manager.clone());
+                .with_upstream(upstream_manager.clone())
+                .with_file_store(file_store.clone())
+                .with_task_manager(task_manager.clone());
         if let Some(ref worker) = otlp_worker {
             gateway = gateway.with_otlp_worker(worker.clone());
         }
-        let omni_mcp = OmniMCPServer::new(cache.clone(), gateway.clone());
+        let omni_mcp = OmniMCPServer::with_runtime(
+            cache.clone(),
+            gateway.clone(),
+            skills.clone(),
+            task_manager.clone(),
+            file_store.clone(),
+        );
 
         let ctx = Self {
             config,
@@ -370,6 +418,9 @@ impl ProductionGatewayContext {
             event_bus,
             otlp_worker,
             oauth_pending_flows: Arc::new(RwLock::new(HashMap::new())),
+            skills,
+            task_manager,
+            file_store,
         };
 
         if ctx.config.demo_seed && ctx.registry.list_servers(None).is_empty() {

@@ -15,7 +15,7 @@
 <p>
   <a href="#why-omnimcp">Why</a> ·
   <a href="#installation-across-all-operating-systems">Quick start & OS binaries</a> ·
-  <a href="#release-evolution-v40--v65">What's new in v6.5</a> ·
+  <a href="#release-evolution-v40--v68">What's new in v6.8</a> ·
   <a href="#architecture-diagram">Architecture</a> ·
   <a href="#authoritative-json-rpc-20-error-code-contract--320xx-table">Error contract</a> ·
   <a href="#available-endpoints--apis">Endpoints & tools</a> ·
@@ -26,7 +26,7 @@
 
 </div>
 
-**OmniMCP** (`omni-mcp` `v6.5` — *Distributed Cluster HA, Host-Bridged Wasm Plugins, Live Multi-Protocol Wire, Bidirectional MCP & Governance Studio*) is a high-performance **Rust** Model Context Protocol (MCP) management platform and runtime gateway. It unifies external stdio/HTTP MCP fleets, Virtual Tool Groups, OpenAPI/Protobuf/Thrift services, and an in-process **Code Mode** sandbox behind one governed, sub-millisecond gateway.
+**OmniMCP** (`omni-mcp` `v6.8` — *Skills over MCP, Postgres HA Tasks, Governance-Driven Elicitation, Streaming File Uploads & Wasm Guest ABI v2*) is a high-performance **Rust** Model Context Protocol (MCP) management platform and runtime gateway. It unifies external stdio/HTTP MCP fleets, Virtual Tool Groups, OpenAPI/Protobuf/Thrift services, and an in-process **Code Mode** sandbox behind one governed, sub-millisecond gateway.
 
 - **Unified External MCP Fleet & Tool Groups.** Supervise external stdio (`crates/omni-process-guard`) and HTTP/HTTPS (`rustls`) MCP servers with live SSE telemetry, health checks, and scoped Virtual Tool Groups in the React/Vite Fleet & Studio UI.
 - **Native Code Mode (`codemode`) & Wasm Sandbox.** Compiles tool schemas into compact `declare namespace codemode` TypeScript `.d.ts` definitions ($65\%\text{–}95\%$ token compression) and executes procedural scripts in an in-process AST VM ($\sim 100\ \mu\text{s}$) or `wasmi` WebAssembly sandbox with resumable WAL approval gates.
@@ -40,7 +40,7 @@
 
 Raw multi-server MCP setups degrade quickly as tool counts grow:
 
-| ❌ Connecting raw MCP servers directly | ✅ Routing through OmniMCP (`v6.5`) |
+| ❌ Connecting raw MCP servers directly | ✅ Routing through OmniMCP (`v6.8`) |
 | :--- | :--- |
 | Loads thousands of flat JSON schemas into every prompt, burning context tokens | Compiles schemas into compact `.d.ts` definitions and pre-injects top-$K$ via Okapi BM25 ($k_1 = 1.2, b = 0.75$) |
 | Forces slow multi-turn tool ping-pong for filtering, joins, and loops | Executes procedural `codemode` scripts with SSA auto-parallelization (`Stmt::ParallelWave`) and vectorized `PhysicalExpr` columnar pushdown |
@@ -64,7 +64,18 @@ Raw multi-server MCP setups degrade quickly as tool counts grow:
 
 ---
 
-## Release Evolution (`v4.0` → `v6.5`)
+## Release Evolution (`v4.0` → `v6.8`)
+
+<details open>
+<summary><strong>🚀 Version 6.8 — Skills over MCP, Postgres HA Tasks, Governance-Driven Elicitation & Streaming File Uploads</strong></summary>
+
+- **Unified `2026-07-28` Discovery, Group Isolation & `PgWirePool`**: Unified `build_server_capabilities()` and `server/discover` across `/omni/mcp`, `/groups/<slug>/mcp`, and `/<service>/mcp`; bounded `PgWirePool` (`OMNI_PG_POOL_SIZE=8`); channel-dispatched `LISTEN/NOTIFY` (`omni_registry_changed` vs `omni_task_changed`).
+- **Skills over MCP (`io.modelcontextprotocol/skills`, SEP-2640)**: Validated `SkillRecord` bundles (512 files / 16 MiB, YAML frontmatter, path-traversal guard, deterministic SHA-256 manifests), auto-synthesized Tool Group playbooks, `skills/list`, `skills/get`, `resources/read` (`skill://`), `resources/directory/read`, REST `/api/v1/skills*`, and `omni skills list|publish|verify`.
+- **Postgres HA-Backed MCP Tasks (`io.modelcontextprotocol/tasks`, GA)**: `TaskManager` with grace-window promotion (`resultType: "task"`), cooperative cancellation (`cancel_flag` in AST VM & Wasm -> `CodeModeError::Cancelled` -> LIFO Saga rollback), spec-compliant `tasks/get`, `tasks/update` (`inputResponses` -> `{}` ack), `tasks/cancel` (`{}` ack), 60s TTL reaper, and Prometheus metrics.
+- **Governance-Driven Elicitation & Multi-Replica OAuth**: Strict secret-key & primitive-schema validator on `form` elicitations, `url`-mode PKCE via `OMNI_PUBLIC_BASE_URL`, and shared `omni_oauth_flows` / AEAD `omni_oauth_tokens` / `omni_upstream_callbacks` across Postgres/SQLite/WAL.
+- **Feature-Gated File Uploads (`io.modelcontextprotocol/files`, SEP-2356) & Wasm ABI v2**: Dual async/sync 64 MiB streaming upload bypass (`Transfer-Encoding: chunked` + `PUT` CORS), universal multi-cloud `FileBlobBackend` (`local`, `postgres`, `s3` SigV4, `gcs`, `azure`, `http`), Wasm ABI v2 (`omni::file_stat`, `omni::file_read_chunk`), `HttpDownstreamClient::post_stream_file()`, Governance Studio UI v4, and `omni migrate --to-v6.8`.
+
+</details>
 
 <details open>
 <summary><strong>🚀 Version 6.5 — Distributed Cluster HA, Host-Bridged Wasm Plugins, Live Multi-Protocol Wire, Bidirectional MCP & Governance Studio</strong></summary>
@@ -143,7 +154,7 @@ npx -y @rangow2260/omni-mcp aifx mcp simulate --code "const res = await codemode
 
 ### 2. Native Pre-Built Binaries by Operating System
 
-All binaries (plus `omni-*`, `aifx-*`, Cargo SBOMs, and `SHA256SUMS`) are published on the [v6.5.0 GitHub Release](https://github.com/Rangow4562/omni-mcp-gateway/releases/tag/v6.5.0):
+All binaries (plus `omni-*`, `aifx-*`, Cargo SBOMs, and `SHA256SUMS`) are published on the [v6.8.0 GitHub Release](https://github.com/Rangow4562/omni-mcp-gateway/releases/tag/v6.8.0):
 
 | Operating System | Architecture | Target Triple | Release Binary Asset |
 | :--- | :--- | :--- | :--- |
@@ -157,41 +168,41 @@ All binaries (plus `omni-*`, `aifx-*`, Cargo SBOMs, and `SHA256SUMS`) are publis
 #### 🍎 macOS (Apple Silicon & Intel)
 ```bash
 # Apple Silicon (ARM64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-darwin-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-darwin-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Intel (x64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-darwin-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-darwin-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🐧 Linux (`x86_64` & ARM64)
 ```bash
 # Linux x64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-linux-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-linux-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Linux ARM64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-linux-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-linux-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🪟 Windows (PowerShell — x64 & ARM64)
 ```powershell
 # Windows x64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 
 # Windows ARM64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.5.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 ```
 
 #### 🐳 Docker & Build from Source
 ```bash
-# Docker (production container with UI & full v6.5 feature set)
-docker build -t omni-mcp:v6.5.0 .
-docker run --rm -e OMNI_AUTH_SECRET="your-secret" -p 8080:8080 omni-mcp:v6.5.0
+# Docker (production container with UI & full v6.8 feature set)
+docker build -t omni-mcp:v6.8.0 .
+docker run --rm -e OMNI_AUTH_SECRET="your-secret" -p 8080:8080 omni-mcp:v6.8.0
 
 # Build from source (Any OS with Rust 1.75+)
 cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc"
@@ -513,4 +524,4 @@ See [`examples/mcp-configs/python_harness_agent.py`](examples/mcp-configs/python
 
 ## License
 
-Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)). See [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASE_v6.5.0.md](docs/RELEASE_v6.5.0.md) for release notes.
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)). See [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASE_v6.8.0.md](docs/RELEASE_v6.8.0.md) for release notes.

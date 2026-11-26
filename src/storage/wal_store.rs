@@ -3,7 +3,9 @@
 
 use crate::json::JsonValue;
 use crate::models::{
-    ConfigDiff, SagaCompensationRecord, ServerRecord, SuspendedExecutionFrame, ToolGroupRecord,
+    ConfigDiff, FileBlobRecord, McpTaskRecord, McpTaskStatus, OAuthFlowRecord, OAuthTokenRecord,
+    PendingUpstreamCallback, SagaCompensationRecord, ServerRecord, SkillRecord,
+    SuspendedExecutionFrame, ToolGroupRecord,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -11,7 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::RwLock;
 
-/// Pluggable persistence backend trait for `MCPRegistry` (v6.0.0 / v6.5.0).
+/// Pluggable persistence backend trait for `MCPRegistry` (v6.0.0 / v6.5.0 / v6.8.0).
 pub trait RegistryStorageBackend: Send + Sync {
     fn load_all_servers(&self) -> Vec<ServerRecord>;
     fn save_server(&self, server: &ServerRecord);
@@ -38,6 +40,94 @@ pub trait RegistryStorageBackend: Send + Sync {
         execution_id: &str,
         approver: &str,
     ) -> Result<SuspendedExecutionFrame, String>;
+
+    // --- v6.8.0 Skills over MCP (SEP-2640) ---
+    fn load_all_skills(&self) -> Vec<SkillRecord> {
+        Vec::new()
+    }
+    fn save_skill(&self, _skill: &SkillRecord) {}
+    fn delete_skill(&self, _slug: &str) -> Option<SkillRecord> {
+        None
+    }
+
+    // --- v6.8.0 Postgres HA-Backed MCP Tasks (GA) ---
+    fn load_all_mcp_tasks(&self) -> Vec<McpTaskRecord> {
+        Vec::new()
+    }
+    fn get_mcp_task(&self, task_id: &str) -> Option<McpTaskRecord> {
+        self.load_all_mcp_tasks()
+            .into_iter()
+            .find(|t| t.task_id == task_id)
+    }
+    fn save_mcp_task(&self, _task: &McpTaskRecord) {}
+    fn update_mcp_task_cas(
+        &self,
+        _task_id: &str,
+        _expected_status: McpTaskStatus,
+        updated: &McpTaskRecord,
+    ) -> Result<McpTaskRecord, String> {
+        self.save_mcp_task(updated);
+        Ok(updated.clone())
+    }
+    fn request_mcp_task_cancel(&self, _task_id: &str) -> Option<McpTaskRecord> {
+        None
+    }
+    fn purge_expired_mcp_tasks(&self, _now_epoch: f64) -> usize {
+        0
+    }
+
+    // --- v6.8.0 Multi-Replica HA OAuth Flows, Tokens & Upstream Callbacks ---
+    fn save_oauth_flow(&self, _flow: &OAuthFlowRecord) {}
+    fn load_all_oauth_flows(&self) -> Vec<OAuthFlowRecord> {
+        Vec::new()
+    }
+    fn take_oauth_flow(&self, _state: &str) -> Option<OAuthFlowRecord> {
+        None
+    }
+    fn save_oauth_token(&self, _token: &OAuthTokenRecord) {}
+    fn load_all_oauth_tokens(&self) -> Vec<OAuthTokenRecord> {
+        Vec::new()
+    }
+    fn get_oauth_token(&self, _server_name: &str) -> Option<OAuthTokenRecord> {
+        None
+    }
+    fn delete_oauth_token(&self, _server_name: &str) -> Option<OAuthTokenRecord> {
+        None
+    }
+    fn save_upstream_callback(&self, _cb: &PendingUpstreamCallback) {}
+    fn load_all_upstream_callbacks(&self) -> Vec<PendingUpstreamCallback> {
+        Vec::new()
+    }
+    fn delete_upstream_callback(&self, _request_id: &str) -> Option<PendingUpstreamCallback> {
+        None
+    }
+
+    // --- v6.8.0 File Blobs Metadata & Optional Chunk Storage ---
+    fn save_file_blob(&self, _blob: &FileBlobRecord) {}
+    fn load_all_file_blobs(&self) -> Vec<FileBlobRecord> {
+        Vec::new()
+    }
+    fn get_file_blob(&self, _file_id: &str) -> Option<FileBlobRecord> {
+        None
+    }
+    fn delete_file_blob(&self, _file_id: &str) -> Option<FileBlobRecord> {
+        None
+    }
+    fn purge_expired_file_blobs(&self, _now_epoch: f64) -> Vec<FileBlobRecord> {
+        Vec::new()
+    }
+    fn save_file_blob_chunk(
+        &self,
+        _file_id: &str,
+        _chunk_idx: u32,
+        _data: &[u8],
+    ) -> Result<(), String> {
+        Err("File blob chunk storage not supported by this backend".to_string())
+    }
+    fn load_file_blob_chunks(&self, _file_id: &str) -> Result<Vec<Vec<u8>>, String> {
+        Err("File blob chunk storage not supported by this backend".to_string())
+    }
+    fn delete_file_blob_chunks(&self, _file_id: &str) {}
 }
 
 struct StoreState {
@@ -46,6 +136,13 @@ struct StoreState {
     suspended_frames: BTreeMap<String, SuspendedExecutionFrame>,
     saga_compensations: BTreeMap<String, SagaCompensationRecord>,
     tool_groups: BTreeMap<String, ToolGroupRecord>,
+    skills: BTreeMap<String, SkillRecord>,
+    mcp_tasks: BTreeMap<String, McpTaskRecord>,
+    oauth_flows: BTreeMap<String, OAuthFlowRecord>,
+    oauth_tokens: BTreeMap<String, OAuthTokenRecord>,
+    upstream_callbacks: BTreeMap<String, PendingUpstreamCallback>,
+    file_blobs: BTreeMap<String, FileBlobRecord>,
+    file_blob_chunks: BTreeMap<String, BTreeMap<u32, Vec<u8>>>,
     wal_entries_since_compact: usize,
 }
 
@@ -68,6 +165,13 @@ impl WalRegistryStore {
                 suspended_frames: BTreeMap::new(),
                 saga_compensations: BTreeMap::new(),
                 tool_groups: BTreeMap::new(),
+                skills: BTreeMap::new(),
+                mcp_tasks: BTreeMap::new(),
+                oauth_flows: BTreeMap::new(),
+                oauth_tokens: BTreeMap::new(),
+                upstream_callbacks: BTreeMap::new(),
+                file_blobs: BTreeMap::new(),
+                file_blob_chunks: BTreeMap::new(),
                 wal_entries_since_compact: 0,
             }),
         };
@@ -133,6 +237,48 @@ impl WalRegistryStore {
                         for g_val in groups {
                             if let Some(grp) = ToolGroupRecord::from_json(g_val) {
                                 guard.tool_groups.insert(grp.slug.clone(), grp);
+                            }
+                        }
+                    }
+                    if let Some(skills) = val.get("skills").and_then(|s| s.as_array()) {
+                        for s_val in skills {
+                            if let Some(sk) = SkillRecord::from_json(s_val) {
+                                guard.skills.insert(sk.slug.clone(), sk);
+                            }
+                        }
+                    }
+                    if let Some(tasks) = val.get("mcp_tasks").and_then(|t| t.as_array()) {
+                        for t_val in tasks {
+                            if let Some(tk) = McpTaskRecord::from_json(t_val) {
+                                guard.mcp_tasks.insert(tk.task_id.clone(), tk);
+                            }
+                        }
+                    }
+                    if let Some(flows) = val.get("oauth_flows").and_then(|f| f.as_array()) {
+                        for f_val in flows {
+                            if let Some(fl) = OAuthFlowRecord::from_json(f_val) {
+                                guard.oauth_flows.insert(fl.state.clone(), fl);
+                            }
+                        }
+                    }
+                    if let Some(tokens) = val.get("oauth_tokens").and_then(|t| t.as_array()) {
+                        for t_val in tokens {
+                            if let Some(tk) = OAuthTokenRecord::from_json(t_val) {
+                                guard.oauth_tokens.insert(tk.server_name.clone(), tk);
+                            }
+                        }
+                    }
+                    if let Some(cbs) = val.get("upstream_callbacks").and_then(|c| c.as_array()) {
+                        for c_val in cbs {
+                            if let Some(cb) = PendingUpstreamCallback::from_json(c_val) {
+                                guard.upstream_callbacks.insert(cb.callback_id.clone(), cb);
+                            }
+                        }
+                    }
+                    if let Some(blobs) = val.get("file_blobs").and_then(|b| b.as_array()) {
+                        for b_val in blobs {
+                            if let Some(bl) = FileBlobRecord::from_json(b_val) {
+                                guard.file_blobs.insert(bl.file_id.clone(), bl);
                             }
                         }
                     }
@@ -218,6 +364,80 @@ impl WalRegistryStore {
                                         {
                                             guard.tool_groups.remove(slug);
                                         }
+                                    } else if op == "SAVE_SKILL" {
+                                        if let Some(s_val) = entry.get("data") {
+                                            if let Some(sk) = SkillRecord::from_json(s_val) {
+                                                guard.skills.insert(sk.slug.clone(), sk);
+                                            }
+                                        }
+                                    } else if op == "DELETE_SKILL" {
+                                        if let Some(slug) =
+                                            entry.get("data").and_then(|d| d.as_str())
+                                        {
+                                            guard.skills.remove(slug);
+                                        }
+                                    } else if op == "SAVE_MCP_TASK" {
+                                        if let Some(t_val) = entry.get("data") {
+                                            if let Some(tk) = McpTaskRecord::from_json(t_val) {
+                                                guard.mcp_tasks.insert(tk.task_id.clone(), tk);
+                                            }
+                                        }
+                                    } else if op == "DELETE_MCP_TASK" {
+                                        if let Some(id) = entry.get("data").and_then(|d| d.as_str())
+                                        {
+                                            guard.mcp_tasks.remove(id);
+                                        }
+                                    } else if op == "SAVE_OAUTH_FLOW" {
+                                        if let Some(f_val) = entry.get("data") {
+                                            if let Some(fl) = OAuthFlowRecord::from_json(f_val) {
+                                                guard.oauth_flows.insert(fl.state.clone(), fl);
+                                            }
+                                        }
+                                    } else if op == "DELETE_OAUTH_FLOW" {
+                                        if let Some(st) = entry.get("data").and_then(|d| d.as_str())
+                                        {
+                                            guard.oauth_flows.remove(st);
+                                        }
+                                    } else if op == "SAVE_OAUTH_TOKEN" {
+                                        if let Some(t_val) = entry.get("data") {
+                                            if let Some(tk) = OAuthTokenRecord::from_json(t_val) {
+                                                guard
+                                                    .oauth_tokens
+                                                    .insert(tk.server_name.clone(), tk);
+                                            }
+                                        }
+                                    } else if op == "DELETE_OAUTH_TOKEN" {
+                                        if let Some(srv) =
+                                            entry.get("data").and_then(|d| d.as_str())
+                                        {
+                                            guard.oauth_tokens.remove(srv);
+                                        }
+                                    } else if op == "SAVE_UPSTREAM_CALLBACK" {
+                                        if let Some(c_val) = entry.get("data") {
+                                            if let Some(cb) =
+                                                PendingUpstreamCallback::from_json(c_val)
+                                            {
+                                                guard
+                                                    .upstream_callbacks
+                                                    .insert(cb.callback_id.clone(), cb);
+                                            }
+                                        }
+                                    } else if op == "DELETE_UPSTREAM_CALLBACK" {
+                                        if let Some(id) = entry.get("data").and_then(|d| d.as_str())
+                                        {
+                                            guard.upstream_callbacks.remove(id);
+                                        }
+                                    } else if op == "SAVE_FILE_BLOB" {
+                                        if let Some(b_val) = entry.get("data") {
+                                            if let Some(bl) = FileBlobRecord::from_json(b_val) {
+                                                guard.file_blobs.insert(bl.file_id.clone(), bl);
+                                            }
+                                        }
+                                    } else if op == "DELETE_FILE_BLOB" {
+                                        if let Some(id) = entry.get("data").and_then(|d| d.as_str())
+                                        {
+                                            guard.file_blobs.remove(id);
+                                        }
                                     }
                                 }
                             }
@@ -280,6 +500,16 @@ impl WalRegistryStore {
             .map(|c| c.to_json())
             .collect();
         let groups_arr: Vec<JsonValue> = state.tool_groups.values().map(|g| g.to_json()).collect();
+        let skills_arr: Vec<JsonValue> = state.skills.values().map(|s| s.to_json()).collect();
+        let tasks_arr: Vec<JsonValue> = state.mcp_tasks.values().map(|t| t.to_json()).collect();
+        let flows_arr: Vec<JsonValue> = state.oauth_flows.values().map(|f| f.to_json()).collect();
+        let tokens_arr: Vec<JsonValue> = state.oauth_tokens.values().map(|t| t.to_json()).collect();
+        let callbacks_arr: Vec<JsonValue> = state
+            .upstream_callbacks
+            .values()
+            .map(|c| c.to_json())
+            .collect();
+        let blobs_arr: Vec<JsonValue> = state.file_blobs.values().map(|b| b.to_json()).collect();
         let snapshot = json!({
             "engine": concat!("omni-rust-wal-v", env!("CARGO_PKG_VERSION")),
             "servers": JsonValue::Array(servers_arr),
@@ -287,6 +517,12 @@ impl WalRegistryStore {
             "suspended_frames": JsonValue::Array(frames_arr),
             "saga_compensations": JsonValue::Array(comps_arr),
             "tool_groups": JsonValue::Array(groups_arr),
+            "skills": JsonValue::Array(skills_arr),
+            "mcp_tasks": JsonValue::Array(tasks_arr),
+            "oauth_flows": JsonValue::Array(flows_arr),
+            "oauth_tokens": JsonValue::Array(tokens_arr),
+            "upstream_callbacks": JsonValue::Array(callbacks_arr),
+            "file_blobs": JsonValue::Array(blobs_arr),
         });
         let tmp_path = format!("{}.tmp", self.db_path);
         if let Ok(mut f) = File::create(&tmp_path) {
@@ -524,6 +760,263 @@ impl RegistryStorageBackend for WalRegistryStore {
         self.consume_frame(execution_id, approver)
             .map_err(|e| e.to_string())
     }
+
+    fn load_all_skills(&self) -> Vec<SkillRecord> {
+        let guard = self.state.read().unwrap();
+        guard.skills.values().cloned().collect()
+    }
+
+    fn save_skill(&self, skill: &SkillRecord) {
+        let mut guard = self.state.write().unwrap();
+        guard.skills.insert(skill.slug.clone(), skill.clone());
+        self.append_wal_and_maybe_compact("SAVE_SKILL", skill.to_json(), &mut guard);
+    }
+
+    fn delete_skill(&self, slug: &str) -> Option<SkillRecord> {
+        let mut guard = self.state.write().unwrap();
+        let removed = guard.skills.remove(slug);
+        if removed.is_some() {
+            self.append_wal_and_maybe_compact("DELETE_SKILL", JsonValue::from(slug), &mut guard);
+        }
+        removed
+    }
+
+    fn load_all_mcp_tasks(&self) -> Vec<McpTaskRecord> {
+        let guard = self.state.read().unwrap();
+        guard.mcp_tasks.values().cloned().collect()
+    }
+
+    fn get_mcp_task(&self, task_id: &str) -> Option<McpTaskRecord> {
+        let guard = self.state.read().unwrap();
+        guard.mcp_tasks.get(task_id).cloned()
+    }
+
+    fn save_mcp_task(&self, task: &McpTaskRecord) {
+        let mut guard = self.state.write().unwrap();
+        guard.mcp_tasks.insert(task.task_id.clone(), task.clone());
+        self.append_wal_and_maybe_compact("SAVE_MCP_TASK", task.to_json(), &mut guard);
+    }
+
+    fn update_mcp_task_cas(
+        &self,
+        task_id: &str,
+        expected_status: McpTaskStatus,
+        updated: &McpTaskRecord,
+    ) -> Result<McpTaskRecord, String> {
+        let mut guard = self.state.write().unwrap();
+        let existing = guard
+            .mcp_tasks
+            .get(task_id)
+            .ok_or_else(|| format!("Task '{}' not found", task_id))?;
+        if existing.status != expected_status {
+            return Err(format!(
+                "Task '{}' status conflict: expected '{}', found '{}'",
+                task_id,
+                expected_status.as_str(),
+                existing.status.as_str()
+            ));
+        }
+        guard.mcp_tasks.insert(task_id.to_string(), updated.clone());
+        self.append_wal_and_maybe_compact("SAVE_MCP_TASK", updated.to_json(), &mut guard);
+        Ok(updated.clone())
+    }
+
+    fn request_mcp_task_cancel(&self, task_id: &str) -> Option<McpTaskRecord> {
+        let mut guard = self.state.write().unwrap();
+        let mut task = guard.mcp_tasks.get(task_id)?.clone();
+        task.cancel_requested = true;
+        if !task.status.is_terminal() {
+            task.status = McpTaskStatus::Cancelled;
+            task.status_message = Some("Cancelled by client".to_string());
+        }
+        task.updated_at = crate::logging::now_epoch_secs();
+        guard.mcp_tasks.insert(task_id.to_string(), task.clone());
+        self.append_wal_and_maybe_compact("SAVE_MCP_TASK", task.to_json(), &mut guard);
+        Some(task)
+    }
+
+    fn purge_expired_mcp_tasks(&self, now_epoch: f64) -> usize {
+        let mut guard = self.state.write().unwrap();
+        let expired: Vec<String> = guard
+            .mcp_tasks
+            .iter()
+            .filter(|(_, t)| t.expires_at <= now_epoch)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = expired.len();
+        for id in expired {
+            guard.mcp_tasks.remove(&id);
+            self.append_wal_and_maybe_compact(
+                "DELETE_MCP_TASK",
+                JsonValue::from(id.as_str()),
+                &mut guard,
+            );
+        }
+        count
+    }
+
+    fn save_oauth_flow(&self, flow: &OAuthFlowRecord) {
+        let mut guard = self.state.write().unwrap();
+        guard.oauth_flows.insert(flow.state.clone(), flow.clone());
+        self.append_wal_and_maybe_compact("SAVE_OAUTH_FLOW", flow.to_json(), &mut guard);
+    }
+
+    fn load_all_oauth_flows(&self) -> Vec<OAuthFlowRecord> {
+        let guard = self.state.read().unwrap();
+        guard.oauth_flows.values().cloned().collect()
+    }
+
+    fn take_oauth_flow(&self, state: &str) -> Option<OAuthFlowRecord> {
+        let mut guard = self.state.write().unwrap();
+        let removed = guard.oauth_flows.remove(state);
+        if removed.is_some() {
+            self.append_wal_and_maybe_compact(
+                "DELETE_OAUTH_FLOW",
+                JsonValue::from(state),
+                &mut guard,
+            );
+        }
+        removed
+    }
+
+    fn save_oauth_token(&self, token: &OAuthTokenRecord) {
+        let mut guard = self.state.write().unwrap();
+        guard
+            .oauth_tokens
+            .insert(token.server_name.clone(), token.clone());
+        self.append_wal_and_maybe_compact("SAVE_OAUTH_TOKEN", token.to_json(), &mut guard);
+    }
+
+    fn load_all_oauth_tokens(&self) -> Vec<OAuthTokenRecord> {
+        let guard = self.state.read().unwrap();
+        guard.oauth_tokens.values().cloned().collect()
+    }
+
+    fn get_oauth_token(&self, server_name: &str) -> Option<OAuthTokenRecord> {
+        let guard = self.state.read().unwrap();
+        guard.oauth_tokens.get(server_name).cloned()
+    }
+
+    fn delete_oauth_token(&self, server_name: &str) -> Option<OAuthTokenRecord> {
+        let mut guard = self.state.write().unwrap();
+        let removed = guard.oauth_tokens.remove(server_name);
+        if removed.is_some() {
+            self.append_wal_and_maybe_compact(
+                "DELETE_OAUTH_TOKEN",
+                JsonValue::from(server_name),
+                &mut guard,
+            );
+        }
+        removed
+    }
+
+    fn save_upstream_callback(&self, cb: &PendingUpstreamCallback) {
+        let mut guard = self.state.write().unwrap();
+        guard
+            .upstream_callbacks
+            .insert(cb.callback_id.clone(), cb.clone());
+        self.append_wal_and_maybe_compact("SAVE_UPSTREAM_CALLBACK", cb.to_json(), &mut guard);
+    }
+
+    fn load_all_upstream_callbacks(&self) -> Vec<PendingUpstreamCallback> {
+        let guard = self.state.read().unwrap();
+        guard.upstream_callbacks.values().cloned().collect()
+    }
+
+    fn delete_upstream_callback(&self, request_id: &str) -> Option<PendingUpstreamCallback> {
+        let mut guard = self.state.write().unwrap();
+        let removed = guard.upstream_callbacks.remove(request_id);
+        if removed.is_some() {
+            self.append_wal_and_maybe_compact(
+                "DELETE_UPSTREAM_CALLBACK",
+                JsonValue::from(request_id),
+                &mut guard,
+            );
+        }
+        removed
+    }
+
+    fn save_file_blob(&self, blob: &FileBlobRecord) {
+        let mut guard = self.state.write().unwrap();
+        guard.file_blobs.insert(blob.file_id.clone(), blob.clone());
+        self.append_wal_and_maybe_compact("SAVE_FILE_BLOB", blob.to_json(), &mut guard);
+    }
+
+    fn load_all_file_blobs(&self) -> Vec<FileBlobRecord> {
+        let guard = self.state.read().unwrap();
+        guard.file_blobs.values().cloned().collect()
+    }
+
+    fn get_file_blob(&self, file_id: &str) -> Option<FileBlobRecord> {
+        let guard = self.state.read().unwrap();
+        guard.file_blobs.get(file_id).cloned()
+    }
+
+    fn delete_file_blob(&self, file_id: &str) -> Option<FileBlobRecord> {
+        let mut guard = self.state.write().unwrap();
+        let removed = guard.file_blobs.remove(file_id);
+        guard.file_blob_chunks.remove(file_id);
+        if removed.is_some() {
+            self.append_wal_and_maybe_compact(
+                "DELETE_FILE_BLOB",
+                JsonValue::from(file_id),
+                &mut guard,
+            );
+        }
+        removed
+    }
+
+    fn purge_expired_file_blobs(&self, now_epoch: f64) -> Vec<FileBlobRecord> {
+        let mut guard = self.state.write().unwrap();
+        let expired_ids: Vec<String> = guard
+            .file_blobs
+            .iter()
+            .filter(|(_, b)| b.expires_at <= now_epoch)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut removed = Vec::with_capacity(expired_ids.len());
+        for id in expired_ids {
+            if let Some(blob) = guard.file_blobs.remove(&id) {
+                removed.push(blob);
+                guard.file_blob_chunks.remove(&id);
+                self.append_wal_and_maybe_compact(
+                    "DELETE_FILE_BLOB",
+                    JsonValue::from(id.as_str()),
+                    &mut guard,
+                );
+            }
+        }
+        removed
+    }
+
+    fn save_file_blob_chunk(
+        &self,
+        file_id: &str,
+        chunk_idx: u32,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let mut guard = self.state.write().unwrap();
+        guard
+            .file_blob_chunks
+            .entry(file_id.to_string())
+            .or_default()
+            .insert(chunk_idx, data.to_vec());
+        Ok(())
+    }
+
+    fn load_file_blob_chunks(&self, file_id: &str) -> Result<Vec<Vec<u8>>, String> {
+        let guard = self.state.read().unwrap();
+        let map = guard
+            .file_blob_chunks
+            .get(file_id)
+            .ok_or_else(|| format!("File blob chunks '{}' not found", file_id))?;
+        Ok(map.values().cloned().collect())
+    }
+
+    fn delete_file_blob_chunks(&self, file_id: &str) {
+        let mut guard = self.state.write().unwrap();
+        guard.file_blob_chunks.remove(file_id);
+    }
 }
 
 /// SQLite WAL-mode storage backend (v6.0.0, enabled via `storage-sqlite`).
@@ -551,6 +1044,14 @@ impl SqliteRegistryBackend {
         CREATE TABLE IF NOT EXISTS tool_groups (slug TEXT PRIMARY KEY, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS suspended_frames (execution_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log (idx INTEGER PRIMARY KEY, current_hash TEXT NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS skills (slug TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS mcp_tasks (task_id TEXT PRIMARY KEY, status TEXT NOT NULL, expires_at REAL NOT NULL, payload TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_mcp_tasks_status_expires ON mcp_tasks (status, expires_at);
+        CREATE TABLE IF NOT EXISTS oauth_flows (state TEXT PRIMARY KEY, expires_at REAL NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS oauth_tokens (server_name TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS upstream_callbacks (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS file_blobs (file_id TEXT PRIMARY KEY, expires_at REAL NOT NULL, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS file_blob_chunks (file_id TEXT NOT NULL, chunk_idx INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (file_id, chunk_idx));
     ";
 
     pub fn try_open(dsn: impl Into<String>) -> Result<Self, String> {
@@ -844,6 +1345,423 @@ impl RegistryStorageBackend for SqliteRegistryBackend {
         conn.execute_batch("COMMIT")
             .map_err(|e| format!("Failed to commit SQLite CAS transaction: {}", e))?;
         Ok(frame)
+    }
+
+    fn load_all_skills(&self) -> Vec<SkillRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT payload FROM skills ORDER BY slug ASC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| SkillRecord::from_json(&j))
+            .collect()
+    }
+
+    fn save_skill(&self, skill: &SkillRecord) {
+        let conn = self.conn.lock().unwrap();
+        let payload = skill.to_json().to_string_compact();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO skills (slug, payload, updated_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![skill.slug, payload, skill.updated_at],
+        );
+    }
+
+    fn delete_skill(&self, slug: &str) -> Option<SkillRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM skills WHERE slug = ?1",
+                rusqlite::params![slug],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = conn.execute(
+            "DELETE FROM skills WHERE slug = ?1",
+            rusqlite::params![slug],
+        );
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| SkillRecord::from_json(&j))
+    }
+
+    fn load_all_mcp_tasks(&self) -> Vec<McpTaskRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT payload FROM mcp_tasks ORDER BY task_id DESC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| McpTaskRecord::from_json(&j))
+            .collect()
+    }
+
+    fn get_mcp_task(&self, task_id: &str) -> Option<McpTaskRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM mcp_tasks WHERE task_id = ?1",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .ok();
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| McpTaskRecord::from_json(&j))
+    }
+
+    fn save_mcp_task(&self, task: &McpTaskRecord) {
+        let conn = self.conn.lock().unwrap();
+        let payload = task.to_json().to_string_compact();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO mcp_tasks (task_id, status, expires_at, payload) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![task.task_id, task.status.as_str(), task.expires_at, payload],
+        );
+    }
+
+    fn update_mcp_task_cas(
+        &self,
+        task_id: &str,
+        expected_status: McpTaskStatus,
+        updated: &McpTaskRecord,
+    ) -> Result<McpTaskRecord, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "SQLite lock poisoned".to_string())?;
+        let payload = updated.to_json().to_string_compact();
+        let changed = conn
+            .execute(
+                "UPDATE mcp_tasks SET status = ?1, expires_at = ?2, payload = ?3 WHERE task_id = ?4 AND status = ?5",
+                rusqlite::params![
+                    updated.status.as_str(),
+                    updated.expires_at,
+                    payload,
+                    task_id,
+                    expected_status.as_str()
+                ],
+            )
+            .map_err(|e| format!("Failed to CAS-update SQLite task: {}", e))?;
+        if changed == 0 {
+            return Err(format!(
+                "Task '{}' not found or status mismatch (expected '{}')",
+                task_id,
+                expected_status.as_str()
+            ));
+        }
+        Ok(updated.clone())
+    }
+
+    fn request_mcp_task_cancel(&self, task_id: &str) -> Option<McpTaskRecord> {
+        let mut task = self.get_mcp_task(task_id)?;
+        task.cancel_requested = true;
+        if !task.status.is_terminal() {
+            task.status = McpTaskStatus::Cancelled;
+            task.status_message = Some("Cancelled by client".to_string());
+        }
+        task.updated_at = crate::logging::now_epoch_secs();
+        self.save_mcp_task(&task);
+        Some(task)
+    }
+
+    fn purge_expired_mcp_tasks(&self, now_epoch: f64) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM mcp_tasks WHERE expires_at <= ?1",
+            rusqlite::params![now_epoch],
+        )
+        .unwrap_or(0)
+    }
+
+    fn save_oauth_flow(&self, flow: &OAuthFlowRecord) {
+        let conn = self.conn.lock().unwrap();
+        let payload = flow.to_json().to_string_compact();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO oauth_flows (state, expires_at, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![flow.state, flow.expires_at, payload],
+        );
+    }
+
+    fn load_all_oauth_flows(&self) -> Vec<OAuthFlowRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT payload FROM oauth_flows ORDER BY state ASC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| OAuthFlowRecord::from_json(&j))
+            .collect()
+    }
+
+    fn take_oauth_flow(&self, state: &str) -> Option<OAuthFlowRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM oauth_flows WHERE state = ?1",
+                rusqlite::params![state],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = conn.execute(
+            "DELETE FROM oauth_flows WHERE state = ?1",
+            rusqlite::params![state],
+        );
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| OAuthFlowRecord::from_json(&j))
+    }
+
+    fn save_oauth_token(&self, token: &OAuthTokenRecord) {
+        let conn = self.conn.lock().unwrap();
+        let payload = token.to_json().to_string_compact();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO oauth_tokens (server_name, payload, updated_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![token.server_name, payload, token.updated_at],
+        );
+    }
+
+    fn load_all_oauth_tokens(&self) -> Vec<OAuthTokenRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            match conn.prepare("SELECT payload FROM oauth_tokens ORDER BY server_name ASC") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| OAuthTokenRecord::from_json(&j))
+            .collect()
+    }
+
+    fn get_oauth_token(&self, server_name: &str) -> Option<OAuthTokenRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM oauth_tokens WHERE server_name = ?1",
+                rusqlite::params![server_name],
+                |row| row.get(0),
+            )
+            .ok();
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| OAuthTokenRecord::from_json(&j))
+    }
+
+    fn delete_oauth_token(&self, server_name: &str) -> Option<OAuthTokenRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM oauth_tokens WHERE server_name = ?1",
+                rusqlite::params![server_name],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = conn.execute(
+            "DELETE FROM oauth_tokens WHERE server_name = ?1",
+            rusqlite::params![server_name],
+        );
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| OAuthTokenRecord::from_json(&j))
+    }
+
+    fn save_upstream_callback(&self, cb: &PendingUpstreamCallback) {
+        let conn = self.conn.lock().unwrap();
+        let payload = cb.to_json().to_string_compact();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO upstream_callbacks (request_id, payload) VALUES (?1, ?2)",
+            rusqlite::params![cb.callback_id, payload],
+        );
+    }
+
+    fn load_all_upstream_callbacks(&self) -> Vec<PendingUpstreamCallback> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            match conn.prepare("SELECT payload FROM upstream_callbacks ORDER BY request_id ASC") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| PendingUpstreamCallback::from_json(&j))
+            .collect()
+    }
+
+    fn delete_upstream_callback(&self, request_id: &str) -> Option<PendingUpstreamCallback> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM upstream_callbacks WHERE request_id = ?1",
+                rusqlite::params![request_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = conn.execute(
+            "DELETE FROM upstream_callbacks WHERE request_id = ?1",
+            rusqlite::params![request_id],
+        );
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| PendingUpstreamCallback::from_json(&j))
+    }
+
+    fn save_file_blob(&self, blob: &FileBlobRecord) {
+        let conn = self.conn.lock().unwrap();
+        let payload = blob.to_json().to_string_compact();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO file_blobs (file_id, expires_at, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![blob.file_id, blob.expires_at, payload],
+        );
+    }
+
+    fn load_all_file_blobs(&self) -> Vec<FileBlobRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT payload FROM file_blobs ORDER BY file_id ASC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| FileBlobRecord::from_json(&j))
+            .collect()
+    }
+
+    fn get_file_blob(&self, file_id: &str) -> Option<FileBlobRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM file_blobs WHERE file_id = ?1",
+                rusqlite::params![file_id],
+                |row| row.get(0),
+            )
+            .ok();
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| FileBlobRecord::from_json(&j))
+    }
+
+    fn delete_file_blob(&self, file_id: &str) -> Option<FileBlobRecord> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM file_blobs WHERE file_id = ?1",
+                rusqlite::params![file_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let _ = conn.execute(
+            "DELETE FROM file_blobs WHERE file_id = ?1",
+            rusqlite::params![file_id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM file_blob_chunks WHERE file_id = ?1",
+            rusqlite::params![file_id],
+        );
+        existing
+            .and_then(|p| JsonValue::parse(&p).ok())
+            .and_then(|j| FileBlobRecord::from_json(&j))
+    }
+
+    fn purge_expired_file_blobs(&self, now_epoch: f64) -> Vec<FileBlobRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT payload FROM file_blobs WHERE expires_at <= ?1") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let expired: Vec<FileBlobRecord> = stmt
+            .query_map(rusqlite::params![now_epoch], |row| row.get::<_, String>(0))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|p| JsonValue::parse(&p).ok())
+            .filter_map(|j| FileBlobRecord::from_json(&j))
+            .collect();
+        for blob in &expired {
+            let _ = conn.execute(
+                "DELETE FROM file_blobs WHERE file_id = ?1",
+                rusqlite::params![blob.file_id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM file_blob_chunks WHERE file_id = ?1",
+                rusqlite::params![blob.file_id],
+            );
+        }
+        expired
+    }
+
+    fn save_file_blob_chunk(
+        &self,
+        file_id: &str,
+        chunk_idx: u32,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "SQLite lock poisoned".to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO file_blob_chunks (file_id, chunk_idx, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![file_id, chunk_idx as i64, data],
+        )
+        .map_err(|e| format!("Failed to save file blob chunk to SQLite: {}", e))?;
+        Ok(())
+    }
+
+    fn load_file_blob_chunks(&self, file_id: &str) -> Result<Vec<Vec<u8>>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "SQLite lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT data FROM file_blob_chunks WHERE file_id = ?1 ORDER BY chunk_idx ASC")
+            .map_err(|e| format!("Failed to prepare chunk query: {}", e))?;
+        let rows = stmt
+            .query_map(rusqlite::params![file_id], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| format!("Failed to query file blob chunks: {}", e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        if out.is_empty() {
+            return Err(format!("No chunks found for file '{}'", file_id));
+        }
+        Ok(out)
+    }
+
+    fn delete_file_blob_chunks(&self, file_id: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM file_blob_chunks WHERE file_id = ?1",
+            rusqlite::params![file_id],
+        );
     }
 }
 

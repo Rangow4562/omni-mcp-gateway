@@ -40,6 +40,7 @@ pub struct UpstreamCallbackHub {
     progress_sink: RwLock<Option<ProgressSink>>,
     callback_event_sink: RwLock<Option<CallbackEventSink>>,
     policy_resolver: RwLock<Option<PolicyResolver>>,
+    registry: RwLock<Option<crate::control_plane::MCPRegistry>>,
     max_sampling_tokens: u64,
 }
 
@@ -56,8 +57,13 @@ impl UpstreamCallbackHub {
             progress_sink: RwLock::new(None),
             callback_event_sink: RwLock::new(None),
             policy_resolver: RwLock::new(None),
+            registry: RwLock::new(None),
             max_sampling_tokens: 4096,
         }
+    }
+
+    pub fn set_registry(&self, registry: crate::control_plane::MCPRegistry) {
+        *self.registry.write().unwrap() = Some(registry);
     }
 
     pub fn set_progress_sink(&self, sink: ProgressSink) {
@@ -79,8 +85,17 @@ impl UpstreamCallbackHub {
     }
 
     pub fn list_pending_callbacks(&self) -> Vec<PendingUpstreamCallback> {
+        let mut by_id: HashMap<String, PendingUpstreamCallback> = HashMap::new();
+        if let Some(ref reg) = *self.registry.read().unwrap() {
+            for cb in reg.list_upstream_callbacks() {
+                by_id.insert(cb.callback_id.clone(), cb);
+            }
+        }
         let guard = self.pending.read().unwrap();
-        guard.values().map(|e| e.meta.clone()).collect()
+        for (k, e) in guard.iter() {
+            by_id.insert(k.clone(), e.meta.clone());
+        }
+        by_id.into_values().collect()
     }
 
     /// Resolves a pending `RelayToClient` or `ApprovalGate` callback, waking the waiting
@@ -92,38 +107,53 @@ impl UpstreamCallbackHub {
         result_payload: Option<JsonValue>,
         error_message: Option<&str>,
     ) -> Result<PendingUpstreamCallback, String> {
-        let entry = self
-            .pending
-            .write()
+        let local_entry = self.pending.write().unwrap().remove(callback_id);
+        let persisted_meta = self
+            .registry
+            .read()
             .unwrap()
-            .remove(callback_id)
-            .ok_or_else(|| format!("Pending upstream callback '{}' not found", callback_id))?;
+            .as_ref()
+            .and_then(|reg| reg.delete_upstream_callback(callback_id));
 
-        let rpc_reply = if approved {
-            json!({
-                "jsonrpc": "2.0",
-                "id": entry.meta.upstream_request_id.clone(),
-                "result": result_payload.unwrap_or_else(JsonValue::object),
-            })
-        } else {
-            json!({
-                "jsonrpc": "2.0",
-                "id": entry.meta.upstream_request_id.clone(),
-                "error": {
-                    "code": UNAUTHORIZED,
-                    "message": error_message.unwrap_or("Upstream request rejected by operator/client"),
-                }
-            })
-        };
+        if let Some(entry) = local_entry {
+            let rpc_reply = if approved {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": entry.meta.upstream_request_id.clone(),
+                    "result": result_payload.unwrap_or_else(JsonValue::object),
+                })
+            } else {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": entry.meta.upstream_request_id.clone(),
+                    "error": {
+                        "code": UNAUTHORIZED,
+                        "message": error_message.unwrap_or("Upstream request rejected by operator/client"),
+                    }
+                })
+            };
 
-        let _ = entry.tx.send(rpc_reply);
-        let mut resolved = entry.meta;
-        resolved.status = if approved {
-            "resolved".to_string()
+            let _ = entry.tx.send(rpc_reply);
+            let mut resolved = entry.meta;
+            resolved.status = if approved {
+                "resolved".to_string()
+            } else {
+                "rejected".to_string()
+            };
+            Ok(resolved)
+        } else if let Some(mut meta) = persisted_meta {
+            meta.status = if approved {
+                "resolved".to_string()
+            } else {
+                "rejected".to_string()
+            };
+            Ok(meta)
         } else {
-            "rejected".to_string()
-        };
-        Ok(resolved)
+            Err(format!(
+                "Pending upstream callback '{}' not found",
+                callback_id
+            ))
+        }
     }
 
     /// Evaluates policy and handles an upstream server-initiated JSON-RPC request
@@ -212,6 +242,9 @@ impl UpstreamCallbackHub {
                         tx,
                     },
                 );
+                if let Some(ref reg) = *self.registry.read().unwrap() {
+                    reg.save_upstream_callback(&meta);
+                }
 
                 if let Some(ref sink) = *self.callback_event_sink.read().unwrap() {
                     sink(event_kind, &meta);
@@ -222,6 +255,9 @@ impl UpstreamCallbackHub {
                     Ok(reply) => reply,
                     Err(RecvTimeoutError::Timeout) => {
                         self.pending.write().unwrap().remove(&callback_id);
+                        if let Some(ref reg) = *self.registry.read().unwrap() {
+                            let _ = reg.delete_upstream_callback(&callback_id);
+                        }
                         json!({
                             "jsonrpc": "2.0",
                             "id": upstream_req_id,
@@ -236,6 +272,9 @@ impl UpstreamCallbackHub {
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         self.pending.write().unwrap().remove(&callback_id);
+                        if let Some(ref reg) = *self.registry.read().unwrap() {
+                            let _ = reg.delete_upstream_callback(&callback_id);
+                        }
                         json!({
                             "jsonrpc": "2.0",
                             "id": upstream_req_id,
@@ -254,6 +293,7 @@ impl UpstreamCallbackHub {
 pub struct UpstreamManager {
     pub config: Arc<OmniConfig>,
     pub callback_hub: Arc<UpstreamCallbackHub>,
+    registry: RwLock<Option<crate::control_plane::MCPRegistry>>,
     stdio_sessions: RwLock<HashMap<String, Arc<StdioUpstreamSession>>>,
     http_sessions: RwLock<HashMap<String, Arc<HttpUpstreamSession>>>,
     rediscovery_in_flight: Mutex<HashSet<String>>,
@@ -264,10 +304,16 @@ impl UpstreamManager {
         Self {
             config,
             callback_hub: Arc::new(UpstreamCallbackHub::new()),
+            registry: RwLock::new(None),
             stdio_sessions: RwLock::new(HashMap::new()),
             http_sessions: RwLock::new(HashMap::new()),
             rediscovery_in_flight: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub fn set_registry(&self, registry: crate::control_plane::MCPRegistry) {
+        self.callback_hub.set_registry(registry.clone());
+        *self.registry.write().unwrap() = Some(registry);
     }
 
     /// Propagates downstream `notifications/cancelled` (`requestId`) to an upstream session
@@ -396,7 +442,8 @@ impl UpstreamManager {
                     .with_bidirectional_hub(
                         self.callback_hub.clone(),
                         server.sampling_elicitation_policy.clone(),
-                    ),
+                    )
+                    .with_registry(self.registry.read().unwrap().clone()),
                 );
 
                 let mut w_guard = self.http_sessions.write().unwrap();

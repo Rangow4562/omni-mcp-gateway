@@ -12,6 +12,8 @@ import { CodeModeStudio } from './components/CodeModeStudio';
 import { ApprovalInboxModal } from './components/ApprovalInboxModal';
 import { ObservabilityStudio } from './components/ObservabilityStudio';
 import { ImportConfigModal } from './components/ImportConfigModal';
+import { SkillsStudioModal } from './components/SkillsStudioModal';
+import { TasksMonitorModal } from './components/TasksMonitorModal';
 import {
   ServerSummary,
   ServerDetail,
@@ -19,7 +21,7 @@ import {
   PlatformStats,
   ToolItem,
 } from './types';
-import { apiFetch, ApiError, getToken, listSuspendedFrames, listPendingCallbacks } from './api';
+import { apiFetch, ApiError, getToken, listSuspendedFrames, listPendingCallbacks, fetchTasks } from './api';
 
 export const App: React.FC = () => {
   const [servers, setServers] = useState<ServerSummary[]>([]);
@@ -39,6 +41,8 @@ export const App: React.FC = () => {
   const [isApprovalInboxOpen, setIsApprovalInboxOpen] = useState(false);
   const [isObservabilityOpen, setIsObservabilityOpen] = useState(false);
   const [isImportConfigOpen, setIsImportConfigOpen] = useState(false);
+  const [isSkillsStudioOpen, setIsSkillsStudioOpen] = useState(false);
+  const [isTasksMonitorOpen, setIsTasksMonitorOpen] = useState(false);
   const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
   const [sseRevision, setSseRevision] = useState(0);
   const [sseConnected, setSseConnected] = useState(false);
@@ -110,11 +114,16 @@ export const App: React.FC = () => {
 
   const fetchPendingApprovals = useCallback(async () => {
     try {
-      const [frames, cbs] = await Promise.all([
+      const [frames, cbs, tasks] = await Promise.all([
         listSuspendedFrames().catch(() => []),
         listPendingCallbacks().catch(() => []),
+        fetchTasks().catch(() => []),
       ]);
-      setPendingApprovalCount(frames.length + cbs.length);
+      const frameIds = new Set(frames.map((f) => f.execution_id));
+      const extraInputTasks = tasks.filter(
+        (t: any) => t.status === 'input_required' && !frameIds.has(t.task_id)
+      );
+      setPendingApprovalCount(frames.length + cbs.length + extraInputTasks.length);
     } catch {
       // Non-approver tokens ignore silently
     }
@@ -167,6 +176,8 @@ export const App: React.FC = () => {
               frame.includes('event: codemode.') ||
               frame.includes('event: mcp.approval_required') ||
               frame.includes('event: mcp.callback_resolved') ||
+              frame.includes('event: mcp.task.') ||
+              frame.includes('event: skills.') ||
               frame.includes('event: registry.')
             ) {
               setSseRevision((r) => r + 1);
@@ -299,6 +310,8 @@ export const App: React.FC = () => {
         onOpenApprovalInbox={() => setIsApprovalInboxOpen(true)}
         onOpenObservability={() => setIsObservabilityOpen(true)}
         onOpenImportConfig={() => setIsImportConfigOpen(true)}
+        onOpenSkillsStudio={() => setIsSkillsStudioOpen(true)}
+        onOpenTasksMonitor={() => setIsTasksMonitorOpen(true)}
         sseConnected={sseConnected}
         pendingDiffCount={diffs.length}
         pendingApprovalCount={pendingApprovalCount}
@@ -400,6 +413,18 @@ export const App: React.FC = () => {
         isOpen={isImportConfigOpen}
         onClose={() => setIsImportConfigOpen(false)}
         onImported={refreshAll}
+      />
+
+      <SkillsStudioModal
+        isOpen={isSkillsStudioOpen}
+        onClose={() => setIsSkillsStudioOpen(false)}
+        sseRevision={sseRevision}
+      />
+
+      <TasksMonitorModal
+        isOpen={isTasksMonitorOpen}
+        onClose={() => setIsTasksMonitorOpen(false)}
+        sseRevision={sseRevision}
       />
 
       {inspectServerTarget && (

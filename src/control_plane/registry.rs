@@ -5,8 +5,9 @@ use crate::data_plane::codemode::CodeModeTypeGenerator;
 use crate::json::JsonValue;
 use crate::logging::now_epoch_secs;
 use crate::models::{
-    ChangeOrigin, ConfigDiff, HistoryEntry, ProtocolType, SchemaSource, ServerRecord,
-    SuspendedExecutionFrame, ToolGroupRecord, ToolRecord, ToolStatus,
+    ChangeOrigin, ConfigDiff, FileBlobRecord, HistoryEntry, McpTaskRecord, McpTaskStatus,
+    OAuthFlowRecord, OAuthTokenRecord, PendingUpstreamCallback, ProtocolType, SchemaSource,
+    ServerRecord, SkillRecord, SuspendedExecutionFrame, ToolGroupRecord, ToolRecord, ToolStatus,
 };
 use crate::storage::{RegistryStorageBackend, WalRegistryStore};
 use std::collections::{BTreeMap, HashMap};
@@ -59,6 +60,12 @@ struct RegistryInner {
     diffs: BTreeMap<String, ConfigDiff>,
     suspended_frames: BTreeMap<String, SuspendedExecutionFrame>,
     tool_groups: BTreeMap<String, ToolGroupRecord>,
+    skills: BTreeMap<String, SkillRecord>,
+    mcp_tasks: BTreeMap<String, McpTaskRecord>,
+    oauth_flows: BTreeMap<String, OAuthFlowRecord>,
+    oauth_tokens: BTreeMap<String, OAuthTokenRecord>,
+    upstream_callbacks: BTreeMap<String, PendingUpstreamCallback>,
+    file_blobs: BTreeMap<String, FileBlobRecord>,
     version_history: HashMap<String, Vec<JsonValue>>,
 }
 
@@ -66,6 +73,7 @@ struct RegistryInner {
 pub struct MCPRegistry {
     inner: Arc<RwLock<RegistryInner>>,
     store: Option<Arc<dyn RegistryStorageBackend>>,
+    reload_counter: Arc<AtomicU64>,
 }
 
 impl Default for MCPRegistry {
@@ -90,6 +98,12 @@ impl MCPRegistry {
         let mut diffs = BTreeMap::new();
         let mut suspended_frames = BTreeMap::new();
         let mut tool_groups = BTreeMap::new();
+        let mut skills = BTreeMap::new();
+        let mut mcp_tasks = BTreeMap::new();
+        let oauth_flows = BTreeMap::new();
+        let oauth_tokens = BTreeMap::new();
+        let mut upstream_callbacks = BTreeMap::new();
+        let file_blobs = BTreeMap::new();
         let mut version_history: HashMap<String, Vec<JsonValue>> = HashMap::new();
 
         if let Some(store) = &backend {
@@ -107,6 +121,15 @@ impl MCPRegistry {
             for g in store.load_all_tool_groups() {
                 tool_groups.insert(g.slug.clone(), g);
             }
+            for sk in store.load_all_skills() {
+                skills.insert(sk.slug.clone(), sk);
+            }
+            for tk in store.load_all_mcp_tasks() {
+                mcp_tasks.insert(tk.task_id.clone(), tk);
+            }
+            for cb in store.load_all_upstream_callbacks() {
+                upstream_callbacks.insert(cb.callback_id.clone(), cb);
+            }
         }
 
         Self {
@@ -115,15 +138,31 @@ impl MCPRegistry {
                 diffs,
                 suspended_frames,
                 tool_groups,
+                skills,
+                mcp_tasks,
+                oauth_flows,
+                oauth_tokens,
+                upstream_callbacks,
+                file_blobs,
                 version_history,
             })),
             store: backend,
+            reload_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Reloads servers, diffs, suspended frames, and tool groups from the backing
-    /// distributed storage engine (invoked on PostgreSQL `LISTEN/NOTIFY` invalidation).
+    pub fn backend(&self) -> Option<Arc<dyn RegistryStorageBackend>> {
+        self.store.clone()
+    }
+
+    pub fn reload_count(&self) -> u64 {
+        self.reload_counter.load(Ordering::Relaxed)
+    }
+
+    /// Reloads servers, diffs, suspended frames, tool groups, and skills from the backing
+    /// distributed storage engine (invoked on PostgreSQL `LISTEN omni_registry_changed`).
     pub fn reload_from_backend(&self) {
+        self.reload_counter.fetch_add(1, Ordering::Relaxed);
         let Some(store) = &self.store else {
             return;
         };
@@ -131,6 +170,7 @@ impl MCPRegistry {
         let loaded_diffs = store.load_all_diffs();
         let loaded_frames = store.load_all_suspended_frames();
         let loaded_groups = store.load_all_tool_groups();
+        let loaded_skills = store.load_all_skills();
         let mut guard = self.inner.write().unwrap();
         guard.servers.clear();
         for s in loaded_servers {
@@ -147,6 +187,10 @@ impl MCPRegistry {
         guard.tool_groups.clear();
         for g in loaded_groups {
             guard.tool_groups.insert(g.slug.clone(), g);
+        }
+        guard.skills.clear();
+        for sk in loaded_skills {
+            guard.skills.insert(sk.slug.clone(), sk);
         }
     }
 
@@ -1094,6 +1138,279 @@ impl MCPRegistry {
             let _ = store.delete_tool_group(slug);
         }
         removed
+    }
+
+    // --- v6.8.0 Skills over MCP ---
+
+    pub fn save_skill(&self, mut skill: SkillRecord) -> Result<SkillRecord, String> {
+        skill.validate()?;
+        {
+            let mut guard = self.inner.write().unwrap();
+            guard.skills.insert(skill.slug.clone(), skill.clone());
+        }
+        if let Some(store) = &self.store {
+            store.save_skill(&skill);
+        }
+        Ok(skill)
+    }
+
+    pub fn get_skill(&self, slug: &str) -> Option<SkillRecord> {
+        let guard = self.inner.read().unwrap();
+        guard.skills.get(slug).cloned()
+    }
+
+    pub fn list_skills(&self) -> Vec<SkillRecord> {
+        let guard = self.inner.read().unwrap();
+        guard.skills.values().cloned().collect()
+    }
+
+    pub fn delete_skill(&self, slug: &str) -> Option<SkillRecord> {
+        let removed = {
+            let mut guard = self.inner.write().unwrap();
+            guard.skills.remove(slug)
+        };
+        if let Some(store) = &self.store {
+            let _ = store.delete_skill(slug);
+        }
+        removed
+    }
+
+    // --- v6.8.0 HA MCP Tasks ---
+
+    pub fn save_mcp_task(&self, task: &McpTaskRecord) {
+        {
+            let mut guard = self.inner.write().unwrap();
+            guard.mcp_tasks.insert(task.task_id.clone(), task.clone());
+        }
+        if let Some(store) = &self.store {
+            store.save_mcp_task(task);
+        }
+    }
+
+    pub fn get_mcp_task(&self, task_id: &str) -> Option<McpTaskRecord> {
+        if let Some(store) = &self.store {
+            if let Some(t) = store.get_mcp_task(task_id) {
+                return Some(t);
+            }
+        }
+        let guard = self.inner.read().unwrap();
+        guard.mcp_tasks.get(task_id).cloned()
+    }
+
+    pub fn list_mcp_tasks(&self) -> Vec<McpTaskRecord> {
+        if let Some(store) = &self.store {
+            return store.load_all_mcp_tasks();
+        }
+        let guard = self.inner.read().unwrap();
+        guard.mcp_tasks.values().cloned().collect()
+    }
+
+    pub fn update_mcp_task_cas(
+        &self,
+        task_id: &str,
+        expected_status: McpTaskStatus,
+        updated: &McpTaskRecord,
+    ) -> Result<McpTaskRecord, String> {
+        if let Some(store) = &self.store {
+            let res = store.update_mcp_task_cas(task_id, expected_status, updated)?;
+            let mut guard = self.inner.write().unwrap();
+            guard.mcp_tasks.insert(task_id.to_string(), res.clone());
+            return Ok(res);
+        }
+        let mut guard = self.inner.write().unwrap();
+        let existing = guard
+            .mcp_tasks
+            .get(task_id)
+            .ok_or_else(|| format!("Task '{}' not found", task_id))?;
+        if existing.status != expected_status {
+            return Err(format!(
+                "Task '{}' status mismatch: expected '{}', found '{}'",
+                task_id,
+                expected_status.as_str(),
+                existing.status.as_str()
+            ));
+        }
+        guard.mcp_tasks.insert(task_id.to_string(), updated.clone());
+        Ok(updated.clone())
+    }
+
+    pub fn request_mcp_task_cancel(&self, task_id: &str) -> Option<McpTaskRecord> {
+        if let Some(store) = &self.store {
+            if let Some(t) = store.request_mcp_task_cancel(task_id) {
+                let mut guard = self.inner.write().unwrap();
+                guard.mcp_tasks.insert(task_id.to_string(), t.clone());
+                return Some(t);
+            }
+        }
+        let mut guard = self.inner.write().unwrap();
+        let mut task = guard.mcp_tasks.get(task_id)?.clone();
+        task.cancel_requested = true;
+        if !task.status.is_terminal() {
+            task.status = McpTaskStatus::Cancelled;
+            task.status_message = Some("Cancelled by client".to_string());
+        }
+        task.updated_at = now_epoch_secs();
+        guard.mcp_tasks.insert(task_id.to_string(), task.clone());
+        Some(task)
+    }
+
+    pub fn purge_expired_mcp_tasks(&self, now_epoch: f64) -> usize {
+        let mut removed = 0;
+        if let Some(store) = &self.store {
+            removed = store.purge_expired_mcp_tasks(now_epoch);
+        }
+        let mut guard = self.inner.write().unwrap();
+        let before = guard.mcp_tasks.len();
+        guard.mcp_tasks.retain(|_, t| t.expires_at > now_epoch);
+        removed.max(before.saturating_sub(guard.mcp_tasks.len()))
+    }
+
+    // --- v6.8.0 Multi-Pod HA OAuth Flows, Tokens & Upstream Callbacks ---
+
+    pub fn save_oauth_flow(&self, flow: &OAuthFlowRecord) {
+        {
+            let mut guard = self.inner.write().unwrap();
+            guard.oauth_flows.insert(flow.state.clone(), flow.clone());
+        }
+        if let Some(store) = &self.store {
+            store.save_oauth_flow(flow);
+        }
+    }
+
+    pub fn take_oauth_flow(&self, state: &str) -> Option<OAuthFlowRecord> {
+        let mem = {
+            let mut guard = self.inner.write().unwrap();
+            guard.oauth_flows.remove(state)
+        };
+        if let Some(store) = &self.store {
+            if let Some(f) = store.take_oauth_flow(state) {
+                return Some(f);
+            }
+        }
+        mem
+    }
+
+    pub fn save_oauth_token(&self, token: &OAuthTokenRecord) {
+        {
+            let mut guard = self.inner.write().unwrap();
+            guard
+                .oauth_tokens
+                .insert(token.server_name.clone(), token.clone());
+        }
+        if let Some(store) = &self.store {
+            store.save_oauth_token(token);
+        }
+    }
+
+    pub fn get_oauth_token(&self, server_name: &str) -> Option<OAuthTokenRecord> {
+        if let Some(store) = &self.store {
+            if let Some(t) = store.get_oauth_token(server_name) {
+                return Some(t);
+            }
+        }
+        let guard = self.inner.read().unwrap();
+        guard.oauth_tokens.get(server_name).cloned()
+    }
+
+    pub fn delete_oauth_token(&self, server_name: &str) -> Option<OAuthTokenRecord> {
+        let mem = {
+            let mut guard = self.inner.write().unwrap();
+            guard.oauth_tokens.remove(server_name)
+        };
+        if let Some(store) = &self.store {
+            if let Some(t) = store.delete_oauth_token(server_name) {
+                return Some(t);
+            }
+        }
+        mem
+    }
+
+    pub fn save_upstream_callback(&self, cb: &PendingUpstreamCallback) {
+        {
+            let mut guard = self.inner.write().unwrap();
+            guard
+                .upstream_callbacks
+                .insert(cb.callback_id.clone(), cb.clone());
+        }
+        if let Some(store) = &self.store {
+            store.save_upstream_callback(cb);
+        }
+    }
+
+    pub fn list_upstream_callbacks(&self) -> Vec<PendingUpstreamCallback> {
+        if let Some(store) = &self.store {
+            return store.load_all_upstream_callbacks();
+        }
+        let guard = self.inner.read().unwrap();
+        guard.upstream_callbacks.values().cloned().collect()
+    }
+
+    pub fn delete_upstream_callback(&self, request_id: &str) -> Option<PendingUpstreamCallback> {
+        let mem = {
+            let mut guard = self.inner.write().unwrap();
+            guard.upstream_callbacks.remove(request_id)
+        };
+        if let Some(store) = &self.store {
+            if let Some(cb) = store.delete_upstream_callback(request_id) {
+                return Some(cb);
+            }
+        }
+        mem
+    }
+
+    // --- v6.8.0 File Blobs ---
+
+    pub fn save_file_blob(&self, blob: &FileBlobRecord) {
+        {
+            let mut guard = self.inner.write().unwrap();
+            guard.file_blobs.insert(blob.file_id.clone(), blob.clone());
+        }
+        if let Some(store) = &self.store {
+            store.save_file_blob(blob);
+        }
+    }
+
+    pub fn get_file_blob(&self, file_id: &str) -> Option<FileBlobRecord> {
+        if let Some(store) = &self.store {
+            if let Some(b) = store.get_file_blob(file_id) {
+                return Some(b);
+            }
+        }
+        let guard = self.inner.read().unwrap();
+        guard.file_blobs.get(file_id).cloned()
+    }
+
+    pub fn delete_file_blob(&self, file_id: &str) -> Option<FileBlobRecord> {
+        let mem = {
+            let mut guard = self.inner.write().unwrap();
+            guard.file_blobs.remove(file_id)
+        };
+        if let Some(store) = &self.store {
+            if let Some(b) = store.delete_file_blob(file_id) {
+                return Some(b);
+            }
+        }
+        mem
+    }
+
+    pub fn purge_expired_file_blobs(&self, now_epoch: f64) -> Vec<FileBlobRecord> {
+        let mut removed = Vec::new();
+        if let Some(store) = &self.store {
+            removed = store.purge_expired_file_blobs(now_epoch);
+        }
+        let mut guard = self.inner.write().unwrap();
+        let mem_expired: Vec<FileBlobRecord> = guard
+            .file_blobs
+            .values()
+            .filter(|b| b.expires_at <= now_epoch)
+            .cloned()
+            .collect();
+        guard.file_blobs.retain(|_, b| b.expires_at > now_epoch);
+        if removed.is_empty() {
+            mem_expired
+        } else {
+            removed
+        }
     }
 
     fn snapshot_server(server: &ServerRecord) -> JsonValue {

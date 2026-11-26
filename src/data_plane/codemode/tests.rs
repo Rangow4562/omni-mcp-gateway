@@ -17,6 +17,7 @@ fn run_noop_script(code: &str, limits: SandboxLimits) -> CodeOutput {
         invoke_parallel_batch: &mut parallel_cb,
         search_catalog: &search_cb,
         describe_types: &describe_cb,
+        cancel_flag: None,
     };
     CodeModeExecutor::new(limits).execute(
         code,
@@ -171,6 +172,7 @@ fn test_suspended_execution_frame_serialize_and_resume_identity() {
             invoke_parallel_batch: &mut parallel_cb,
             search_catalog: &search_cb,
             describe_types: &describe_cb,
+            cancel_flag: None,
         };
         executor.execute(
             script,
@@ -203,6 +205,7 @@ fn test_suspended_execution_frame_serialize_and_resume_identity() {
             invoke_parallel_batch: &mut parallel_cb,
             search_catalog: &search_cb,
             describe_types: &describe_cb,
+            cancel_flag: None,
         };
         executor.resume_frame(
             &restored_frame,
@@ -338,6 +341,7 @@ fn test_sandbox_panic_containment_does_not_abort_process() {
         invoke_parallel_batch: &mut parallel_cb,
         search_catalog: &search_cb,
         describe_types: &describe_cb,
+        cancel_flag: None,
     };
     let script = r#"
         async () => {
@@ -479,6 +483,7 @@ fn test_codemode_v2_typegen_and_vm_features() {
         invoke_parallel_batch: &mut batch,
         search_catalog: &search,
         describe_types: &desc,
+        cancel_flag: None,
     };
     let exec = CodeModeExecutor::new(SandboxLimits::default());
     let code = r#"

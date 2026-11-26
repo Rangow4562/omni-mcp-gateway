@@ -389,6 +389,121 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
     let subcmd = args[1].as_str();
 
     match subcmd {
+        "skills" => {
+            let action = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+            let engine = crate::control_plane::SkillEngine::new(cli.registry.clone());
+            match action {
+                "list" => {
+                    let mut group_slug: Option<String> = None;
+                    let mut i = 3;
+                    while i < args.len() {
+                        if args[i] == "--group" && i + 1 < args.len() {
+                            group_slug = Some(args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    let scope = crate::control_plane::SkillAccessScope {
+                        group_slug,
+                        server_scope: None,
+                    };
+                    let skills = engine.list_skills(&scope);
+                    let arr: Vec<JsonValue> = skills
+                        .iter()
+                        .map(crate::control_plane::SkillEngine::to_mcp_summary)
+                        .collect();
+                    println!("{}", JsonValue::Array(arr).to_string_pretty());
+                    0
+                }
+                "publish" => {
+                    if args.len() < 4 {
+                        eprintln!(
+                            "Usage: omni skills publish <dir> [--group <slug>] [--slug <slug>]"
+                        );
+                        return 1;
+                    }
+                    let dir = std::path::Path::new(&args[3]);
+                    let mut group_slug: Option<String> = None;
+                    let mut slug_override: Option<String> = None;
+                    let mut i = 4;
+                    while i < args.len() {
+                        if args[i] == "--group" && i + 1 < args.len() {
+                            group_slug = Some(args[i + 1].clone());
+                            i += 2;
+                        } else if args[i] == "--slug" && i + 1 < args.len() {
+                            slug_override = Some(args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    match engine.publish_from_dir(dir, slug_override.as_deref(), group_slug, None) {
+                        Ok(saved) => {
+                            println!(
+                                "Published skill '{}' (version={}, files={}, sha256={})",
+                                saved.slug,
+                                saved.version,
+                                saved.files.len(),
+                                saved.manifest_sha256
+                            );
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to publish skill: {}", e);
+                            1
+                        }
+                    }
+                }
+                "verify" => {
+                    if args.len() < 4 {
+                        eprintln!("Usage: omni skills verify <slug>");
+                        return 1;
+                    }
+                    let slug = &args[3];
+                    let scope = crate::control_plane::SkillAccessScope::default();
+                    match engine.get_skill(slug, &scope) {
+                        Some(mut sk) => {
+                            let stored_sha = sk.manifest_sha256.clone();
+                            match sk.validate() {
+                                Ok(()) if sk.manifest_sha256 == stored_sha => {
+                                    println!(
+                                        "VERIFIED skill '{}' (files={}, total_bytes={}, manifest_sha256={})",
+                                        sk.slug,
+                                        sk.files.len(),
+                                        sk.total_bytes(),
+                                        sk.manifest_sha256
+                                    );
+                                    0
+                                }
+                                Ok(()) => {
+                                    eprintln!(
+                                        "MANIFEST DRIFT for '{}': stored={} recomputed={}",
+                                        sk.slug, stored_sha, sk.manifest_sha256
+                                    );
+                                    1
+                                }
+                                Err(e) => {
+                                    eprintln!("INVALID skill '{}': {}", slug, e);
+                                    1
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!("Skill '{}' not found", slug);
+                            1
+                        }
+                    }
+                }
+                other => {
+                    eprintln!(
+                        "Unknown skills subcommand '{}'. Use: list | publish <dir> | verify <slug>",
+                        other
+                    );
+                    1
+                }
+            }
+        }
         "list" => {
             let mut format_type = "table";
             let mut i = 2;
@@ -794,6 +909,7 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             }
         }
         "migrate" => {
+            let to_v6_8 = args.iter().any(|a| a == "--to-v6.8" || a == "--to-v6.8.0");
             let to_v6_5 = args.iter().any(|a| a == "--to-v6.5");
             let to_v6 = args.iter().any(|a| a == "--to-v6");
             let dry_run = args.iter().any(|a| a == "--dry-run");
@@ -814,7 +930,9 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             }
             println!(
                 "Omni MCP {} State Migration Utility (v{}) {}",
-                if to_v6_5 {
+                if to_v6_8 {
+                    "-> v6.8"
+                } else if to_v6_5 {
                     "-> v6.5"
                 } else if to_v6 {
                     "v5 -> v6"
@@ -828,7 +946,23 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             let cfg = crate::config::get_config();
             println!("[*] Data directory: {}", cfg.data_dir);
             println!("[*] Validating schema version and Merkle audit log continuity...");
-            if to_v6_5 {
+            if to_v6_8 {
+                let mig = migrate_to_v6_8(&cfg.data_dir, &target_backend, &database_url, dry_run);
+                println!(
+                    "[+] v6.8.0 migration ({}): {} ({} servers, {} tool groups)",
+                    target_backend, mig.summary, mig.servers_migrated, mig.tool_groups_count
+                );
+                println!(
+                    "[+] Audit chain integrity: {} ({} records)",
+                    if mig.audit_verified { "OK" } else { "FAILED" },
+                    mig.audit_records
+                );
+                if mig.ok {
+                    0
+                } else {
+                    1
+                }
+            } else if to_v6_5 {
                 let mig = migrate_to_v6_5(&cfg.data_dir, &target_backend, &database_url, dry_run);
                 println!(
                     "[+] v6.5 migration ({}): {} ({} servers, {} tool groups)",
@@ -1180,6 +1314,386 @@ fn compute_migration_checksum(
     crate::storage::sha256_hex(keys.join("|").as_bytes())
 }
 
+/// Migrates all v6.8.0 collections (`servers`, `diffs`, `groups`, `frames`, `skills`,
+/// `mcp_tasks`, `oauth_flows`, `oauth_tokens`, `upstream_callbacks`, `file_blobs` + chunks,
+/// plus Merkle audit log records) from WAL or SQLite into SQLite or PostgreSQL with SHA-256
+/// checksum verification across all collections.
+pub fn migrate_to_v6_8(
+    data_dir: &str,
+    target_backend: &str,
+    database_url: &str,
+    dry_run: bool,
+) -> MigrationReport {
+    use crate::storage::RegistryStorageBackend;
+
+    let wal_path = std::path::Path::new(data_dir).join("omni_registry.db");
+    let legacy_wal = std::path::Path::new(data_dir).join("registry.db");
+    let sqlite_src = std::path::Path::new(data_dir).join("omni_registry.sqlite");
+
+    #[allow(unused_mut)]
+    let (
+        mut servers,
+        mut diffs,
+        mut groups,
+        mut frames,
+        mut skills,
+        mut mcp_tasks,
+        mut oauth_flows,
+        mut oauth_tokens,
+        mut upstream_callbacks,
+        mut file_blobs,
+        mut file_blob_chunks,
+    ) = if wal_path.exists() || legacy_wal.exists() {
+        let src_path = if wal_path.exists() {
+            wal_path
+        } else {
+            legacy_wal
+        };
+        let src_store =
+            crate::storage::WalRegistryStore::new(src_path.to_string_lossy().to_string());
+        let s = src_store.load_all_servers();
+        let d = src_store.load_all_diffs();
+        let g = src_store.load_all_tool_groups();
+        let f = src_store.load_all_suspended_frames();
+        let sk = src_store.load_all_skills();
+        let mt = src_store.load_all_mcp_tasks();
+        let of = src_store.load_all_oauth_flows();
+        let ot = src_store.load_all_oauth_tokens();
+        let uc = src_store.load_all_upstream_callbacks();
+        let fb = src_store.load_all_file_blobs();
+        let mut chunks_map = Vec::new();
+        for blob in &fb {
+            if let Ok(chunks) = src_store.load_file_blob_chunks(&blob.storage_key) {
+                if !chunks.is_empty() {
+                    chunks_map.push((blob.storage_key.clone(), chunks));
+                }
+            }
+        }
+        src_store.close();
+        (s, d, g, f, sk, mt, of, ot, uc, fb, chunks_map)
+    } else {
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+
+    #[cfg(feature = "storage-sqlite")]
+    if servers.is_empty()
+        && groups.is_empty()
+        && skills.is_empty()
+        && mcp_tasks.is_empty()
+        && sqlite_src.exists()
+    {
+        if let Ok(sq) =
+            crate::storage::SqliteRegistryBackend::try_open(sqlite_src.to_string_lossy().as_ref())
+        {
+            servers = sq.load_all_servers();
+            diffs = sq.load_all_diffs();
+            groups = sq.load_all_tool_groups();
+            frames = sq.load_all_suspended_frames();
+            skills = sq.load_all_skills();
+            mcp_tasks = sq.load_all_mcp_tasks();
+            oauth_flows = sq.load_all_oauth_flows();
+            oauth_tokens = sq.load_all_oauth_tokens();
+            upstream_callbacks = sq.load_all_upstream_callbacks();
+            file_blobs = sq.load_all_file_blobs();
+            for blob in &file_blobs {
+                if let Ok(chunks) = sq.load_file_blob_chunks(&blob.storage_key) {
+                    if !chunks.is_empty() {
+                        file_blob_chunks.push((blob.storage_key.clone(), chunks));
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "storage-sqlite"))]
+    let _ = &sqlite_src;
+
+    let src_digest = compute_migration_checksum_v6_8(
+        &servers,
+        &groups,
+        &diffs,
+        &frames,
+        &skills,
+        &mcp_tasks,
+        &oauth_flows,
+        &oauth_tokens,
+        &upstream_callbacks,
+        &file_blobs,
+    );
+    let audit_path = std::path::Path::new(data_dir).join("omni_audit.log");
+    let audit_store =
+        crate::storage::MerkleAuditStore::new(Some(audit_path.to_string_lossy().to_string()));
+    let (audit_verified, audit_records) = audit_store.verify_chain();
+    let audit_entries = audit_store.list_records(None);
+
+    if dry_run {
+        return MigrationReport {
+            ok: audit_verified,
+            servers_migrated: servers.len(),
+            tool_groups_count: groups.len(),
+            audit_verified,
+            audit_records,
+            summary: format!(
+                "dry-run verified v6.8 migration to '{}' (checksum {}; {} skills, {} tasks, {} oauth_flows, {} oauth_tokens, {} callbacks, {} file_blobs)",
+                target_backend,
+                &src_digest[..12],
+                skills.len(),
+                mcp_tasks.len(),
+                oauth_flows.len(),
+                oauth_tokens.len(),
+                upstream_callbacks.len(),
+                file_blobs.len(),
+            ),
+        };
+    }
+
+    type MigDest = (
+        Box<dyn crate::storage::RegistryStorageBackend>,
+        Option<Box<dyn crate::storage::AuditSink>>,
+    );
+    let backend_res: Result<MigDest, String> = match target_backend.to_ascii_lowercase().as_str() {
+        "sqlite" => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let dsn = if !database_url.trim().is_empty() {
+                    database_url.to_string()
+                } else {
+                    std::path::Path::new(data_dir)
+                        .join("omni_registry.sqlite")
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                crate::storage::SqliteRegistryBackend::try_open(dsn.clone()).map(|b| {
+                    let sink_res = crate::storage::SqliteRegistryBackend::try_open(dsn);
+                    let sink = sink_res
+                        .ok()
+                        .map(|s| Box::new(s) as Box<dyn crate::storage::AuditSink>);
+                    (
+                        Box::new(b) as Box<dyn crate::storage::RegistryStorageBackend>,
+                        sink,
+                    )
+                })
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = database_url;
+                Err("SQLite migration requires the 'storage-sqlite' feature".to_string())
+            }
+        }
+        "postgres" | "postgresql" => {
+            #[cfg(feature = "storage-postgres")]
+            {
+                let dsn = if !database_url.trim().is_empty() {
+                    database_url.to_string()
+                } else {
+                    return MigrationReport {
+                        ok: false,
+                        servers_migrated: 0,
+                        tool_groups_count: 0,
+                        audit_verified,
+                        audit_records,
+                        summary:
+                            "PostgreSQL migration requires --database-url or OMNI_DATABASE_URL"
+                                .to_string(),
+                    };
+                };
+                crate::storage::PostgresRegistryBackend::connect(dsn.clone()).map(|b| {
+                    let sink = crate::storage::PostgresRegistryBackend::connect(dsn)
+                        .ok()
+                        .map(|s| Box::new(s) as Box<dyn crate::storage::AuditSink>);
+                    (
+                        Box::new(b) as Box<dyn crate::storage::RegistryStorageBackend>,
+                        sink,
+                    )
+                })
+            }
+            #[cfg(not(feature = "storage-postgres"))]
+            {
+                let _ = database_url;
+                Err("PostgreSQL migration requires the 'storage-postgres' feature".to_string())
+            }
+        }
+        other => Err(format!("Unsupported migration target '{}'", other)),
+    };
+
+    match backend_res {
+        Ok((dst, audit_sink_opt)) => {
+            for s in &servers {
+                dst.save_server(s);
+            }
+            for d in &diffs {
+                dst.save_diff(d);
+            }
+            for g in &groups {
+                dst.save_tool_group(g);
+            }
+            for f in &frames {
+                dst.save_suspended_frame(f);
+            }
+            for sk in &skills {
+                dst.save_skill(sk);
+            }
+            for mt in &mcp_tasks {
+                dst.save_mcp_task(mt);
+            }
+            for of in &oauth_flows {
+                dst.save_oauth_flow(of);
+            }
+            for ot in &oauth_tokens {
+                dst.save_oauth_token(ot);
+            }
+            for uc in &upstream_callbacks {
+                dst.save_upstream_callback(uc);
+            }
+            for fb in &file_blobs {
+                dst.save_file_blob(fb);
+            }
+            for (storage_key, chunks) in &file_blob_chunks {
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    let _ = dst.save_file_blob_chunk(storage_key, idx as u32, chunk);
+                }
+            }
+
+            let mut sink_ok = true;
+            if let Some(sink) = audit_sink_opt {
+                for rec in &audit_entries {
+                    if sink.emit_record(rec).is_err() {
+                        sink_ok = false;
+                        break;
+                    }
+                }
+                if sink_ok && !audit_entries.is_empty() {
+                    let (v, _) = sink.verify_integrity();
+                    sink_ok = v;
+                }
+            }
+
+            let verify_servers = dst.load_all_servers();
+            let verify_groups = dst.load_all_tool_groups();
+            let verify_diffs = dst.load_all_diffs();
+            let verify_frames = dst.load_all_suspended_frames();
+            let verify_skills = dst.load_all_skills();
+            let verify_tasks = dst.load_all_mcp_tasks();
+            let verify_flows = dst.load_all_oauth_flows();
+            let verify_tokens = dst.load_all_oauth_tokens();
+            let verify_callbacks = dst.load_all_upstream_callbacks();
+            let verify_blobs = dst.load_all_file_blobs();
+
+            let dst_digest = compute_migration_checksum_v6_8(
+                &verify_servers,
+                &verify_groups,
+                &verify_diffs,
+                &verify_frames,
+                &verify_skills,
+                &verify_tasks,
+                &verify_flows,
+                &verify_tokens,
+                &verify_callbacks,
+                &verify_blobs,
+            );
+            let checksum_ok = src_digest == dst_digest;
+            MigrationReport {
+                ok: audit_verified && sink_ok && checksum_ok,
+                servers_migrated: servers.len(),
+                tool_groups_count: groups.len(),
+                audit_verified: audit_verified && sink_ok,
+                audit_records,
+                summary: if checksum_ok && sink_ok {
+                    format!(
+                        "migrated v6.8 state to '{}' with verified SHA-256 checksum {} ({} skills, {} tasks, {} oauth_flows, {} oauth_tokens, {} callbacks, {} file_blobs)",
+                        target_backend,
+                        &dst_digest[..12],
+                        skills.len(),
+                        mcp_tasks.len(),
+                        oauth_flows.len(),
+                        oauth_tokens.len(),
+                        upstream_callbacks.len(),
+                        file_blobs.len(),
+                    )
+                } else if !sink_ok {
+                    "audit log sink verification failed after v6.8 migration".to_string()
+                } else {
+                    format!(
+                        "v6.8 checksum mismatch after migration (src {} != dst {})",
+                        &src_digest[..12],
+                        &dst_digest[..12]
+                    )
+                },
+            }
+        }
+        Err(e) => MigrationReport {
+            ok: false,
+            servers_migrated: 0,
+            tool_groups_count: 0,
+            audit_verified,
+            audit_records,
+            summary: e,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_migration_checksum_v6_8(
+    servers: &[crate::models::ServerRecord],
+    groups: &[crate::models::ToolGroupRecord],
+    diffs: &[crate::models::ConfigDiff],
+    frames: &[crate::models::SuspendedExecutionFrame],
+    skills: &[crate::models::SkillRecord],
+    mcp_tasks: &[crate::models::McpTaskRecord],
+    oauth_flows: &[crate::models::OAuthFlowRecord],
+    oauth_tokens: &[crate::models::OAuthTokenRecord],
+    upstream_callbacks: &[crate::models::PendingUpstreamCallback],
+    file_blobs: &[crate::models::FileBlobRecord],
+) -> String {
+    let mut keys: Vec<String> = servers
+        .iter()
+        .map(|s| format!("srv:{}:{}:{}", s.name, s.version, s.tools.len()))
+        .collect();
+    for g in groups {
+        keys.push(format!("grp:{}:{}", g.slug, g.entries.len()));
+    }
+    for d in diffs {
+        keys.push(format!("diff:{}:{}", d.diff_id, d.approved));
+    }
+    for f in frames {
+        keys.push(format!(
+            "frame:{}:{}",
+            f.execution_id, f.pending_arguments_hash
+        ));
+    }
+    for sk in skills {
+        keys.push(format!("skill:{}:{}", sk.slug, sk.manifest_sha256));
+    }
+    for mt in mcp_tasks {
+        keys.push(format!("task:{}:{}", mt.task_id, mt.status.as_str()));
+    }
+    for of in oauth_flows {
+        keys.push(format!("flow:{}:{}", of.state, of.server_name));
+    }
+    for ot in oauth_tokens {
+        keys.push(format!("tok:{}:{}", ot.server_name, ot.updated_at));
+    }
+    for uc in upstream_callbacks {
+        keys.push(format!("cb:{}:{}", uc.callback_id, uc.server_name));
+    }
+    for fb in file_blobs {
+        keys.push(format!("blob:{}:{}", fb.file_id, fb.sha256));
+    }
+    keys.sort();
+    crate::storage::sha256_hex(keys.join("|").as_bytes())
+}
+
 fn encode_std_base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1356,7 +1870,7 @@ fn print_help() {
             "  omni bench-codemode [--iterations <N>]\n",
             "  omni import <path/to/mcp.json>\n",
             "  omni wasm register <server> <tool> <path.wasm> [--description <text>]\n",
-            "  omni migrate [--to-v6 | --to-v6.5 --target sqlite|postgres --database-url <dsn>]\n\n",
+            "  omni migrate [--to-v6 | --to-v6.5 | --to-v6.8 --target sqlite|postgres --database-url <dsn>]\n\n",
             "NOTE: Commands can be prefixed with 'aifx', 'omni', or 'mcp' interchangeably."
         )
     );

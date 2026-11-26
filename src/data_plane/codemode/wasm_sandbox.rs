@@ -15,7 +15,7 @@ use crate::data_plane::security::PIIRedactor;
 use crate::json::JsonValue;
 use crate::models::{FeatureStatus, FUEL_EXHAUSTED, INTERNAL_ERROR, MEMORY_EXHAUSTED};
 use crate::storage::sha256_hex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -111,6 +111,21 @@ fn get_or_compile_module(wasm_bytes: &[u8]) -> Result<(Engine, Module, bool), St
 pub type WasmToolCallback =
     Arc<dyn Fn(&str, &str, &JsonValue) -> Result<JsonValue, String> + Send + Sync>;
 
+/// Host callback type for read-only byte-range file reads in Wasm Guest ABI v2 (`v6.8.0`).
+pub type WasmFileReader = Arc<dyn Fn(&str, u64, usize) -> Result<Vec<u8>, String> + Send + Sync>;
+
+/// Read-only attached file descriptor exposed to a Wasm Guest via ABI v2 (`omni::file_stat` /
+/// `omni::file_read_chunk`) with zero ambient filesystem access.
+#[derive(Clone)]
+pub struct WasmAttachedFile {
+    pub file_id: String,
+    pub size_bytes: u64,
+    pub reader: WasmFileReader,
+}
+
+/// Maximum single chunk read permitted by `omni::file_read_chunk` (256 KiB).
+pub const MAX_WASM_FILE_CHUNK_BYTES: usize = 256 * 1024;
+
 struct WasmHostState {
     logs: Vec<String>,
     total_log_bytes: usize,
@@ -119,6 +134,9 @@ struct WasmHostState {
     tool_callback: Option<WasmToolCallback>,
     tool_calls: usize,
     intermediate_bytes: usize,
+    cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    attached_files: BTreeMap<String, WasmAttachedFile>,
+    cancelled: bool,
 }
 
 impl WasmHostState {
@@ -249,6 +267,13 @@ impl WasmSandboxExecutor {
             "omni",
             "call_tool",
             |mut caller: Caller<'_, WasmHostState>, req_ptr: i32, req_len: i32| -> i64 {
+                if let Some(ref flag) = caller.data().cancel_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        caller.data_mut().cancelled = true;
+                        let _ = caller.set_fuel(0);
+                        return 0;
+                    }
+                }
                 if let Ok(rem) = caller.get_fuel() {
                     let _ = caller.set_fuel(rem.saturating_sub(500));
                 }
@@ -329,6 +354,137 @@ impl WasmSandboxExecutor {
             },
         );
 
+        // Wasm Guest ABI v2: `omni::file_stat(id_ptr, id_len) -> i64`
+        let _ = linker.func_wrap(
+            "omni",
+            "file_stat",
+            |mut caller: Caller<'_, WasmHostState>, id_ptr: i32, id_len: i32| -> i64 {
+                if let Some(ref flag) = caller.data().cancel_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        caller.data_mut().cancelled = true;
+                        let _ = caller.set_fuel(0);
+                        return -2;
+                    }
+                }
+                if let Ok(rem) = caller.get_fuel() {
+                    let _ = caller.set_fuel(rem.saturating_sub(100));
+                }
+                if id_ptr < 0 || id_len <= 0 || id_len > 256 {
+                    return -1;
+                }
+                let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    Some(m) => m,
+                    None => return -1,
+                };
+                let mem_size = mem.data_size(&caller);
+                if (id_ptr as usize)
+                    .checked_add(id_len as usize)
+                    .map_or(true, |end| end > mem_size)
+                {
+                    return -1;
+                }
+                let mut id_buf = vec![0u8; id_len as usize];
+                if mem.read(&caller, id_ptr as usize, &mut id_buf).is_err() {
+                    return -1;
+                }
+                let file_id = match std::str::from_utf8(&id_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+                caller
+                    .data()
+                    .attached_files
+                    .get(file_id)
+                    .map(|f| f.size_bytes as i64)
+                    .unwrap_or(-1)
+            },
+        );
+
+        // Wasm Guest ABI v2: `omni::file_read_chunk(id_ptr, id_len, offset, max_len, dst_ptr) -> i32`
+        let _ = linker.func_wrap(
+            "omni",
+            "file_read_chunk",
+            |mut caller: Caller<'_, WasmHostState>,
+             id_ptr: i32,
+             id_len: i32,
+             offset: i64,
+             max_len: i32,
+             dst_ptr: i32|
+             -> i32 {
+                if let Some(ref flag) = caller.data().cancel_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        caller.data_mut().cancelled = true;
+                        let _ = caller.set_fuel(0);
+                        return -2;
+                    }
+                }
+                if id_ptr < 0
+                    || id_len <= 0
+                    || id_len > 256
+                    || offset < 0
+                    || max_len < 0
+                    || dst_ptr < 0
+                {
+                    return -1;
+                }
+                let capped_len = (max_len as usize).min(MAX_WASM_FILE_CHUNK_BYTES);
+                if capped_len == 0 {
+                    return 0;
+                }
+                let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    Some(m) => m,
+                    None => return -1,
+                };
+                let mem_size = mem.data_size(&caller);
+                if (id_ptr as usize)
+                    .checked_add(id_len as usize)
+                    .map_or(true, |end| end > mem_size)
+                {
+                    return -1;
+                }
+                if (dst_ptr as usize)
+                    .checked_add(capped_len)
+                    .map_or(true, |end| end > mem_size)
+                {
+                    return -1;
+                }
+                let mut id_buf = vec![0u8; id_len as usize];
+                if mem.read(&caller, id_ptr as usize, &mut id_buf).is_err() {
+                    return -1;
+                }
+                let file_id = match std::str::from_utf8(&id_buf) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return -1,
+                };
+                let attached = match caller.data().attached_files.get(&file_id).cloned() {
+                    Some(f) => f,
+                    None => return -1,
+                };
+                let chunk = match (attached.reader)(&file_id, offset as u64, capped_len) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return -1,
+                };
+                let to_write = chunk.len().min(capped_len);
+                // Fuel-meter per KiB read (20 fuel units / KiB, min 50)
+                let fuel_cost = ((to_write.div_ceil(1024) as u64) * 20).max(50);
+                if let Ok(rem) = caller.get_fuel() {
+                    if rem < fuel_cost {
+                        let _ = caller.set_fuel(0);
+                        return -3;
+                    }
+                    let _ = caller.set_fuel(rem.saturating_sub(fuel_cost));
+                }
+                if mem
+                    .write(&mut caller, dst_ptr as usize, &chunk[..to_write])
+                    .is_err()
+                {
+                    return -1;
+                }
+                caller.data_mut().intermediate_bytes += to_write;
+                to_write as i32
+            },
+        );
+
         linker
     }
 
@@ -363,6 +519,9 @@ impl WasmSandboxExecutor {
             tool_callback: None,
             tool_calls: 0,
             intermediate_bytes: 0,
+            cancel_flag: None,
+            attached_files: BTreeMap::new(),
+            cancelled: false,
         };
         let mut store = Store::new(&engine, host_state);
         store.limiter(|s| &mut s.limits);
@@ -475,6 +634,32 @@ impl WasmSandboxExecutor {
         input_json: &JsonValue,
         tool_callback: Option<WasmToolCallback>,
     ) -> CodeOutput {
+        self.execute_wasm_abi_v2(wasm_bytes, input_json, tool_callback, Vec::new(), None)
+    }
+
+    /// Wasm Guest ABI v2 (`v6.8.0`): extends ABI v1 with read-only `attached_files`
+    /// (`omni::file_stat`, `omni::file_read_chunk`) and cooperative `cancel_flag`.
+    pub fn execute_wasm_abi_v2(
+        &self,
+        wasm_bytes: &[u8],
+        input_json: &JsonValue,
+        tool_callback: Option<WasmToolCallback>,
+        attached_files: Vec<WasmAttachedFile>,
+        cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> CodeOutput {
+        if let Some(ref flag) = cancel_flag {
+            if flag.load(Ordering::Relaxed) {
+                return Self::err_output(
+                    FeatureStatus::Error,
+                    INTERNAL_ERROR,
+                    "Cancelled: Wasm execution cancelled before start".to_string(),
+                    0,
+                    0,
+                    0,
+                    Vec::new(),
+                );
+            }
+        }
         let _depth_guard = match DepthGuard::try_enter() {
             Ok(g) => g,
             Err(e) => {
@@ -507,6 +692,10 @@ impl WasmSandboxExecutor {
         let boot_parse_us = parse_start.elapsed().as_micros() as u64;
 
         let eval_start = Instant::now();
+        let mut attached_map = BTreeMap::new();
+        for f in attached_files {
+            attached_map.insert(f.file_id.clone(), f);
+        }
         let host_state = WasmHostState {
             logs: Vec::new(),
             total_log_bytes: 0,
@@ -517,6 +706,9 @@ impl WasmSandboxExecutor {
             tool_callback,
             tool_calls: 0,
             intermediate_bytes: 0,
+            cancel_flag,
+            attached_files: attached_map,
+            cancelled: false,
         };
         let mut store = Store::new(&engine, host_state);
         store.limiter(|s| &mut s.limits);
@@ -659,7 +851,26 @@ impl WasmSandboxExecutor {
         let logs = store.data().logs.clone();
         let tool_calls = store.data().tool_calls;
         let intermediate_bytes = store.data().intermediate_bytes;
+        let was_cancelled = store.data().cancelled
+            || store
+                .data()
+                .cancel_flag
+                .as_ref()
+                .map(|f| f.load(Ordering::Relaxed))
+                .unwrap_or(false);
         let mem_bytes = memory.data_size(&store);
+
+        if was_cancelled {
+            return Self::err_output(
+                FeatureStatus::Error,
+                INTERNAL_ERROR,
+                "Cancelled: Wasm execution cancelled cooperatively".to_string(),
+                boot_parse_us,
+                eval_us,
+                ops_consumed,
+                logs,
+            );
+        }
 
         let packed = match packed_res {
             Ok(v) => v as u64,
