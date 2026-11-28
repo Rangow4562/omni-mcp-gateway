@@ -1,0 +1,14 @@
+{
+  "name": "omni-mcp",
+  "version": "6.8.5",
+  "description": "OmniMCP Gateway v6.8.5 — Universal MCP proxy, Code Mode sandbox, SEP-2640 Skills, Tasks GA, and Merkle audit trail (Standard local stdio mode).",
+  "author": {
+    "name": "Omni MCP Engineering",
+    "url": "https://github.com/Rangow4562/omni-mcp-gateway"
+  },
+  "repository": "https://github.com/Rangow4562/omni-mcp-gateway",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "gateway", "code-mode", "skills", "enterprise"],
+  "skills": "./skills",
+  "mcpServers": "./.mcp.json"
+}

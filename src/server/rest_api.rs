@@ -506,6 +506,28 @@ impl ProductionGatewayContext {
                                 "summary": "Execute sandboxed Code Mode workflow",
                                 "responses": {"200": {"description": "Execution result"}}
                             }
+                        },
+                        "/api/v1/skills": {
+                            "get": {
+                                "summary": "List curated and auto-synthesized SEP-2640 skills",
+                                "responses": {"200": {"description": "Skills catalog"}}
+                            },
+                            "post": {
+                                "summary": "Publish or update a SEP-2640 skill bundle",
+                                "responses": {"200": {"description": "Saved skill manifest"}}
+                            }
+                        },
+                        "/api/v1/plugin/manifest": {
+                            "get": {
+                                "summary": "Generate Standard or Enterprise coding-agent plugin manifest and CLI commands",
+                                "responses": {"200": {"description": "Agent plugin manifest and policy"}}
+                            }
+                        },
+                        "/api/v1/tasks": {
+                            "get": {
+                                "summary": "List durable MCP Tasks GA executions",
+                                "responses": {"200": {"description": "Active and recent MCP tasks"}}
+                            }
                         }
                     }
                 }),
@@ -552,6 +574,10 @@ impl ProductionGatewayContext {
                     .iter()
                     .map(|v| JsonValue::from(*v))
                     .collect();
+                let capabilities = crate::models::build_server_capabilities(
+                    &self.config,
+                    crate::models::CapabilityScope::Global,
+                );
                 self.json_response(
                     200,
                     json!({
@@ -560,14 +586,102 @@ impl ProductionGatewayContext {
                         "server": "omni-mcp-gateway",
                         "version": env!("CARGO_PKG_VERSION"),
                         "supported_versions": JsonValue::Array(supported),
-                        "capabilities": {
-                            "tools": {"listChanged": true},
-                            "resources": {"subscribe": false, "listChanged": true},
-                            "prompts": {"listChanged": true},
-                            "extensions": {}
-                        }
+                        "capabilities": capabilities
                     }),
                 )
+            }
+            _ if path.starts_with("/groups/") && path.ends_with("/mcp") => {
+                let raw_slug = path
+                    .strip_prefix("/groups/")
+                    .and_then(|s| s.strip_suffix("/mcp"))
+                    .unwrap_or("")
+                    .trim();
+                let slug = percent_decode(raw_slug);
+                match self.registry.get_tool_group(&slug) {
+                    Some(group) => {
+                        let supported: Vec<JsonValue> =
+                            crate::models::SUPPORTED_MCP_PROTOCOL_VERSIONS
+                                .iter()
+                                .map(|v| JsonValue::from(*v))
+                                .collect();
+                        let capabilities = crate::models::build_server_capabilities(
+                            &self.config,
+                            crate::models::CapabilityScope::ToolGroup(group.slug.clone()),
+                        );
+                        self.json_response(
+                            200,
+                            json!({
+                                "endpoint": format!("/groups/{}/mcp", group.slug),
+                                "protocol": "Streamable HTTP",
+                                "server": format!("omni-group:{}", group.slug),
+                                "group": group.slug,
+                                "display_name": group.display_name,
+                                "description": group.description,
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "entries_count": group.entries.len() as i64,
+                                "supported_versions": JsonValue::Array(supported),
+                                "capabilities": capabilities
+                            }),
+                        )
+                    }
+                    None => self.json_response(
+                        404,
+                        json!({
+                            "error": format!("Tool group '{}' not found", slug)
+                        }),
+                    ),
+                }
+            }
+            "/api/plugin/manifest" => {
+                let mut agent = "claude".to_string();
+                let mut mode = "standard".to_string();
+                let mut group: Option<String> = None;
+                let mut gateway_url_param: Option<String> = None;
+                let mut auth_env = "OMNI_AUTH_TOKEN".to_string();
+                let mut transport: Option<String> = None;
+                let mut allow_insecure_http = false;
+                if let Some(q) = query {
+                    for pair in q.split('&') {
+                        if let Some((k, v)) = pair.split_once('=') {
+                            let val = percent_decode(v.trim());
+                            match k {
+                                "agent" if !val.is_empty() => agent = val,
+                                "mode" if !val.is_empty() => mode = val,
+                                "group" if !val.is_empty() => group = Some(val),
+                                "gateway_url" if !val.is_empty() => gateway_url_param = Some(val),
+                                "auth_env" if !val.is_empty() => auth_env = val,
+                                "transport" if !val.is_empty() => transport = Some(val),
+                                "allow_insecure_http" => {
+                                    allow_insecure_http = matches!(
+                                        val.to_ascii_lowercase().as_str(),
+                                        "true" | "1" | "yes"
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                let default_gw = if mode.eq_ignore_ascii_case("enterprise")
+                    && !self.config.public_base_url.starts_with("https://")
+                {
+                    "https://mcp.corp.example.com".to_string()
+                } else {
+                    self.config.public_base_url.clone()
+                };
+                let gw = gateway_url_param.unwrap_or(default_gw);
+                match crate::extension::plugin::build_plugin_manifest_json(
+                    &agent,
+                    &mode,
+                    &gw,
+                    group.as_deref(),
+                    &auth_env,
+                    transport.as_deref(),
+                    allow_insecure_http,
+                ) {
+                    Ok(manifest) => self.json_response(200, manifest),
+                    Err(e) => self.json_response(400, json!({"error": e})),
+                }
             }
             _ if path.ends_with("/mcp") => {
                 let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();

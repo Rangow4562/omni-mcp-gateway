@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "omni-mcp"
-version = "6.8.0"
+version = "6.8.5"
 rust-version = "1.75.0"
 edition = "2021"
 authors = ["Omni MCP Engineering"]

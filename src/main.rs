@@ -22,16 +22,24 @@ fn main() {
         }
         if first == "--stdio" || first == "stdio" || first == "serve-stdio" {
             let mut server_name = None;
+            let mut group_slug = None;
             let mut i = 1;
             while i < args.len() {
                 if (args[i] == "--server" || args[i] == "-s") && i + 1 < args.len() {
                     server_name = Some(args[i + 1].as_str());
                     i += 2;
+                } else if (args[i] == "--group" || args[i] == "-g") && i + 1 < args.len() {
+                    group_slug = Some(args[i + 1].as_str());
+                    i += 2;
                 } else {
                     i += 1;
                 }
             }
-            process::exit(omni_mcp::server::run_stdio_server(server_name));
+            if server_name.is_some() && group_slug.is_some() {
+                eprintln!("[!] Error: --server and --group cannot be combined in --stdio mode");
+                process::exit(2);
+            }
+            process::exit(omni_mcp::server::run_stdio_server(server_name, group_slug));
         }
         match first.as_str() {
             "mcp"
@@ -52,6 +60,8 @@ fn main() {
             | "import"
             | "migrate"
             | "wasm"
+            | "skills"
+            | "plugin"
             | "mock-echo-mcp"
             | "mock-bidirectional-mcp" => {
                 process::exit(run_aifx_cli(&args));

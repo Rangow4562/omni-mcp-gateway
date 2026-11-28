@@ -89,7 +89,7 @@ impl SkillEngine {
                         san_srv, san_tool, t.description
                     ));
                     examples.push_str(&format!(
-                        "// {}\nconst res_{} = await omni.{}.{}({{}});\n",
+                        "// {}\nconst res_{} = await codemode.{}.{}({{}});\n",
                         t.description, san_tool, san_srv, san_tool
                     ));
                 }
@@ -171,7 +171,7 @@ impl SkillEngine {
                     san_srv, san_tool, t.description
                 ));
                 examples.push_str(&format!(
-                    "// {}\nconst res_{} = await omni.{}.{}({{}});\n",
+                    "// {}\nconst res_{} = await codemode.{}.{}({{}});\n",
                     t.description, san_tool, san_srv, san_tool
                 ));
             }

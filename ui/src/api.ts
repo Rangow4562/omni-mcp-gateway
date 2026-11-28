@@ -245,3 +245,39 @@ export async function respondTask(
     body: JSON.stringify({ action, content: content ?? {} }),
   });
 }
+
+export interface PluginManifestResponse {
+  version: string;
+  agent: string;
+  mode: 'standard' | 'enterprise';
+  transport: string;
+  gateway_url: string;
+  group_slug: string | null;
+  endpoint: string;
+  auth_env: string;
+  config_format: 'json' | 'toml';
+  config_filename: string;
+  config_snippet: string;
+  config_object: any;
+  install_skills_cmd: string;
+  init_plugin_cmd: string;
+  policy: any;
+}
+
+export async function fetchPluginManifest(params: {
+  agent: string;
+  mode: 'standard' | 'enterprise';
+  group?: string;
+  gateway_url?: string;
+  auth_env?: string;
+  transport?: string;
+}): Promise<PluginManifestResponse> {
+  const qs = new URLSearchParams();
+  qs.set('agent', params.agent);
+  qs.set('mode', params.mode);
+  if (params.group) qs.set('group', params.group);
+  if (params.gateway_url) qs.set('gateway_url', params.gateway_url);
+  if (params.auth_env) qs.set('auth_env', params.auth_env);
+  if (params.transport) qs.set('transport', params.transport);
+  return apiFetch<PluginManifestResponse>(`/api/v1/plugin/manifest?${qs.toString()}`);
+}

@@ -1,0 +1,12 @@
+{
+  "name": "omni-mcp",
+  "displayName": "Omni MCP Gateway",
+  "version": "6.8.5",
+  "description": "High-performance pure-Rust enterprise Model Context Protocol (MCP) & Omni Code Mode Gateway v6.8.5: progressive discovery, Code Mode sandbox, SEP-2640 Skills, HA Tasks GA, Governance Elicitation, and SHA-256 Merkle audit trail.",
+  "suggestedPrompts": [
+    "Discover available MCP microservices and tools using Omni MCP",
+    "Generate 0-turn Code Mode TypeScript types and run a parallel workflow",
+    "List and verify SEP-2640 skills and inspect active MCP Tasks",
+    "Verify the cryptographic SHA-256 Merkle audit trail"
+  ]
+}

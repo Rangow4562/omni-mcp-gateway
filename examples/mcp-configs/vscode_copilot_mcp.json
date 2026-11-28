@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "omni-mcp": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@rangow2260/omni-mcp", "--stdio"]
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "omni-mcp",
+  "version": "6.8.5",
+  "description": "OmniMCP Gateway v6.8.5 — Universal enterprise MCP proxy, Code Mode sandbox, SEP-2640 Skills, Tasks GA, and Merkle audit trail.",
+  "contextFileName": "AGENTS.md",
+  "mcpServers": {
+    "omni-mcp": {
+      "command": "npx",
+      "args": ["-y", "@rangow2260/omni-mcp", "--stdio"]
+    }
+  }
+}

@@ -1,4 +1,4 @@
-//! HTTP Dispatch & MCP JSON-RPC 2.0 Routing (`/omni/mcp`, `/<service>/mcp`, `/g/<slug>/mcp`, stdio server).
+//! HTTP Dispatch & MCP JSON-RPC 2.0 Routing (`/omni/mcp`, `/<service>/mcp`, `/groups/<slug>/mcp`, stdio server).
 
 use super::auth::{is_origin_allowed, AuthRole};
 use super::http_codec::{get_header, percent_decode};
@@ -115,6 +115,7 @@ impl ProductionGatewayContext {
                 | "/api/v1/servers"
                 | "/api/groups"
                 | "/api/v1/groups"
+                | "/api/plugin/manifest"
                 | "/api/codemode/types"
                 | "/api/codemode/speculative_types"
                 | "/api/execute"
@@ -199,6 +200,19 @@ impl ProductionGatewayContext {
         // A12: Derive actor and rate-limiting key from authenticated principal identity
         // rather than trusting client-supplied headers (e.g. X-Caller-Actor)
         let principal = self.authenticate(headers).ok();
+
+        // v6.8.5 Enterprise MCP Auth enforcement (`OMNI_REQUIRE_MCP_AUTH`, defaults to true on non-loopback)
+        let is_mcp_post_route = path == "/omni/mcp"
+            || (path.starts_with("/groups/") && path.ends_with("/mcp"))
+            || (path.ends_with("/mcp") && path.split('/').filter(|p| !p.is_empty()).count() == 2);
+        if is_mcp_post_route && self.config.require_mcp_auth {
+            match &principal {
+                Some(p) if p.role.can_satisfy(AuthRole::Agent) => {}
+                Some(_) => return self.forbidden_response(path, AuthRole::Agent),
+                None => return self.unauthorized_response(path),
+            }
+        }
+
         let (actor, rate_key) = if let Some(ref p) = principal {
             (p.id.clone(), format!("{}:{}", p.id, p.role.as_str()))
         } else {
@@ -262,7 +276,6 @@ impl ProductionGatewayContext {
                     );
                 }
             };
-            let req_id = json_val.get("id").cloned();
             let rpc_method = json_val
                 .get("method")
                 .and_then(|m| m.as_str())
@@ -275,358 +288,19 @@ impl ProductionGatewayContext {
             } else {
                 incoming_sid
             };
-            let group_headers = || -> Vec<(String, String)> {
-                session_id
-                    .as_ref()
-                    .map(|sid| vec![("Mcp-Session-Id".to_string(), sid.clone())])
-                    .unwrap_or_default()
-            };
-            if rpc_method == "server/discover" {
-                let discover = crate::models::build_server_discover_result(
-                    &self.config,
-                    crate::models::CapabilityScope::ToolGroup(group.slug.clone()),
-                    &format!("omni-group:{}", group.slug),
-                    env!("CARGO_PKG_VERSION"),
-                    &group.description,
-                );
-                return self.json_response_with_headers(
-                    200,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": discover
-                    }),
-                    group_headers(),
-                );
-            } else if rpc_method == "initialize" {
-                let params = json_val
-                    .get("params")
-                    .cloned()
-                    .unwrap_or_else(JsonValue::object);
-                if let Some(required) = params
-                    .get("clientCapabilities")
-                    .and_then(|c| c.get("required"))
-                    .and_then(|r| r.as_array())
-                {
-                    let unsupported: Vec<&str> = required
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .filter(|cap| {
-                            !crate::models::is_required_capability_supported(cap, &self.config)
-                        })
-                        .collect();
-                    if !unsupported.is_empty() {
-                        return self.json_response_with_headers(
-                            200,
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": req_id,
-                                "error": {
-                                    "code": crate::models::MISSING_REQUIRED_CLIENT_CAPABILITY,
-                                    "message": format!(
-                                        "Missing required client capabilities: {}",
-                                        unsupported.join(", ")
-                                    )
-                                }
-                            }),
-                            group_headers(),
-                        );
-                    }
-                }
-                let client_ver = params.get("protocolVersion").and_then(|v| v.as_str());
-                let negotiated = crate::models::negotiate_protocol_version(client_ver);
-                let capabilities = crate::models::build_server_capabilities(
-                    &self.config,
-                    crate::models::CapabilityScope::ToolGroup(group.slug.clone()),
-                );
-                return self.json_response_with_headers(
-                    200,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "protocolVersion": negotiated,
-                            "capabilities": capabilities,
-                            "serverInfo": {
-                                "name": format!("omni-group:{}", group.slug),
-                                "version": env!("CARGO_PKG_VERSION")
-                            },
-                            "resultType": "complete"
-                        }
-                    }),
-                    group_headers(),
-                );
-            } else if rpc_method == "notifications/initialized" {
-                return (
+            let group_headers = session_id
+                .as_ref()
+                .map(|sid| vec![("Mcp-Session-Id".to_string(), sid.clone())])
+                .unwrap_or_default();
+            return match self.handle_group_rpc(&group, &json_val, actor, Some(token), traceparent) {
+                Some(resp_json) => self.json_response_with_headers(200, resp_json, group_headers),
+                None => (
                     202,
                     "application/json".to_string(),
-                    group_headers(),
+                    group_headers,
                     Vec::new(),
-                );
-            } else if rpc_method == "ping" {
-                return self.json_response_with_headers(
-                    200,
-                    json!({"jsonrpc": "2.0", "id": req_id, "result": {}}),
-                    group_headers(),
-                );
-            } else if rpc_method == "tools/list" {
-                let mut tools_arr = Vec::new();
-                for entry in &group.entries {
-                    if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
-                        for (t_name, tool) in &srv.tools {
-                            if tool.status != ToolStatus::Enabled {
-                                continue;
-                            }
-                            if let Some(ref only_tool) = entry.tool_name {
-                                if only_tool != t_name {
-                                    continue;
-                                }
-                            }
-                            let exposed = format!("{}_{}", entry.server_name, t_name);
-                            tools_arr.push(json!({
-                                "name": exposed,
-                                "description": tool.description.clone(),
-                                "inputSchema": tool.input_schema.clone()
-                            }));
-                        }
-                    }
-                }
-                return self.json_response_with_headers(
-                    200,
-                    json!({"jsonrpc": "2.0", "id": req_id, "result": {"tools": JsonValue::Array(tools_arr)}}),
-                    group_headers(),
-                );
-            } else if rpc_method == "tools/call" {
-                let params = json_val
-                    .get("params")
-                    .cloned()
-                    .unwrap_or_else(JsonValue::object);
-                let tool_req = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let args = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(JsonValue::object);
-                let mut matched_target: Option<(String, String)> = None;
-                for entry in &group.entries {
-                    if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
-                        for t_name in srv.tools.keys() {
-                            if let Some(ref only_tool) = entry.tool_name {
-                                if only_tool != t_name {
-                                    continue;
-                                }
-                            }
-                            let exposed = format!("{}_{}", entry.server_name, t_name);
-                            if exposed == tool_req {
-                                matched_target = Some((entry.server_name.clone(), t_name.clone()));
-                                break;
-                            }
-                        }
-                    }
-                    if matched_target.is_some() {
-                        break;
-                    }
-                }
-                if let Some((srv_name, t_name)) = matched_target {
-                    let mut fwd_params = json!({
-                        "name": t_name,
-                        "arguments": args
-                    });
-                    if let Some(cc) = params.get("clientCapabilities").cloned() {
-                        fwd_params.insert("clientCapabilities", cc);
-                    }
-                    if let Some(caps) = params.get("capabilities").cloned() {
-                        fwd_params.insert("capabilities", caps);
-                    }
-                    if let Some(meta) = params.get("_meta").cloned() {
-                        fwd_params.insert("_meta", meta);
-                    }
-                    if let Some(task) = params.get("task").cloned() {
-                        fwd_params.insert("task", task);
-                    }
-                    let rpc_req = crate::models::RPCRequest {
-                        jsonrpc: "2.0".to_string(),
-                        id: req_id.clone().unwrap_or(JsonValue::Null),
-                        method: "tools/call".to_string(),
-                        params: fwd_params,
-                    };
-                    let rpc_resp = self.gateway.handle_request_with_trace(
-                        &srv_name,
-                        &rpc_req,
-                        actor,
-                        Some(token),
-                        traceparent,
-                    );
-                    return self.json_response_with_headers(
-                        200,
-                        rpc_resp.to_json(),
-                        group_headers(),
-                    );
-                }
-                return self.json_response_with_headers(
-                    200,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {"code": -32601, "message": format!("Tool '{}' not in group '{}'", tool_req, group.slug)}
-                    }),
-                    group_headers(),
-                );
-            } else if rpc_method == "resources/list" {
-                let mut resources = Vec::new();
-                for entry in &group.entries {
-                    if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
-                        for res in &srv.external_resources {
-                            resources.push(json!({
-                                "uri": format!("ext://{}/{}", srv.name, res.uri),
-                                "name": res.name.clone(),
-                                "description": res.description.clone(),
-                                "mimeType": res.mime_type.clone().unwrap_or_else(|| "application/json".to_string())
-                            }));
-                        }
-                    }
-                }
-                return self.json_response_with_headers(
-                    200,
-                    json!({"jsonrpc": "2.0", "id": req_id, "result": {"resources": JsonValue::Array(resources), "resultType": "complete"}}),
-                    group_headers(),
-                );
-            } else if rpc_method == "resources/templates/list"
-                || rpc_method == "resources/read"
-                || rpc_method == "resources/directory/read"
-                || rpc_method == "skills/list"
-                || rpc_method == "skills/get"
-                || rpc_method == "prompts/list"
-                || rpc_method == "prompts/get"
-                || rpc_method == "tasks/get"
-                || rpc_method == "tasks/update"
-                || rpc_method == "tasks/cancel"
-            {
-                let allowed_servers: std::collections::HashSet<String> = group
-                    .entries
-                    .iter()
-                    .map(|e| e.server_name.clone())
-                    .collect();
-                if rpc_method == "resources/read" {
-                    let uri = json_val
-                        .get("params")
-                        .and_then(|p| p.get("uri"))
-                        .and_then(|u| u.as_str())
-                        .unwrap_or("");
-                    if let Some(rest) = uri.strip_prefix("ext://") {
-                        if let Some((srv_name, _)) = rest.split_once('/') {
-                            if !allowed_servers.contains(srv_name) {
-                                return self.json_response(
-                                    200,
-                                    json!({
-                                        "jsonrpc": "2.0",
-                                        "id": req_id,
-                                        "error": {"code": -32601, "message": format!("Resource '{}' not in group '{}'", uri, group.slug)}
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                } else if rpc_method == "prompts/get" {
-                    let pname = json_val
-                        .get("params")
-                        .and_then(|p| p.get("name"))
-                        .and_then(|u| u.as_str())
-                        .unwrap_or("");
-                    if let Some((srv_name, _)) = pname.split_once(':') {
-                        if !allowed_servers.contains(srv_name) {
-                            return self.json_response(
-                                200,
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "id": req_id,
-                                    "error": {"code": -32601, "message": format!("Prompt '{}' not in group '{}'", pname, group.slug)}
-                                }),
-                            );
-                        }
-                    }
-                }
-                let rpc_req = crate::models::RPCRequest {
-                    jsonrpc: "2.0".to_string(),
-                    id: req_id.clone().unwrap_or(JsonValue::Null),
-                    method: rpc_method.to_string(),
-                    params: json_val
-                        .get("params")
-                        .cloned()
-                        .unwrap_or_else(JsonValue::object),
-                };
-                let mut resp = self.omni_mcp.handle_request_scoped(
-                    &rpc_req,
-                    actor,
-                    Some(token),
-                    Some(&group.slug),
-                    None,
-                );
-                if rpc_method == "prompts/list" {
-                    if let Some(res_val) = resp.result.as_mut() {
-                        if let Some(arr) = res_val.get("prompts").and_then(|p| p.as_array()) {
-                            let filtered: Vec<JsonValue> = arr
-                                .iter()
-                                .filter(|item| {
-                                    let n = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    n.split_once(':')
-                                        .map(|(srv, _)| allowed_servers.contains(srv))
-                                        .unwrap_or(false)
-                                })
-                                .cloned()
-                                .collect();
-                            res_val.insert("prompts", JsonValue::Array(filtered));
-                        }
-                    }
-                }
-                return self.json_response_with_headers(200, resp.to_json(), group_headers());
-            } else if rpc_method == "sampling/createMessage" || rpc_method == "elicitation/create" {
-                let params = json_val
-                    .get("params")
-                    .cloned()
-                    .unwrap_or_else(JsonValue::object);
-                let target_srv = params.get("server").and_then(|s| s.as_str());
-                if let Some(srv_name) = target_srv {
-                    if !group.entries.iter().any(|e| e.server_name == srv_name) {
-                        return self.json_response_with_headers(
-                            200,
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": req_id,
-                                "error": {"code": -32601, "message": format!("Server '{}' not in group '{}'", srv_name, group.slug)}
-                            }),
-                            group_headers(),
-                        );
-                    }
-                }
-                let policy = if let Some(srv_name) = target_srv {
-                    self.cache
-                        .get_server_arc(srv_name)
-                        .map(|s| s.sampling_elicitation_policy.clone())
-                        .unwrap_or(crate::models::SamplingElicitationPolicy::Deny)
-                } else {
-                    group
-                        .entries
-                        .iter()
-                        .filter_map(|e| self.cache.get_server_arc(&e.server_name))
-                        .map(|s| s.sampling_elicitation_policy.clone())
-                        .find(|p| *p != crate::models::SamplingElicitationPolicy::Deny)
-                        .unwrap_or(crate::models::SamplingElicitationPolicy::Deny)
-                };
-                let resp = crate::extension::omni_mcp::apply_sampling_elicitation_policy(
-                    req_id.unwrap_or(JsonValue::Null),
-                    rpc_method,
-                    &policy,
-                    target_srv,
-                    Some(&group.slug),
-                    &params,
-                );
-                return self.json_response_with_headers(200, resp.to_json(), group_headers());
-            }
-            return self.json_response_with_headers(
-                200,
-                json!({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": format!("Method '{}' not found", rpc_method)}}),
-                group_headers(),
-            );
+                ),
+            };
         }
 
         // 1. Dynamic Virtual Server MCP Route: `/<service-name>/mcp`
@@ -1024,9 +698,346 @@ impl ProductionGatewayContext {
         }
         self.handle_rest_post(path, headers, actor, token, traceparent, parsed_body)
     }
+
+    /// Unified Tool Group JSON-RPC handler shared by HTTP `POST /groups/<slug>/mcp`
+    /// and stdio `--stdio --group <slug>`. Returns `None` for notifications.
+    pub fn handle_group_rpc(
+        &self,
+        group: &crate::models::ToolGroupRecord,
+        json_val: &JsonValue,
+        actor: &str,
+        token: Option<&str>,
+        traceparent: Option<&str>,
+    ) -> Option<JsonValue> {
+        let req_id = json_val.get("id").cloned();
+        let rpc_method = json_val
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+
+        if rpc_method == "server/discover" {
+            let discover = crate::models::build_server_discover_result(
+                &self.config,
+                crate::models::CapabilityScope::ToolGroup(group.slug.clone()),
+                &format!("omni-group:{}", group.slug),
+                env!("CARGO_PKG_VERSION"),
+                &group.description,
+            );
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": discover
+            }));
+        } else if rpc_method == "initialize" {
+            let params = json_val
+                .get("params")
+                .cloned()
+                .unwrap_or_else(JsonValue::object);
+            if let Some(required) = params
+                .get("clientCapabilities")
+                .and_then(|c| c.get("required"))
+                .and_then(|r| r.as_array())
+            {
+                let unsupported: Vec<&str> = required
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|cap| {
+                        !crate::models::is_required_capability_supported(cap, &self.config)
+                    })
+                    .collect();
+                if !unsupported.is_empty() {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": crate::models::MISSING_REQUIRED_CLIENT_CAPABILITY,
+                            "message": format!(
+                                "Missing required client capabilities: {}",
+                                unsupported.join(", ")
+                            )
+                        }
+                    }));
+                }
+            }
+            let client_ver = params.get("protocolVersion").and_then(|v| v.as_str());
+            let negotiated = crate::models::negotiate_protocol_version(client_ver);
+            let capabilities = crate::models::build_server_capabilities(
+                &self.config,
+                crate::models::CapabilityScope::ToolGroup(group.slug.clone()),
+            );
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": negotiated,
+                    "capabilities": capabilities,
+                    "serverInfo": {
+                        "name": format!("omni-group:{}", group.slug),
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "resultType": "complete"
+                }
+            }));
+        } else if rpc_method == "notifications/initialized"
+            || rpc_method.starts_with("notifications/")
+        {
+            return None;
+        } else if rpc_method == "ping" {
+            return Some(json!({"jsonrpc": "2.0", "id": req_id, "result": {}}));
+        } else if rpc_method == "tools/list" {
+            let mut tools_arr = Vec::new();
+            for entry in &group.entries {
+                if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
+                    for (t_name, tool) in &srv.tools {
+                        if tool.status != ToolStatus::Enabled {
+                            continue;
+                        }
+                        if let Some(ref only_tool) = entry.tool_name {
+                            if only_tool != t_name {
+                                continue;
+                            }
+                        }
+                        let exposed = format!("{}_{}", entry.server_name, t_name);
+                        tools_arr.push(json!({
+                            "name": exposed,
+                            "description": tool.description.clone(),
+                            "inputSchema": tool.input_schema.clone()
+                        }));
+                    }
+                }
+            }
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"tools": JsonValue::Array(tools_arr)}
+            }));
+        } else if rpc_method == "tools/call" {
+            let params = json_val
+                .get("params")
+                .cloned()
+                .unwrap_or_else(JsonValue::object);
+            let tool_req = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(JsonValue::object);
+            let mut matched_target: Option<(String, String)> = None;
+            for entry in &group.entries {
+                if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
+                    for t_name in srv.tools.keys() {
+                        if let Some(ref only_tool) = entry.tool_name {
+                            if only_tool != t_name {
+                                continue;
+                            }
+                        }
+                        let exposed = format!("{}_{}", entry.server_name, t_name);
+                        if exposed == tool_req {
+                            matched_target = Some((entry.server_name.clone(), t_name.clone()));
+                            break;
+                        }
+                    }
+                }
+                if matched_target.is_some() {
+                    break;
+                }
+            }
+            if let Some((srv_name, t_name)) = matched_target {
+                let mut fwd_params = json!({
+                    "name": t_name,
+                    "arguments": args
+                });
+                if let Some(cc) = params.get("clientCapabilities").cloned() {
+                    fwd_params.insert("clientCapabilities", cc);
+                }
+                if let Some(caps) = params.get("capabilities").cloned() {
+                    fwd_params.insert("capabilities", caps);
+                }
+                if let Some(meta) = params.get("_meta").cloned() {
+                    fwd_params.insert("_meta", meta);
+                }
+                if let Some(task) = params.get("task").cloned() {
+                    fwd_params.insert("task", task);
+                }
+                let rpc_req = crate::models::RPCRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: req_id.clone().unwrap_or(JsonValue::Null),
+                    method: "tools/call".to_string(),
+                    params: fwd_params,
+                };
+                let rpc_resp = self.gateway.handle_request_with_trace(
+                    &srv_name,
+                    &rpc_req,
+                    actor,
+                    token,
+                    traceparent,
+                );
+                return Some(rpc_resp.to_json());
+            }
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": format!("Tool '{}' not in group '{}'", tool_req, group.slug)}
+            }));
+        } else if rpc_method == "resources/list" {
+            let mut resources = Vec::new();
+            let mut seen_servers = std::collections::HashSet::new();
+            for entry in &group.entries {
+                if !seen_servers.insert(entry.server_name.as_str()) {
+                    continue;
+                }
+                if let Some(srv) = self.cache.get_server_arc(&entry.server_name) {
+                    for res in &srv.external_resources {
+                        resources.push(json!({
+                            "uri": format!("ext://{}/{}", srv.name, res.uri),
+                            "name": res.name.clone(),
+                            "description": res.description.clone(),
+                            "mimeType": res.mime_type.clone().unwrap_or_else(|| "application/json".to_string())
+                        }));
+                    }
+                }
+            }
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"resources": JsonValue::Array(resources), "resultType": "complete"}
+            }));
+        } else if rpc_method == "resources/templates/list"
+            || rpc_method == "resources/read"
+            || rpc_method == "resources/directory/read"
+            || rpc_method == "skills/list"
+            || rpc_method == "skills/get"
+            || rpc_method == "prompts/list"
+            || rpc_method == "prompts/get"
+            || rpc_method == "tasks/get"
+            || rpc_method == "tasks/update"
+            || rpc_method == "tasks/cancel"
+        {
+            let allowed_servers: std::collections::HashSet<String> = group
+                .entries
+                .iter()
+                .map(|e| e.server_name.clone())
+                .collect();
+            if rpc_method == "resources/read" {
+                let uri = json_val
+                    .get("params")
+                    .and_then(|p| p.get("uri"))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                if let Some(rest) = uri.strip_prefix("ext://") {
+                    if let Some((srv_name, _)) = rest.split_once('/') {
+                        if !allowed_servers.contains(srv_name) {
+                            return Some(json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "error": {"code": -32601, "message": format!("Resource '{}' not in group '{}'", uri, group.slug)}
+                            }));
+                        }
+                    }
+                }
+            } else if rpc_method == "prompts/get" {
+                let pname = json_val
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                if let Some((srv_name, _)) = pname.split_once(':') {
+                    if !allowed_servers.contains(srv_name) {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {"code": -32601, "message": format!("Prompt '{}' not in group '{}'", pname, group.slug)}
+                        }));
+                    }
+                }
+            }
+            let rpc_req = crate::models::RPCRequest {
+                jsonrpc: "2.0".to_string(),
+                id: req_id.clone().unwrap_or(JsonValue::Null),
+                method: rpc_method.to_string(),
+                params: json_val
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(JsonValue::object),
+            };
+            let mut resp = self.omni_mcp.handle_request_scoped(
+                &rpc_req,
+                actor,
+                token,
+                Some(&group.slug),
+                None,
+            );
+            if rpc_method == "prompts/list" {
+                if let Some(res_val) = resp.result.as_mut() {
+                    if let Some(arr) = res_val.get("prompts").and_then(|p| p.as_array()) {
+                        let filtered: Vec<JsonValue> = arr
+                            .iter()
+                            .filter(|item| {
+                                let n = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                n.split_once(':')
+                                    .map(|(srv, _)| allowed_servers.contains(srv))
+                                    .unwrap_or(false)
+                            })
+                            .cloned()
+                            .collect();
+                        res_val.insert("prompts", JsonValue::Array(filtered));
+                    }
+                }
+            }
+            return Some(resp.to_json());
+        } else if rpc_method == "sampling/createMessage" || rpc_method == "elicitation/create" {
+            let params = json_val
+                .get("params")
+                .cloned()
+                .unwrap_or_else(JsonValue::object);
+            let target_srv = params.get("server").and_then(|s| s.as_str());
+            if let Some(srv_name) = target_srv {
+                if !group.entries.iter().any(|e| e.server_name == srv_name) {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32601, "message": format!("Server '{}' not in group '{}'", srv_name, group.slug)}
+                    }));
+                }
+            }
+            let policy = if let Some(srv_name) = target_srv {
+                self.cache
+                    .get_server_arc(srv_name)
+                    .map(|s| s.sampling_elicitation_policy.clone())
+                    .unwrap_or(crate::models::SamplingElicitationPolicy::Deny)
+            } else {
+                group
+                    .entries
+                    .iter()
+                    .filter_map(|e| self.cache.get_server_arc(&e.server_name))
+                    .map(|s| s.sampling_elicitation_policy.clone())
+                    .find(|p| *p != crate::models::SamplingElicitationPolicy::Deny)
+                    .unwrap_or(crate::models::SamplingElicitationPolicy::Deny)
+            };
+            let resp = crate::extension::omni_mcp::apply_sampling_elicitation_policy(
+                req_id.unwrap_or(JsonValue::Null),
+                rpc_method,
+                &policy,
+                target_srv,
+                Some(&group.slug),
+                &params,
+            );
+            return Some(resp.to_json());
+        }
+
+        Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": format!("Method '{}' not found", rpc_method)}
+        }))
+    }
 }
 
-pub fn run_stdio_server(specific_server: Option<&str>) -> i32 {
+pub fn run_stdio_server(specific_server: Option<&str>, group_slug: Option<&str>) -> i32 {
+    if specific_server.is_some() && group_slug.is_some() {
+        eprintln!("[!] Error: --server and --group cannot be combined in --stdio mode");
+        return 2;
+    }
+
     let ctx = get_gateway_context();
     ctx.cache.start_background_refresh();
     let omni_mcp = &ctx.omni_mcp;
@@ -1061,6 +1072,44 @@ pub fn run_stdio_server(specific_server: Option<&str>) -> i32 {
                 continue;
             }
         };
+
+        if let Some(slug) = group_slug {
+            let group = match ctx.registry.get_tool_group(slug) {
+                Some(g) => g,
+                None => {
+                    let req_id = parsed.get("id").cloned().unwrap_or(JsonValue::Null);
+                    let err_resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32001,
+                            "message": format!("Tool group '{}' not found", slug)
+                        }
+                    });
+                    let _ = writeln!(stdout, "{}", err_resp.to_string_compact());
+                    let _ = stdout.flush();
+                    continue;
+                }
+            };
+            if let Some(arr) = parsed.as_array() {
+                let results: Vec<JsonValue> = arr
+                    .iter()
+                    .filter_map(|item| {
+                        ctx.handle_group_rpc(&group, item, "agent", Some("stdio-token"), None)
+                    })
+                    .collect();
+                if !results.is_empty() {
+                    let _ = writeln!(stdout, "{}", JsonValue::Array(results).to_string_compact());
+                    let _ = stdout.flush();
+                }
+            } else if let Some(resp_json) =
+                ctx.handle_group_rpc(&group, &parsed, "agent", Some("stdio-token"), None)
+            {
+                let _ = writeln!(stdout, "{}", resp_json.to_string_compact());
+                let _ = stdout.flush();
+            }
+            continue;
+        }
 
         match RPCBatchOrSingle::from_json(&parsed) {
             Ok(batch_or_single) => {

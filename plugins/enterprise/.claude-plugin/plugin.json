@@ -1,0 +1,14 @@
+{
+  "name": "omni-mcp-enterprise",
+  "version": "6.8.5",
+  "description": "Enterprise governed OmniMCP Gateway plugin over remote Streamable HTTP with OIDC/Bearer auth, Tool Group isolation, and enterprise-policy.json.",
+  "author": {
+    "name": "Omni MCP Engineering",
+    "url": "https://github.com/Rangow4562/omni-mcp-gateway"
+  },
+  "repository": "https://github.com/Rangow4562/omni-mcp-gateway",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "enterprise", "oidc", "rbac", "streamable-http", "governance"],
+  "skills": "../../skills",
+  "mcpServers": "./mcp_config.json"
+}

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "1.0",
+  "pluginVersion": "6.8.5",
+  "mode": "enterprise",
+  "gatewayUrl": "https://mcp.corp.example.com",
+  "allowedToolGroups": ["billing", "analytics-ro"],
+  "requiredAuthMode": "oidc",
+  "authTokenEnv": "OMNI_AUTH_TOKEN",
+  "requireSkillSha256Verification": true,
+  "allowLocalStdio": false,
+  "tlsCaCertEnv": "OMNI_TLS_CA_CERT",
+  "auditMode": "merkle",
+  "allowedAgents": [
+    "claude",
+    "antigravity",
+    "gemini",
+    "codex",
+    "cursor",
+    "copilot",
+    "vscode",
+    "windsurf",
+    "cline",
+    "opencode"
+  ]
+}

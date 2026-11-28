@@ -10,11 +10,13 @@ FROM rust:1-slim AS rust-builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
+COPY skills/ ./skills/
+COPY AGENTS.md ./
 COPY src/ ./src/
 RUN cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc"
 
 FROM debian:trixie-slim AS runner
-LABEL org.opencontainers.image.version="6.8.0"
+LABEL org.opencontainers.image.version="6.8.5"
 WORKDIR /app
 
 ENV OMNI_HOST=0.0.0.0 \

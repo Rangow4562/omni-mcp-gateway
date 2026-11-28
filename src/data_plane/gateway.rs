@@ -2419,5 +2419,103 @@ mod tests {
             "docs/RELEASE_v{}.md must exist for the current version",
             cargo_ver
         );
+
+        // v6.8.5: Plugin manifests, marketplace, Gemini extension, and UI lockfile version lockstep.
+        let manifest_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for rel in [
+            ".claude-plugin/plugin.json",
+            ".claude-plugin/marketplace.json",
+            "gemini-extension.json",
+            "plugins/antigravity/plugin.json",
+            "plugins/enterprise/plugin.json",
+            "plugins/enterprise/.claude-plugin/plugin.json",
+            "ui/package-lock.json",
+        ] {
+            let content = std::fs::read_to_string(manifest_root.join(rel))
+                .unwrap_or_else(|e| panic!("Must read {}: {}", rel, e));
+            let parsed =
+                JsonValue::parse(&content).unwrap_or_else(|e| panic!("Must parse {}: {}", rel, e));
+            assert_eq!(
+                parsed["version"].as_str(),
+                Some(cargo_ver),
+                "{} version must match Cargo.toml version {}",
+                rel,
+                cargo_ver
+            );
+            if rel == ".claude-plugin/marketplace.json" {
+                let plugins = parsed["plugins"]
+                    .as_array()
+                    .expect("marketplace.json must have plugins array");
+                assert!(
+                    plugins.len() >= 2,
+                    "marketplace.json must expose Standard + Enterprise plugins"
+                );
+                for p in plugins {
+                    assert_eq!(
+                        p["version"].as_str(),
+                        Some(cargo_ver),
+                        "marketplace plugin entry version must match {}",
+                        cargo_ver
+                    );
+                }
+            }
+        }
+
+        // v6.8.5: Every directory under skills/ must pass SEP-2640 SkillRecord::validate().
+        let skills_dir = manifest_root.join("skills");
+        assert!(skills_dir.is_dir(), "skills/ directory must exist");
+        let mut skill_count = 0usize;
+        for entry in std::fs::read_dir(&skills_dir).expect("read skills/") {
+            let entry = entry.expect("dir entry");
+            if entry.path().is_dir() {
+                let slug = entry.file_name().to_string_lossy().into_owned();
+                let mut files = Vec::new();
+                fn walk(
+                    base: &std::path::Path,
+                    cur: &std::path::Path,
+                    out: &mut Vec<crate::models::SkillFileEntry>,
+                ) {
+                    for e in std::fs::read_dir(cur).expect("read skill subdir") {
+                        let e = e.expect("subdir entry");
+                        let p = e.path();
+                        if p.is_dir() {
+                            walk(base, &p, out);
+                        } else if p.is_file() {
+                            let rel = p
+                                .strip_prefix(base)
+                                .unwrap()
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            let content = std::fs::read_to_string(&p).expect("read skill file");
+                            out.push(crate::models::SkillFileEntry::new(
+                                rel,
+                                "text/markdown",
+                                content,
+                            ));
+                        }
+                    }
+                }
+                walk(&entry.path(), &entry.path(), &mut files);
+                let mut rec = crate::models::SkillRecord {
+                    slug: slug.clone(),
+                    name: String::new(),
+                    description: String::new(),
+                    version: String::new(),
+                    group_slug: None,
+                    server_scope: None,
+                    auto_generated: false,
+                    files,
+                    manifest_sha256: String::new(),
+                    updated_at: 0.0,
+                };
+                rec.validate()
+                    .unwrap_or_else(|e| panic!("skills/{} failed validate(): {}", slug, e));
+                skill_count += 1;
+            }
+        }
+        assert!(
+            skill_count >= 4,
+            "Expected at least 4 canonical skill bundles under skills/"
+        );
     }
 }

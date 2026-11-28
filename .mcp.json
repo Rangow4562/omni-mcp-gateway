@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "omni-mcp": {
+      "command": "npx",
+      "args": ["-y", "@rangow2260/omni-mcp", "--stdio"],
+      "env": {
+        "OMNI_ENV": "development"
+      }
+    }
+  }
+}

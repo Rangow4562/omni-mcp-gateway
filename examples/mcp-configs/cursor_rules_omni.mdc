@@ -1,0 +1,11 @@
+---
+description: OmniMCP Gateway v6.8.5 progressive discovery, Code Mode, and enterprise governance rules
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# OmniMCP Cursor Rules (v6.8.5)
+
+- Prefer progressive discovery (`discover_server` -> `discover_tools` -> `get_tool_schema` -> `invoke_tool` with `_projection`).
+- For multi-step workflows, call `get_codemode_types` with `intent` and execute sandboxed scripts via `codemode` using `codemode.<service>.<tool>(args)` (never `omni.<service>.<tool>`).
+- Never embed literal Bearer tokens or secrets in MCP configuration files; reference environment variables (`${OMNI_AUTH_TOKEN}`).

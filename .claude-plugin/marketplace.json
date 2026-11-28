@@ -1,0 +1,30 @@
+{
+  "name": "omni-mcp-marketplace",
+  "version": "6.8.5",
+  "owner": {
+    "name": "Omni MCP Engineering",
+    "url": "https://github.com/Rangow4562/omni-mcp-gateway"
+  },
+  "metadata": {
+    "description": "Official OmniMCP Gateway v6.8.5 plugin marketplace offering Standard (local stdio) and Enterprise (governed remote Streamable HTTP + OIDC/RBAC + Tool Group isolation) plugins.",
+    "version": "6.8.5"
+  },
+  "plugins": [
+    {
+      "name": "omni-mcp",
+      "version": "6.8.5",
+      "description": "Standard local/dev OmniMCP Gateway over stdio via npx @rangow2260/omni-mcp --stdio with all 4 bundled agent skills.",
+      "source": ".",
+      "category": "developer-tools",
+      "tags": ["mcp", "stdio", "code-mode", "skills", "local"]
+    },
+    {
+      "name": "omni-mcp-enterprise",
+      "version": "6.8.5",
+      "description": "Enterprise governed OmniMCP plugin using remote Streamable HTTP (/omni/mcp or /groups/<slug>/mcp), Bearer/OIDC auth, Tool Group isolation, and enterprise-policy.json.",
+      "source": "./plugins/enterprise",
+      "category": "enterprise",
+      "tags": ["mcp", "enterprise", "oidc", "rbac", "streamable-http", "governance"]
+    }
+  ]
+}

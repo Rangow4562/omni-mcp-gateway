@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "omni-mcp-enterprise": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "${OMNI_GATEWAY_URL}/omni/mcp",
+        "--header",
+        "Authorization: Bearer ${OMNI_AUTH_TOKEN}"
+      ]
+    }
+  }
+}

@@ -47,6 +47,11 @@ pub struct OmniConfig {
     pub file_storage_backend: String,
     pub uploads_dir: PathBuf,
     pub pod_id: String,
+    // v6.8.5 Enterprise Auth & Skills Seeding Settings
+    pub jwt_secret: Option<String>,
+    pub oidc_jwks_uri: Option<String>,
+    pub require_mcp_auth: bool,
+    pub seed_builtin_skills: bool,
 }
 
 impl Default for OmniConfig {
@@ -72,6 +77,7 @@ impl OmniConfig {
             .to_lowercase();
 
         let host = env::var("OMNI_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let default_require_mcp_auth = !is_loopback_host(&host);
         let port: u16 = env::var("OMNI_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -230,6 +236,16 @@ impl OmniConfig {
                 .or_else(|_| env::var("HOSTNAME"))
                 .or_else(|_| env::var("COMPUTERNAME"))
                 .unwrap_or_else(|_| "omni-pod-local".to_string()),
+            jwt_secret: env::var("OMNI_JWT_SECRET")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            oidc_jwks_uri: env::var("OMNI_OIDC_JWKS_URI")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            require_mcp_auth: parse_bool_env("OMNI_REQUIRE_MCP_AUTH", default_require_mcp_auth),
+            seed_builtin_skills: parse_bool_env("OMNI_SEED_BUILTIN_SKILLS", false),
         }
     }
 }
@@ -241,12 +257,19 @@ pub fn is_loopback_host(host: &str) -> bool {
 }
 
 impl OmniConfig {
+    /// Returns `true` when at least one authentication mechanism is configured.
+    pub fn has_auth_configured(&self) -> bool {
+        !self.auth_secret.is_empty()
+            || self.jwt_secret.as_deref().is_some_and(|s| !s.is_empty())
+            || self.oidc_jwks_uri.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
     /// Refuses insecure network exposure: binding to a non-loopback address
-    /// requires `OMNI_AUTH_SECRET` to be configured.
+    /// requires `OMNI_AUTH_SECRET`, `OMNI_JWT_SECRET`, or `OMNI_OIDC_JWKS_URI` to be configured.
     pub fn validate_bind(&self, host: &str) -> Result<(), String> {
-        if !is_loopback_host(host) && self.auth_secret.is_empty() {
+        if !is_loopback_host(host) && !self.has_auth_configured() {
             return Err(format!(
-                "Refusing to bind to non-loopback address '{}' without OMNI_AUTH_SECRET configured",
+                "Refusing to bind to non-loopback address '{}' without OMNI_AUTH_SECRET, OMNI_JWT_SECRET, or OMNI_OIDC_JWKS_URI configured",
                 host
             ));
         }

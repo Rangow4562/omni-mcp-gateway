@@ -1,0 +1,12 @@
+{
+  "name": "omni-mcp-enterprise",
+  "displayName": "Omni MCP Enterprise Gateway",
+  "version": "6.8.5",
+  "description": "Governed Enterprise OmniMCP plugin over remote Streamable HTTP with OIDC/Bearer authentication, Tool Group isolation, SEP-2640 SHA-256 skill verification, and Merkle audit trail.",
+  "suggestedPrompts": [
+    "Discover tools available inside my enterprise Tool Group",
+    "Run a governed Code Mode workflow with HITL mutation approval",
+    "Inspect active HA MCP Tasks and pending Approval Inbox elicitations",
+    "Verify the enterprise Merkle audit chain and skill SHA-256 manifests"
+  ]
+}

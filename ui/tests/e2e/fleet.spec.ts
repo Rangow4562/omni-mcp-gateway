@@ -1,10 +1,10 @@
 import { test, expect } from '@playwright/test';
 
-test.describe('Omni MCP v6.8.0 Fleet, Governance & Observability Studio E2E', () => {
+test.describe('Omni MCP v6.8.5 Fleet, Governance & Observability Studio E2E', () => {
   test('dashboard loads, connects live SSE, and opens all studios', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByText('Omni MCP Gateway')).toBeVisible();
-    await expect(page.getByText('v6.8.0 FLEET READY')).toBeVisible();
+    await expect(page.getByText('v6.8.5 FLEET READY')).toBeVisible();
 
     // Verify Tool Groups Studio opens and renders builder
     await page.getByRole('button', { name: /Tool Groups/i }).click();
@@ -122,6 +122,23 @@ test.describe('Omni MCP v6.8.0 Fleet, Governance & Observability Studio E2E', ()
       timeout: 5000,
     });
     await expect(page.getByTestId('skill-manifest-sha')).not.toBeEmpty();
+
+    // Exercise the new v6.8.5 Install & Enterprise Plugin tab
+    await page.getByTestId('tab-plugin-center').click();
+    await expect(page.getByTestId('plugin-center-panel')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByTestId('plugin-config-snippet')).toContainText('@rangow2260/omni-mcp', {
+      timeout: 5000,
+    });
+    await expect(page.getByTestId('plugin-install-cmd')).toContainText('omni skills install');
+
+    // Switch to Enterprise Governed Remote + Codex (TOML)
+    await page.getByTestId('plugin-mode-enterprise').click();
+    await page.getByTestId('plugin-agent-select').selectOption('codex');
+    await expect(page.getByTestId('plugin-config-snippet')).toContainText('[mcp_servers.omni-mcp-enterprise]', {
+      timeout: 5000,
+    });
+    await expect(page.getByTestId('plugin-config-snippet')).toContainText('bearer_token_env_var = "OMNI_AUTH_TOKEN"');
+    await expect(page.getByTestId('plugin-init-cmd')).toContainText('omni plugin init --mode enterprise');
   });
 
   test('Tasks Monitor opens, displays live MCP task stream, cancels task via UI + SSE, and verifies Unified Approval/Elicitation Inbox', async ({ page, request }) => {

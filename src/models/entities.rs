@@ -2352,9 +2352,11 @@ pub fn validate_skill_file_path(path: &str) -> Result<(), String> {
 }
 
 /// Extracts `(name, description)` from `SKILL.md` YAML frontmatter (`---\n...\n---`).
+/// Supports top-level single-line scalars as well as YAML folded (`>`) and literal (`|`)
+/// multi-line block scalars while ignoring indented nested YAML keys.
 pub fn parse_skill_frontmatter(markdown: &str) -> Result<(String, String), String> {
     let trimmed = markdown.trim_start_matches('\u{feff}');
-    let mut lines = trimmed.lines();
+    let mut lines = trimmed.lines().peekable();
     let first = lines.next().unwrap_or("").trim();
     if first != "---" {
         return Err("SKILL.md must begin with YAML frontmatter delimiter '---'".to_string());
@@ -2362,19 +2364,67 @@ pub fn parse_skill_frontmatter(markdown: &str) -> Result<(String, String), Strin
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut closed = false;
-    for line in lines {
+
+    while let Some(line) = lines.next() {
         let t = line.trim();
         if t == "---" || t == "..." {
             closed = true;
             break;
         }
-        if let Some((k, v)) = t.split_once(':') {
+        // Ignore empty lines, comments, and indented nested YAML keys/list items.
+        if t.is_empty() || t.starts_with('#') || line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
-            let val = v.trim().trim_matches('"').trim_matches('\'').trim();
-            if key == "name" && !val.is_empty() {
-                name = Some(val.to_string());
-            } else if key == "description" && !val.is_empty() {
-                description = Some(val.to_string());
+            let raw_val = v.trim();
+            if key != "name" && key != "description" {
+                continue;
+            }
+            let resolved = if matches!(raw_val, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+                let is_folded = raw_val.starts_with('>');
+                let mut block_lines: Vec<String> = Vec::new();
+                while let Some(&next_line) = lines.peek() {
+                    let next_trim = next_line.trim();
+                    if next_trim == "---" || next_trim == "..." {
+                        break;
+                    }
+                    if next_trim.is_empty() {
+                        block_lines.push(String::new());
+                        lines.next();
+                    } else if next_line.starts_with(' ') || next_line.starts_with('\t') {
+                        block_lines.push(next_trim.to_string());
+                        lines.next();
+                    } else {
+                        break;
+                    }
+                }
+                while block_lines.last().is_some_and(|l| l.is_empty()) {
+                    block_lines.pop();
+                }
+                if is_folded {
+                    block_lines
+                        .into_iter()
+                        .filter(|l| !l.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    block_lines.join("\n")
+                }
+            } else {
+                raw_val
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim()
+                    .to_string()
+            };
+
+            if !resolved.is_empty() {
+                if key == "name" {
+                    name = Some(resolved);
+                } else if key == "description" {
+                    description = Some(resolved);
+                }
             }
         }
     }

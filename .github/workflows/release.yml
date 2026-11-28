@@ -150,12 +150,20 @@ jobs:
         with:
           path: artifacts
 
-      - name: Flatten Artifacts
+      - name: Flatten Artifacts & Package Skills/Plugins Bundle
         run: |
           mkdir -p release-assets
           find artifacts -type f -exec cp {} release-assets/ \;
+          VERSION=$(node -p "require('./package.json').version")
+          tar -czf "release-assets/omni-mcp-skills-and-plugins-v${VERSION}.tar.gz" skills .claude-plugin plugins AGENTS.md gemini-extension.json .mcp.json examples/mcp-configs
+          zip -rq "release-assets/omni-mcp-skills-and-plugins-v${VERSION}.zip" skills .claude-plugin plugins AGENTS.md gemini-extension.json .mcp.json examples/mcp-configs
           cd release-assets
-          sha256sum omni-gateway-* > SHA256SUMS 2>/dev/null || shasum -a 256 omni-gateway-* > SHA256SUMS || true
+          shopt -s nullglob
+          ASSETS=(omni-gateway-* omni-* aifx-* omni-mcp-skills-and-plugins-*)
+          if [ ${#ASSETS[@]} -gt 0 ]; then
+            mapfile -t UNIQUE_ASSETS < <(printf '%s\n' "${ASSETS[@]}" | sort -u)
+            sha256sum "${UNIQUE_ASSETS[@]}" > SHA256SUMS 2>/dev/null || shasum -a 256 "${UNIQUE_ASSETS[@]}" > SHA256SUMS
+          fi
           cd ..
           ls -la release-assets
 

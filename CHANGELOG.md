@@ -2,6 +2,31 @@
 
 All notable changes to Omni MCP. Per-release narrative notes live in [`docs/`](docs/).
 
+## [6.8.5] - 2026-11-28
+
+### Added
+- **Universal CLI/Coding-Agent Skills Suite (`skills/` + `AGENTS.md`)**:
+  - Added 4 canonical, SEP-2640 + `agentskills.io` compliant skill bundles (`omni-mcp`, `omni-codemode`, `omni-cli`, `omni-enterprise`) with `references/*`, embedded into the Rust binary via `include_str!`.
+  - Added root `AGENTS.md` for automatic discovery across Codex, OpenCode, Cursor, Antigravity, Copilot, and Claude Code.
+- **Multi-Agent Plugin Manifests & Governed Enterprise Plugin Option**:
+  - Added `.claude-plugin/plugin.json`, dual `.claude-plugin/marketplace.json` (`omni-mcp` Standard + `omni-mcp-enterprise` Enterprise), `.mcp.json`, `gemini-extension.json`, `plugins/antigravity/*`, `plugins/enterprise/*` (with `enterprise-policy.example.json`, `mcp_config.json`, `mcp_config.remote-bridge.json`, and IT rollout runbook), and expanded `examples/mcp-configs/` templates (VS Code/Copilot, Codex TOML, Windsurf, OpenCode, Cursor rules, Enterprise HTTP).
+- **Embedded Rust Skills & Enterprise Plugin CLI (`src/extension/plugin.rs`)**:
+  - Added pure-offline `omni skills install`, online `omni skills bootstrap [--group <slug>]`, and `omni plugin init|export|verify|agents` with HTTPS enforcement, plaintext secret leak detection, `enterprise-policy.json` generation, and SHA-256 tamper verification.
+  - Added `GET /api/v1/plugin/manifest` (`AuthRole::Agent`) and Governance Studio UI **Skills Studio → Install & Enterprise Plugin** tab.
+- **Enterprise Auth & Seeding Controls**:
+  - Added `OMNI_REQUIRE_MCP_AUTH` (defaults to `true` on non-loopback hosts, enforcing HTTP `401` + RFC 9728 `WWW-Authenticate` on `/omni/mcp`, `/groups/<slug>/mcp`, and `/<service>/mcp`).
+  - Added opt-in `OMNI_SEED_BUILTIN_SKILLS` (default `false`) and `omni migrate --to-v6.8.5`.
+
+### Fixed
+- **CLI Dispatch**: Added `"skills"` and `"plugin"` to `omni-gateway` CLI dispatch so `omni-gateway skills ...` and `npx @rangow2260/omni-mcp skills|plugin ...` execute the CLI instead of booting the HTTP server.
+- **Tool Group Stdio Isolation**: Extracted unified `ProductionGatewayContext::handle_group_rpc()` shared by HTTP `POST /groups/<slug>/mcp` and `--stdio --group <slug>` (rejecting simultaneous `--server` + `--group` with exit code `2`).
+- **OIDC/JWT Bind Validation**: Fixed `OmniConfig::validate_bind()` to accept `OMNI_JWT_SECRET` and `OMNI_OIDC_JWKS_URI` in addition to `OMNI_AUTH_SECRET`.
+- **Tool Group HTTP Discovery**: Added `GET /groups/<slug>/mcp` JSON discovery metadata response and populated real capabilities via `build_server_capabilities()` on both `GET /omni/mcp` and `GET /groups/<slug>/mcp`.
+- **Offline CLI Side Effects**: Dispatched pure-offline `skills install` and `plugin init|verify|agents|export` before `AifxCLI::new()` so they never touch `~/.omni/data` or PostgreSQL.
+- **Auto-Synthesized Playbook Syntax**: Fixed `SkillEngine` playbook examples from `await omni.<srv>.<tool>({})` to `await codemode.<srv>.<tool>({})`.
+- **YAML Frontmatter Parser**: Hardened `parse_skill_frontmatter()` to support multi-line `>` / `|` block scalars and ignore indented nested YAML keys.
+- **Docker & Release Packaging**: Copied `skills/` and `AGENTS.md` into `Dockerfile` `rust-builder`, archived `omni-mcp-skills-and-plugins-v6.8.5.{tar.gz,zip}` in `.github/workflows/release.yml`, widened `SHA256SUMS`, and synced `ui/package-lock.json` to `6.8.5`.
+
 ## [6.8.0] - 2026-11-26
 
 ### Added

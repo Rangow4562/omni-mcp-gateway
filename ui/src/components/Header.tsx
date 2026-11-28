@@ -113,7 +113,7 @@ export const Header: React.FC<HeaderProps> = ({
               borderRadius: '12px',
               fontWeight: 600,
             }}>
-              v6.8.0 FLEET READY
+              v6.8.5 FLEET READY
             </span>
             <span
               data-testid="sse-status"

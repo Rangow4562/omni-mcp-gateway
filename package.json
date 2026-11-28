@@ -1,7 +1,7 @@
 {
   "name": "@rangow2260/omni-mcp",
-  "version": "6.8.0",
-  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v6.8: Skills over MCP (SEP-2640), Postgres HA Tasks (GA), Governance-Driven Elicitation (form/url) + Multi-Pod OAuth, Streaming File Uploads (SEP-2356) with Universal Multi-Cloud Blob Storage & Wasm Guest ABI v2, PgWirePool, and Governance Studio UI v4.",
+  "version": "6.8.5",
+  "description": "High-performance enterprise Model Context Protocol (MCP) & Omni Code Mode gateway v6.8.5: Universal CLI/Coding-Agent Skills Suite & Enterprise Plugin Option, Skills over MCP (SEP-2640), Postgres HA Tasks (GA), Governance-Driven Elicitation (form/url), Streaming File Uploads (SEP-2356), PgWirePool, and Governance Studio UI.",
   "main": "bin/omni-mcp.js",
   "bin": {
     "omni-mcp": "bin/omni-mcp.js",
@@ -12,6 +12,12 @@
   "files": [
     "bin",
     "assets",
+    "skills",
+    ".claude-plugin",
+    "plugins",
+    "AGENTS.md",
+    "gemini-extension.json",
+    ".mcp.json",
     "README.md",
     "LICENSE"
   ],

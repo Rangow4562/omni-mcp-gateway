@@ -154,7 +154,7 @@ npx -y @rangow2260/omni-mcp aifx mcp simulate --code "const res = await codemode
 
 ### 2. Native Pre-Built Binaries by Operating System
 
-All binaries (plus `omni-*`, `aifx-*`, Cargo SBOMs, and `SHA256SUMS`) are published on the [v6.8.0 GitHub Release](https://github.com/Rangow4562/omni-mcp-gateway/releases/tag/v6.8.0):
+All binaries (plus `omni-*`, `aifx-*`, `omni-mcp-skills-and-plugins-v6.8.5.{tar.gz,zip}`, Cargo SBOMs, and `SHA256SUMS`) are published on the [v6.8.5 GitHub Release](https://github.com/Rangow4562/omni-mcp-gateway/releases/tag/v6.8.5):
 
 | Operating System | Architecture | Target Triple | Release Binary Asset |
 | :--- | :--- | :--- | :--- |
@@ -168,49 +168,72 @@ All binaries (plus `omni-*`, `aifx-*`, Cargo SBOMs, and `SHA256SUMS`) are publis
 #### 🍎 macOS (Apple Silicon & Intel)
 ```bash
 # Apple Silicon (ARM64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-darwin-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.5/omni-gateway-darwin-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Intel (x64)
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-darwin-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.5/omni-gateway-darwin-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🐧 Linux (`x86_64` & ARM64)
 ```bash
 # Linux x64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-linux-x64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.5/omni-gateway-linux-x64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 
 # Linux ARM64
-curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-linux-arm64 -o omni-gateway
+curl -fL https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.5/omni-gateway-linux-arm64 -o omni-gateway
 chmod +x omni-gateway && ./omni-gateway --stdio
 ```
 
 #### 🪟 Windows (PowerShell — x64 & ARM64)
 ```powershell
 # Windows x64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.5/omni-gateway-win32-x64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 
 # Windows ARM64
-Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.0/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
+Invoke-WebRequest -Uri "https://github.com/Rangow4562/omni-mcp-gateway/releases/download/v6.8.5/omni-gateway-win32-arm64.exe" -OutFile "omni-gateway.exe"
 .\omni-gateway.exe --stdio
 ```
 
 #### 🐳 Docker & Build from Source
 ```bash
-# Docker (production container with UI & full v6.8 feature set)
-docker build -t omni-mcp:v6.8.0 .
-docker run --rm -e OMNI_AUTH_SECRET="your-secret" -p 8080:8080 omni-mcp:v6.8.0
+# Docker (production container with UI & full v6.8.5 feature set)
+docker build -t omni-mcp:v6.8.5 .
+docker run --rm -e OMNI_AUTH_SECRET="your-secret" -p 8080:8080 omni-mcp:v6.8.5
 
 # Build from source (Any OS with Rust 1.75+)
 cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,storage-sqlite,storage-postgres,sandbox-wasm,process-containment,transport-http,transport-grpc"
 ./target/release/omni-gateway --stdio
 ```
 
+### 3. Universal CLI/Coding-Agent Skills & Enterprise Plugin (`v6.8.5`)
+
+Install the 4 bundled skills (`omni-mcp`, `omni-codemode`, `omni-cli`, `omni-enterprise`) into **Claude Code, Antigravity, Gemini CLI, Codex, Cursor, VS Code / GitHub Copilot, Windsurf, Cline, OpenCode**, or any agent supporting `.agents/skills`:
+
+```bash
+# Offline install into project or user scope (zero gateway/database side effects)
+omni skills install --agent all --scope project
+
+# Optionally seed the 4 built-in skills into a live MCP skills/list registry
+omni skills bootstrap
+
+# Generate a governed Enterprise Plugin (remote HTTPS Streamable HTTP + Tool Group + OIDC/Bearer)
+omni plugin init --mode enterprise --agent all \
+  --gateway-url https://mcp.corp.example.com \
+  --group billing \
+  --auth-env OMNI_AUTH_TOKEN \
+  --out ./dist/omni-enterprise-plugin
+
+# Export an air-gapped MDM bundle and cryptographically verify SHA-256 integrity
+omni plugin export --enterprise --gateway-url https://mcp.corp.example.com --out ./dist/mdm-bundle
+omni plugin verify ./dist/mdm-bundle
+```
+
 > [!NOTE]
-> Binding to non-loopback addresses (`0.0.0.0`) requires `OMNI_AUTH_SECRET` (or OIDC/JWKS configuration) so unauthenticated control-plane/data-plane exposure is blocked by default.
+> Binding to non-loopback addresses (`0.0.0.0`) requires `OMNI_AUTH_SECRET`, `OMNI_JWT_SECRET`, or `OMNI_OIDC_JWKS_URI`, and defaults `OMNI_REQUIRE_MCP_AUTH=true` so unauthenticated MCP access is blocked with HTTP `401` + RFC 9728 `WWW-Authenticate`.
 
 ---
 
@@ -522,4 +545,4 @@ See [`examples/mcp-configs/python_harness_agent.py`](examples/mcp-configs/python
 
 ## License
 
-Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)). See [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASE_v6.8.0.md](docs/RELEASE_v6.8.0.md) for release notes.
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)). See [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASE_v6.8.5.md](docs/RELEASE_v6.8.5.md) for release notes.

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "omni-mcp-enterprise": {
+      "type": "http",
+      "url": "${OMNI_GATEWAY_URL}/groups/billing/mcp",
+      "headers": {
+        "Authorization": "Bearer ${OMNI_AUTH_TOKEN}"
+      }
+    }
+  }
+}

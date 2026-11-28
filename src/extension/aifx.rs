@@ -385,6 +385,12 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
     clean_args.insert(0, "mcp".to_string());
     let args = &clean_args;
 
+    // Dispatch pure-offline CLI commands BEFORE initializing gateway storage (`AifxCLI::new`)
+    // so they execute hermetically with zero `~/.omni/data` or Postgres side effects.
+    if let Some(exit_code) = try_dispatch_offline_cli(args) {
+        return exit_code;
+    }
+
     let cli = AifxCLI::new(None, None);
     let subcmd = args[1].as_str();
 
@@ -495,13 +501,106 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
                         }
                     }
                 }
+                "bootstrap" => {
+                    let mut group_slug: Option<String> = None;
+                    let mut i = 3;
+                    while i < args.len() {
+                        if args[i] == "--group" && i + 1 < args.len() {
+                            group_slug = Some(args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    match crate::extension::plugin::seed_builtin_skills_into_registry(
+                        &cli.registry,
+                        group_slug,
+                    ) {
+                        Ok(saved) => {
+                            let arr: Vec<JsonValue> = saved
+                                .iter()
+                                .map(|s| {
+                                    json!({
+                                        "slug": s.slug.clone(),
+                                        "version": s.version.clone(),
+                                        "files": s.files.len() as i64,
+                                        "manifest_sha256": s.manifest_sha256.clone()
+                                    })
+                                })
+                                .collect();
+                            println!(
+                                "{}",
+                                json!({
+                                    "bootstrapped": saved.len() as i64,
+                                    "skills": JsonValue::Array(arr)
+                                })
+                                .to_string_pretty()
+                            );
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to bootstrap built-in skills: {}", e);
+                            1
+                        }
+                    }
+                }
                 other => {
                     eprintln!(
-                        "Unknown skills subcommand '{}'. Use: list | publish <dir> | verify <slug>",
+                        "Unknown skills subcommand '{}'. Use: list | publish <dir> | verify <slug> | install | bootstrap",
                         other
                     );
                     1
                 }
+            }
+        }
+        "plugin" => {
+            let action = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            if action == "export" {
+                let opts = match parse_plugin_export_args(args) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        return 2;
+                    }
+                };
+                let extra_skills = if opts.include_registry_skills {
+                    let engine = crate::control_plane::SkillEngine::new(cli.registry.clone());
+                    let scope = crate::control_plane::SkillAccessScope {
+                        group_slug: opts.group_slug.clone(),
+                        server_scope: None,
+                    };
+                    engine.list_skills(&scope)
+                } else {
+                    Vec::new()
+                };
+                match crate::extension::plugin::export_enterprise_bundle(&opts, &extra_skills) {
+                    Ok(report) => {
+                        println!(
+                            "{}",
+                            json!({
+                                "dry_run": report.dry_run,
+                                "out_dir": report.out_dir,
+                                "files_count": report.files.len() as i64,
+                                "skills_exported": JsonValue::Array(
+                                    report.skills_exported.into_iter().map(JsonValue::from).collect()
+                                ),
+                                "sha256sums_digest": report.sha256sums_digest
+                            })
+                            .to_string_pretty()
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Enterprise export failed: {}", e);
+                        1
+                    }
+                }
+            } else {
+                eprintln!(
+                    "Unknown plugin subcommand '{}'. Use: init | export | verify <dir> | agents",
+                    action
+                );
+                2
             }
         }
         "list" => {
@@ -769,16 +868,24 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
         }
         "stdio" | "serve" => {
             let mut server_name = None;
+            let mut group_slug = None;
             let mut i = 2;
             while i < args.len() {
                 if (args[i] == "--server" || args[i] == "-s") && i + 1 < args.len() {
                     server_name = Some(args[i + 1].as_str());
                     i += 2;
+                } else if (args[i] == "--group" || args[i] == "-g") && i + 1 < args.len() {
+                    group_slug = Some(args[i + 1].as_str());
+                    i += 2;
                 } else {
                     i += 1;
                 }
             }
-            crate::server::run_stdio_server(server_name)
+            if server_name.is_some() && group_slug.is_some() {
+                eprintln!("[!] Error: --server and --group cannot be combined in --stdio mode");
+                return 2;
+            }
+            crate::server::run_stdio_server(server_name, group_slug)
         }
         "mock-echo-mcp" => {
             let mut flood_stderr = false;
@@ -909,7 +1016,9 @@ pub fn run_aifx_cli(args: &[String]) -> i32 {
             }
         }
         "migrate" => {
-            let to_v6_8 = args.iter().any(|a| a == "--to-v6.8" || a == "--to-v6.8.0");
+            let to_v6_8 = args
+                .iter()
+                .any(|a| a == "--to-v6.8" || a == "--to-v6.8.0" || a == "--to-v6.8.5");
             let to_v6_5 = args.iter().any(|a| a == "--to-v6.5");
             let to_v6 = args.iter().any(|a| a == "--to-v6");
             let dry_run = args.iter().any(|a| a == "--dry-run");
@@ -1852,6 +1961,321 @@ pub fn import_mcp_config_with_options(
     Ok(report)
 }
 
+fn parse_plugin_export_args(
+    args: &[String],
+) -> Result<crate::extension::plugin::EnterpriseExportOptions, String> {
+    let mut gateway_url = std::env::var("OMNI_GATEWAY_URL")
+        .or_else(|_| std::env::var("OMNI_PUBLIC_BASE_URL"))
+        .unwrap_or_else(|_| "https://mcp.corp.example.com".to_string());
+    let mut group_slug: Option<String> = None;
+    let mut auth_env = "OMNI_AUTH_TOKEN".to_string();
+    let mut out_dir = std::path::PathBuf::from("./omni-enterprise-bundle");
+    let mut allow_insecure_http = false;
+    let mut include_registry_skills = false;
+    let mut dry_run = false;
+
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--enterprise" => i += 1,
+            "--gateway-url" if i + 1 < args.len() => {
+                gateway_url = args[i + 1].clone();
+                i += 2;
+            }
+            "--group" | "-g" if i + 1 < args.len() => {
+                group_slug = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--auth-env" if i + 1 < args.len() => {
+                auth_env = args[i + 1].clone();
+                i += 2;
+            }
+            "--out" | "-o" if i + 1 < args.len() => {
+                out_dir = std::path::PathBuf::from(&args[i + 1]);
+                i += 2;
+            }
+            "--allow-insecure-http" => {
+                allow_insecure_http = true;
+                i += 1;
+            }
+            "--include-registry-skills" => {
+                include_registry_skills = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    Ok(crate::extension::plugin::EnterpriseExportOptions {
+        gateway_url,
+        group_slug,
+        auth_env,
+        out_dir,
+        allow_insecure_http,
+        include_registry_skills,
+        dry_run,
+    })
+}
+
+fn try_dispatch_offline_cli(args: &[String]) -> Option<i32> {
+    let subcmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let action = args.get(2).map(|s| s.as_str()).unwrap_or("");
+
+    if subcmd == "skills" && action == "install" {
+        let mut agent = "universal".to_string();
+        let mut scope = "project".to_string();
+        let mut dir: Option<std::path::PathBuf> = None;
+        let mut only: Vec<String> = Vec::new();
+        let mut dry_run = false;
+        let mut force = false;
+        let mut i = 3;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--agent" | "-a" if i + 1 < args.len() => {
+                    agent = args[i + 1].clone();
+                    i += 2;
+                }
+                "--scope" if i + 1 < args.len() => {
+                    scope = args[i + 1].clone();
+                    i += 2;
+                }
+                "--dir" | "-d" if i + 1 < args.len() => {
+                    dir = Some(std::path::PathBuf::from(&args[i + 1]));
+                    i += 2;
+                }
+                "--only" if i + 1 < args.len() => {
+                    for part in args[i + 1].split(',') {
+                        let p = part.trim();
+                        if !p.is_empty() {
+                            only.push(p.to_string());
+                        }
+                    }
+                    i += 2;
+                }
+                "--dry-run" => {
+                    dry_run = true;
+                    i += 1;
+                }
+                "--force" | "-f" => {
+                    force = true;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        let opts = crate::extension::plugin::SkillInstallOptions {
+            agent,
+            scope,
+            dir,
+            only,
+            dry_run,
+            force,
+        };
+        return Some(match crate::extension::plugin::install_skills(&opts) {
+            Ok(report) => {
+                println!(
+                    "{}",
+                    json!({
+                        "dry_run": report.dry_run,
+                        "targets": JsonValue::Array(report.targets.into_iter().map(JsonValue::from).collect()),
+                        "installed_count": report.installed_files.len() as i64,
+                        "skipped_count": report.skipped_files.len() as i64,
+                        "installed_files": JsonValue::Array(report.installed_files.into_iter().map(JsonValue::from).collect()),
+                        "skipped_files": JsonValue::Array(report.skipped_files.into_iter().map(JsonValue::from).collect())
+                    })
+                    .to_string_pretty()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("Skills install failed: {}", e);
+                1
+            }
+        });
+    }
+
+    if subcmd == "plugin" {
+        match action {
+            "agents" => {
+                println!(
+                    "{}",
+                    crate::extension::plugin::supported_agents_json().to_string_pretty()
+                );
+                return Some(0);
+            }
+            "init" => {
+                let mut mode = "standard".to_string();
+                let mut agent = "claude".to_string();
+                let mut gateway_url: Option<String> = None;
+                let mut group_slug: Option<String> = None;
+                let mut auth_env = "OMNI_AUTH_TOKEN".to_string();
+                let mut transport: Option<String> = None;
+                let mut out_dir = std::path::PathBuf::from("./omni-plugin");
+                let mut allow_insecure_http = false;
+                let mut dry_run = false;
+                let mut i = 3;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--mode" | "-m" if i + 1 < args.len() => {
+                            mode = args[i + 1].clone();
+                            i += 2;
+                        }
+                        "--agent" | "-a" if i + 1 < args.len() => {
+                            agent = args[i + 1].clone();
+                            i += 2;
+                        }
+                        "--gateway-url" if i + 1 < args.len() => {
+                            gateway_url = Some(args[i + 1].clone());
+                            i += 2;
+                        }
+                        "--group" | "-g" if i + 1 < args.len() => {
+                            group_slug = Some(args[i + 1].clone());
+                            i += 2;
+                        }
+                        "--auth-env" if i + 1 < args.len() => {
+                            auth_env = args[i + 1].clone();
+                            i += 2;
+                        }
+                        "--transport" if i + 1 < args.len() => {
+                            transport = Some(args[i + 1].clone());
+                            i += 2;
+                        }
+                        "--out" | "-o" if i + 1 < args.len() => {
+                            out_dir = std::path::PathBuf::from(&args[i + 1]);
+                            i += 2;
+                        }
+                        "--allow-insecure-http" => {
+                            allow_insecure_http = true;
+                            i += 1;
+                        }
+                        "--dry-run" => {
+                            dry_run = true;
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let opts = crate::extension::plugin::PluginInitOptions {
+                    mode,
+                    agent,
+                    gateway_url,
+                    group_slug,
+                    auth_env,
+                    transport,
+                    out_dir,
+                    allow_insecure_http,
+                    dry_run,
+                };
+                return Some(match crate::extension::plugin::init_plugin(&opts) {
+                    Ok(report) => {
+                        println!(
+                            "{}",
+                            json!({
+                                "dry_run": report.dry_run,
+                                "mode": report.mode,
+                                "out_dir": report.out_dir,
+                                "files_count": report.files.len() as i64,
+                                "files": JsonValue::Array(report.files.into_iter().map(JsonValue::from).collect()),
+                                "manifest_sha256": report.manifest_sha256.map(JsonValue::from).unwrap_or(JsonValue::Null)
+                            })
+                            .to_string_pretty()
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Plugin init failed: {}", e);
+                        1
+                    }
+                });
+            }
+            "verify" => {
+                let target = match args.get(3) {
+                    Some(p) => std::path::Path::new(p),
+                    None => {
+                        eprintln!("Usage: omni plugin verify <plugin-dir>");
+                        return Some(2);
+                    }
+                };
+                return Some(
+                    match crate::extension::plugin::verify_plugin_bundle(target) {
+                        Ok(report) => {
+                            println!(
+                            "{}",
+                            json!({
+                                "valid": report.valid,
+                                "checked_files": report.checked_files as i64,
+                                "validated_skills": JsonValue::Array(report.validated_skills.into_iter().map(JsonValue::from).collect()),
+                                "verified_checksum_file": report.verified_checksum_file.map(JsonValue::from).unwrap_or(JsonValue::Null),
+                                "errors": JsonValue::Array(report.errors.iter().cloned().map(JsonValue::from).collect())
+                            })
+                            .to_string_pretty()
+                        );
+                            if report.valid {
+                                0
+                            } else {
+                                1
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Plugin verification error: {}", e);
+                            1
+                        }
+                    },
+                );
+            }
+            "export" => {
+                let include_reg = args.iter().any(|a| a == "--include-registry-skills");
+                if !include_reg {
+                    let opts = match parse_plugin_export_args(args) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            return Some(2);
+                        }
+                    };
+                    return Some(
+                        match crate::extension::plugin::export_enterprise_bundle(&opts, &[]) {
+                            Ok(report) => {
+                                println!(
+                                    "{}",
+                                    json!({
+                                        "dry_run": report.dry_run,
+                                        "out_dir": report.out_dir,
+                                        "files_count": report.files.len() as i64,
+                                        "skills_exported": JsonValue::Array(
+                                            report.skills_exported.into_iter().map(JsonValue::from).collect()
+                                        ),
+                                        "sha256sums_digest": report.sha256sums_digest
+                                    })
+                                    .to_string_pretty()
+                                );
+                                0
+                            }
+                            Err(e) => {
+                                eprintln!("Enterprise export failed: {}", e);
+                                1
+                            }
+                        },
+                    );
+                }
+            }
+            "" | "--help" | "-h" => {
+                println!(
+                    "USAGE:\n  omni plugin agents\n  omni plugin init --mode standard|enterprise [--agent <target>] [--gateway-url <url>] [--group <slug>] [--auth-env <VAR>] [--transport stdio|http|mcp-remote] [--out <dir>] [--dry-run]\n  omni plugin export --enterprise [--gateway-url <url>] [--group <slug>] [--auth-env <VAR>] [--include-registry-skills] [--out <dir>] [--dry-run]\n  omni plugin verify <dir>"
+                );
+                return Some(0);
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn print_help() {
     println!(
         concat!(
@@ -1866,11 +2290,21 @@ fn print_help() {
             "  omni resume <execution_id> [--approver <name>]\n",
             "  omni simulate --code '<script>' [--seed <u64>] [--runs <N>]\n",
             "  omni types [--server <name>] [--query <q>] [--intent '<prompt>']\n",
+            "  omni stdio [--server <name> | --group <slug>]\n",
+            "  omni skills list [--group <slug>]\n",
+            "  omni skills install --agent <target|all> [--scope project|user] [--dir <path>] [--only <slug,...>] [--dry-run] [--force]\n",
+            "  omni skills bootstrap [--group <slug>]\n",
+            "  omni skills publish <dir> [--group <slug>] [--slug <slug>]\n",
+            "  omni skills verify <slug>\n",
+            "  omni plugin agents\n",
+            "  omni plugin init --mode standard|enterprise [--agent <target>] [--gateway-url <url>] [--group <slug>] [--auth-env <VAR>] [--out <dir>]\n",
+            "  omni plugin export --enterprise [--gateway-url <url>] [--group <slug>] [--include-registry-skills] [--out <dir>]\n",
+            "  omni plugin verify <dir>\n",
             "  omni bench [--iterations <N>]\n",
             "  omni bench-codemode [--iterations <N>]\n",
             "  omni import <path/to/mcp.json>\n",
             "  omni wasm register <server> <tool> <path.wasm> [--description <text>]\n",
-            "  omni migrate [--to-v6 | --to-v6.5 | --to-v6.8 --target sqlite|postgres --database-url <dsn>]\n\n",
+            "  omni migrate [--to-v6 | --to-v6.5 | --to-v6.8 | --to-v6.8.5 --target sqlite|postgres --database-url <dsn>]\n\n",
             "NOTE: Commands can be prefixed with 'aifx', 'omni', or 'mcp' interchangeably."
         )
     );

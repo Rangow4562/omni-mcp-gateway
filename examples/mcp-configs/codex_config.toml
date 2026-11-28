@@ -1,0 +1,10 @@
+# OpenAI Codex CLI — OmniMCP Standard (local stdio) & Enterprise (remote HTTP) profiles
+
+[mcp_servers.omni-mcp]
+command = "npx"
+args = ["-y", "@rangow2260/omni-mcp", "--stdio"]
+
+# Uncomment for Enterprise Governed Remote Streamable HTTP:
+# [mcp_servers.omni-mcp-enterprise]
+# url = "https://mcp.corp.example.com/omni/mcp"
+# bearer_token_env_var = "OMNI_AUTH_TOKEN"

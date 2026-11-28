@@ -4,7 +4,7 @@
 //! - `auth`: RBAC roles, HS256 & OIDC/JWKS verification, Origin/DNS-rebinding protection, CIMD validation
 //! - `http_codec`: HTTP/1.1 framing helpers, JSON responses, static dashboard delivery, inbound `rustls` TLS config
 //! - `rest_api`: Control plane REST management APIs (`/api/...`, `/healthz`, `/readyz`, `/metrics`)
-//! - `mcp_router`: MCP JSON-RPC 2.0 routing (`/omni/mcp`, `/<service>/mcp`, `/g/<slug>/mcp`, `run_stdio_server`)
+//! - `mcp_router`: MCP JSON-RPC 2.0 routing (`/omni/mcp`, `/<service>/mcp`, `/groups/<slug>/mcp`, `run_stdio_server`)
 //! - `sse`: Sync & non-blocking async SSE event streaming (`/api/v1/events`)
 //! - `listener`: Non-blocking `tokio` + `rustls` `AsyncTlsStream` listener and `--no-default-features` thread pool
 
@@ -425,6 +425,10 @@ impl ProductionGatewayContext {
 
         if ctx.config.demo_seed && ctx.registry.list_servers(None).is_empty() {
             ctx.seed_sample_catalog();
+        }
+        if ctx.config.seed_builtin_skills {
+            let _ =
+                crate::extension::plugin::seed_builtin_skills_into_registry(&ctx.registry, None);
         }
         ctx
     }
