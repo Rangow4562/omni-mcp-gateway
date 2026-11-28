@@ -211,7 +211,35 @@ cargo build --release --locked --features "os-csprng,tls-rustls,async-runtime,st
 
 ### 3. Universal CLI/Coding-Agent Skills & Enterprise Plugin (`v6.8.5`)
 
-Install the 4 bundled skills (`omni-mcp`, `omni-codemode`, `omni-cli`, `omni-enterprise`) into **Claude Code, Antigravity, Gemini CLI, Codex, Cursor, VS Code / GitHub Copilot, Windsurf, Cline, OpenCode**, or any agent supporting `.agents/skills`:
+Install the 4 bundled skills (`omni-mcp`, `omni-codemode`, `omni-cli`, `omni-enterprise`) and native **Standard** or **Enterprise** plugins into **Claude Code, Antigravity, Gemini CLI, Codex, Cursor, VS Code / GitHub Copilot, Windsurf, Cline, OpenCode**, or any agent supporting `.agents/skills`:
+
+#### Install Skills via `skills.sh` (Any Coding Agent)
+
+```bash
+# Install all 4 skills directly from GitHub via skills.sh
+npx skills add Rangow4562/omni-mcp-gateway
+
+# Or inspect / install a single skill
+npx skills add Rangow4562/omni-mcp-gateway --list
+npx skills add Rangow4562/omni-mcp-gateway --skill omni-mcp
+```
+
+#### Install Native Plugins (Claude Code, Gemini CLI, Antigravity & Universal CLI)
+
+```bash
+# Claude Code Marketplace (Standard local stdio OR Enterprise remote Streamable HTTP)
+/plugin marketplace add Rangow4562/omni-mcp-gateway
+/plugin install omni-mcp@omni-mcp-marketplace              # Standard (local stdio)
+/plugin install omni-mcp-enterprise@omni-mcp-marketplace   # Enterprise (HTTPS + OIDC/Tool Group)
+
+# Gemini CLI native extension (reads gemini-extension.json + AGENTS.md)
+gemini extensions install https://github.com/Rangow4562/omni-mcp-gateway
+
+# Universal CLI installer via npx (no global binary required)
+npx -y @rangow2260/omni-mcp skills install --agent all --scope project
+```
+
+#### Offline CLI, MCP Registry Bootstrap & Air-Gapped Enterprise MDM Bundles
 
 ```bash
 # Offline install into project or user scope (zero gateway/database side effects)
